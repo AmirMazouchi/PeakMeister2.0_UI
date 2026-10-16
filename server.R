@@ -1,3 +1,13 @@
+# Timing instrumentation added for Initialize Run (2026-10-16).
+# Records elapsed seconds per input file for reading, calibration, extraction,
+# smoothing, peak processing, plotting, RData saving, SQLite writes and exports.
+# Shows stage messages in the progress panel and R console, and saves
+# run_timings.csv in the Results folder after each stage, including total time
+# and partial timings on errors or interrupts. Optional stages are labelled
+# "if enabled"; their timings include checking whether that stage is enabled.
+# The timing helper is embedded below: no additional R files are required.
+# This adds measurement only; the scientific processing steps are unchanged.
+
 #PeakMeister2.0_UI was written by Erick Helmeczi and Liam Surry 
 #Initialized 2024-11-12 @McMaster University
 #Department of Chemistry and Chemical Biology
@@ -546,6 +556,59 @@ server <- function(input, output, session){
       file_name <- paste("Results", Sys.Date(), count, sep = " ")}
     dir.create(path = file_name, showWarnings = FALSE)
     
+    # Stage-level timings use elapsed time, including file I/O and database waits.
+    # The CSV is refreshed at every stage boundary so completed stages survive errors.
+    new_run_timer <- function(path, notify = function(stage, file) NULL) {
+      rows <- data.frame(file = character(), stage = character(), status = character(),
+                         started_at = character(), elapsed_seconds = numeric(),
+                         detail = character(), stringsAsFactors = FALSE)
+      run_start <- proc.time()[["elapsed"]]
+      run_wall <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")
+      active <- NULL
+      finished <- FALSE
+      persist <- function() write.csv(rows, path, row.names = FALSE)
+      record <- function(file, stage, status, wall, elapsed, detail = "") {
+        rows[nrow(rows) + 1L, ] <<- list(file, stage, status, wall, elapsed, detail)
+        persist()
+        message(sprintf("[Timing] %s | %s | %s | %.3f seconds", file, stage, status, elapsed))
+      }
+      close_stage <- function(status = "completed", detail = "") {
+        if (!is.null(active)) {
+          record(active$file, active$stage, status, active$wall,
+                 proc.time()[["elapsed"]] - active$start, detail)
+          active <<- NULL
+        }
+      }
+      persist()
+      list(
+        stage = function(stage, file = "") {
+          stopifnot(!finished)
+          close_stage()
+          active <<- list(file = file, stage = stage,
+                          wall = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"),
+                          start = proc.time()[["elapsed"]])
+          message(sprintf("[Timing] Starting %s%s", stage,
+                          if (nzchar(file)) paste0(" | ", file) else ""))
+          notify(stage, file)
+        },
+        end_stage = function() close_stage(),
+        finish = function(status = "completed", detail = "") {
+          if (finished) return(invisible(NULL))
+          close_stage(status, detail)
+          record("", "TOTAL RUN (includes all stages)", status, run_wall,
+                 proc.time()[["elapsed"]] - run_start, detail)
+          finished <<- TRUE
+          invisible(rows)
+        }
+      )
+    }
+    timing <- new_run_timer(file.path(file_name, "run_timings.csv"),
+      notify = function(stage, file) {
+        if (nzchar(file)) shiny::setProgress(detail = stage)
+      })
+    tryCatch({
+    timing$stage("Validate parameters and calculate migration indexes")
+
     #Create a "Plots" folder to store figures
     dir.create(path = file.path(file_name, "Plots"), showWarnings = FALSE)
     
@@ -733,10 +796,12 @@ server <- function(input, output, session){
       dir.create(path = subfolder_path, showWarnings = FALSE, recursive = TRUE)
       
       
+      timing$stage("Copy mz5 file", data_file_names[d])
       #Make a copy of the data file as data will be written directly to this file during mass calibration
       file <- gsub(".mz5", "", data_files[d])
       file.copy(data_files[d], to = paste(file, "temp.mz5", sep = "_"))
       
+      timing$stage("Read mz5 into memory", data_file_names[d])
       #Read copied data file and update progress bar
       incProgress(1/total_steps, detail = paste("Reading Data File"))
       print("Reading Data File")
@@ -757,6 +822,7 @@ server <- function(input, output, session){
       #Unlock "assayData" environment 
       env_binding_unlock(run_data@assayData)
       
+      timing$stage("Mass calibration (if enabled)", data_file_names[d])
       #####3.6 Perform Mass Calibration#####
       
       #This is a stupid line but not sure way around it currently
@@ -901,6 +967,7 @@ server <- function(input, output, session){
       
       print("Mass Calibration Complete")
       
+      timing$stage("Prepare extraction windows and spectra", data_file_names[d])
      #####3.7 Extract Electropherograms#####
       
       #Update progress bar
@@ -977,6 +1044,7 @@ server <- function(input, output, session){
      #Directly update the assayData slot of run_data
      slot(run_data, "assayData") <- sorted_assay_data_env
       
+      timing$stage("Extract electropherograms", data_file_names[d])
       #Extract electropherograms
       electropherograms <- chromatogram(run_data,
                                         mz = mzr,
@@ -985,6 +1053,7 @@ server <- function(input, output, session){
                                         missing = 0,
                                         msLevel = 1)
       
+      timing$stage("Build eie_df", data_file_names[d])
       eie_df <- data.frame("mt.seconds" = electropherograms[1]@rtime)
       
       for (n in 1:length(name_vec)){
@@ -995,6 +1064,7 @@ server <- function(input, output, session){
       
       print("Extraction Complete")
       
+      timing$stage("Smooth electropherograms (if enabled)", data_file_names[d])
       #####3.8 Smooth Intensity Vectors#####
       
       #Check if mass calibration should be applied
@@ -1042,6 +1112,7 @@ server <- function(input, output, session){
       renderText("Electropherograms Smoothing Complete")
       print("Electropherograms Smoothing Complete")
       
+      timing$stage("Internal standard peak detection, integration and filtering", data_file_names[d])
       #####3.9 Internal Standard Peak Detection, Integration, and Filtering#####
       
       #Update progress bar
@@ -1371,6 +1442,7 @@ server <- function(input, output, session){
       
       print("Peak Picking and Filtering for Internal Standards Complete")
       
+      timing$stage("Metabolite peak detection, integration and filtering", data_file_names[d])
       #####3.10 Metabolite  Peak Detection, Integration, and Filtering#####
       
       #Update progress bar
@@ -1804,6 +1876,7 @@ server <- function(input, output, session){
         
       })
       
+      timing$stage("Filter peaks below LOD", data_file_names[d])
       ######3.10.8 Filter peaks below LOD######
       
       #Build a data frame to store comments for each metabolite peak
@@ -1858,6 +1931,7 @@ server <- function(input, output, session){
         
       }
       
+      timing$stage("Filter interfered peaks", data_file_names[d])
       ######3.10.9 Filter interfered peaks######
       
       #Build an interference data frame since some are metabolites and some are internal standards
@@ -1927,6 +2001,7 @@ server <- function(input, output, session){
 
       print("Peak Picking and Filtering for Analytes Complete")
       
+      timing$stage("Generate and save plots", data_file_names[d])
       #####3.11 Plotting#####
       #Update progress bar
       incProgress(1/total_steps, detail = paste("Plotting & Exporting Electropherograms"))
@@ -2351,6 +2426,7 @@ server <- function(input, output, session){
       print("Plotting Complete")
       
       
+      timing$stage("Prepare result tables", data_file_names[d])
       #####3.12 Export Data#####
       
       ######3.12.1 Generate peak area data frame######
@@ -2386,9 +2462,11 @@ server <- function(input, output, session){
         peak_mt_report = rbind(peak_mt_report, peak_mt_df)
       }
       
+      timing$stage("Save plot_list_data.RData", data_file_names[d])
       #Save the entire plot_list to a .RData file in the subfolder as well as peaks_df
       save(plot_list, peaks_df, mi_df, peak_mt_df,peak_area_df, comment_df, file = file.path(subfolder_path, "plot_list_data.RData"))
       
+      timing$stage("Write SQLite results", data_file_names[d])
       #Create SQL database if one doesnt exist and save all data to it for each file.
       db_path_pipeline <- get_db_path(file_name)
       pipeline_con <- dbConnect(SQLite(), db_path_pipeline)
@@ -2418,12 +2496,14 @@ server <- function(input, output, session){
       print(paste("database write complete for:", data_files_name[d]))
       
       
+      timing$stage("Remove temporary mz5 file", data_file_names[d])
       #Delete temporary mz5 file
       file.remove(paste(file, "temp.mz5", sep = "_"))
   
       print(paste("Completed Analysis of Data File: ", data_file_names[d], sep = ""))
       print("")
       
+      timing$stage("Export CSV reports", data_file_names[d])
       ######3.12.3 Export data######
       write.csv(peak_area_report,
                 file = paste(file_name, "/", "Metabolite Peak Areas.csv", sep = ""),
@@ -2433,11 +2513,21 @@ server <- function(input, output, session){
                 file = paste(file_name, "/", "Metabolite Migration Times.csv", sep = ""),
                 row.names = FALSE)
       
+      timing$stage("Save plotly_objects.RData", data_file_names[d])
       #Save plotly_objects to .RDA file
       save_plotly_objects(file_name)
+      timing$end_stage()
       })
     }#End of loop
     
+    timing$finish()
+    }, error = function(e) {
+      timing$finish("failed", conditionMessage(e))
+      stop(e)
+    }, interrupt = function(e) {
+      timing$finish("interrupted", "Run interrupted")
+      stop(e)
+    })
   })#End of main button
   
   
