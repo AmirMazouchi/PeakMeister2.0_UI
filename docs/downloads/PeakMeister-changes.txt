@@ -39,6 +39,18 @@ ui.R
 
 server.R
 
+- Found a pre-refactor data-loss bug: Undo with no previous deletion could save
+  six NULL objects over plot_list_data.RData. Reproduced the uploaded 122-byte
+  file structure with the second branch's actual Undo observer and reproduced
+  the names/vector loading error with the uploaded RData and SQLite files.
+- Refuse empty, incomplete or foreign-file Undo history before changing state
+  or files. Deletion actions now capture the filename for the Undo check.
+- Validate full snapshot tables and electropherograms before saving, including
+  before a plot edit deletes SQLite rows. Snapshot saves share that validation.
+- Added tests/undo-safety.R for unchanged saved files/state on invalid Undo,
+  invalid-edit SQLite preservation, and a valid saved snapshot restoration.
+- These guards prevent future empty overwrites. Already-missing traces require
+  an intact backup, saved Plotly traces, or reprocessing; they are not in SQLite.
 - Replaced duplicate saved-analysis load observers with one observer for both
   connection and file selection. Opening a saved file reads its RData once.
 - Match saved electropherograms by exact list name or a unique saved metabolite

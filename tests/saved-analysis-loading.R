@@ -146,5 +146,12 @@ testServer(harness, {
   stopifnot(counts$loads == 5L, run_metadata$file_name == "Run01.mz5")
   dbDisconnect(connection)
 })
+# The subsequently uploaded file contained exactly these six NULL objects (with
+# mi_df saved twice by the old Undo handler). Reject it before per-trace lookup.
+empty_snapshot <- list2env(setNames(rep(list(NULL), 6),
+  c("plot_list", "comment_df", "mi_df", "peaks_df", "peak_mt_df", "peak_area_df")))
+save(list = c("plot_list", "comment_df", "mi_df", "peaks_df", "peak_mt_df", "peak_area_df", "mi_df"),
+     envir = empty_snapshot, file = path)
+stopifnot(grepl("No saved plot_list", error_text(tasks$load_saved_plot_list(first, "Run01"))))
 unlink(work, recursive = TRUE)
 cat("PASS: saved SQLite/RData loads; exact reported failure; unique-label recovery; malformed/missing/ambiguous traces; single load/error; edits preserved; analysis/run switching and recovery.\n")

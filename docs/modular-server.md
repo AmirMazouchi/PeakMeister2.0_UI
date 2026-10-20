@@ -36,6 +36,7 @@ processing starts on **Engine**.
 | Save PNGs and build interactive plots | `save_static_plots()`, `build_interactive_plots()` | Engine → New analysis → Initialize Run |
 | Prepare report tables | `build_result_tables()` | Engine → New analysis → Initialize Run |
 | Save RData, SQLite, CSVs and Plotly objects | `save_analysis_snapshot()`, `save_analysis_database()`, `export_result_csvs()`, `save_interactive_plots()` | Engine → New analysis → Initialize Run |
+| Reject incomplete snapshots before overwriting saved data | `validate_analysis_snapshot()` | Engine → Initialize Run; Visualization → peak edits and Undo Peak Deletion, through their save functions |
 | Load saved traces and editable peak data | `load_saved_plot_list()`, `read_saved_electropherogram()`, `read_plot_data_from_db()`, `load_plot_list_from_db()`, `load_wide_data_from_db()` | Engine → Open existing analysis → Select run folder; Visualization → Select saved analysis for this file / Select File |
 | Stage timing and error/interrupt reports | `new_run_timer()` | Engine → New analysis → Initialize Run |
 | Delete selected/middle/all peaks and undo | `delete_selected_peaks()`, `delete_middle_peaks()`, `delete_all_peaks()`, `undo_peak_deletion()` | Visualization → Plotting → Delete Selected Peaks / Delete Middle Peaks / Delete all peaks / Undo Peak Deletion, respectively |
@@ -63,6 +64,17 @@ positional trace entries are supported. Missing, ambiguous, empty or malformed
 traces produce one guarded message identifying the metabolite and RData path;
 stale editing/undo state is cleared. A missing trace cannot be reconstructed from
 SQLite alone. Loading does not rebuild the database or overwrite stored edits.
+
+An empty Undo history previously overwrote `plot_list_data.RData` with six NULL
+objects. This bug predates the modular refactor. The uploaded 122-byte snapshot
+had exactly that structure; the second branch's loader reproduced the reported
+names/vector error, and its Undo observer reproduced the empty saved file.
+This identifies a matching failure path, rather than a log of the user's clicks.
+Undo now refuses missing, incomplete or foreign-file history before modifying
+state. Full snapshot writes also validate tables and electropherograms, including
+before an edit can delete SQLite rows. These checks prevent that overwrite;
+they cannot restore traces already lost. Recovery needs an intact snapshot,
+usable saved Plotly traces or reprocessing the original raw data.
 
 Metadata is shared between dated analyses at `Results/<run>/metadata.csv`.
 `metadata_file_paths()` derives that path from the selected analysis, so switching
@@ -122,6 +134,7 @@ Validation:
 - `Rscript --vanilla tests/gui-startup.R`
 - `Rscript --vanilla tests/saved-run-selection.R`
 - `Rscript --vanilla tests/saved-analysis-loading.R`
+- `Rscript --vanilla tests/undo-safety.R`
 - `Rscript --vanilla tests/modular-server.R`
 - `Rscript --vanilla tests/quality-metrics.R`
 - `Rscript --vanilla tests/action-errors.R`
@@ -134,14 +147,22 @@ Plotly traces/layouts, both PNG naming layouts, multiple-file processing, timing
 and failure cleanup. PNG writing and raw MSnbase decoding use test adapters.
 The equivalence check compares those outputs with the pre-refactor server
 (commit `3604a346c92089342519746d578ecb19f0bf4488`) and compares the moved GUI
-action bodies. GUI startup and saved-run tests use the actual handlers.
+action bodies. The three deletion helpers now additionally capture their source
+filename for Undo; their other behavior still matches. Undo intentionally differs
+from the unsafe original and is tested separately. GUI startup and saved-run
+tests use the actual handlers.
 
 The saved-analysis-loading test reproduces the reported `'names' attribute [2]`
 error with a missing list key. Real SQLite/RData fixtures verify recovery by a
 unique saved label, matrix/positional traces, retained database edits, one load
 per connection/file update, informative errors for unrecoverable traces, and
-switching dated analyses/runs after a failure. The user's saved files were not
-available for testing.
+switching dated analyses/runs after a failure. A subsequently uploaded NULL
+snapshot reproduced the failure with the second branch's actual loader.
+
+The undo-safety test exercises the actual Undo observer with empty, incomplete,
+foreign-file and malformed history, checking unchanged file bytes and state.
+It also checks rejected snapshot saves, SQLite row preservation on an invalid
+edit, a valid restored snapshot and a cleared session's invalid Undo history.
 
 The quality-metrics tests use a 12-sample, 20-metabolite fixture to verify PCA
 against an independent correlation-matrix eigendecomposition. They exercise

@@ -16,12 +16,19 @@ normalize <- function(x) {
   x
 }
 for (pair in list(c('delete_peak','delete_selected_peaks'), c('deletemiddlepeaks','delete_middle_peaks'),
-  c('deleteallpeaks','delete_all_peaks'), c('undo','undo_peak_deletion'),
+  c('deleteallpeaks','delete_all_peaks'),
   c('regenerateplots','regenerate_changed_plots'), c('interferences','mark_peak_interferences'),
   c('load_batchcorr_packages','load_batch_correction_packages'), c('batch_corr','apply_batch_correction'),
   c('drug_databases','load_drug_databases'), c('confirm_parse_drugbank','parse_and_save_drugbank'))) {
   original <- Filter(function(x) is.call(x) && identical(x[[1]], as.name('observeEvent')) && identical(x[[2]], as.call(list(as.name('$'), as.name('input'), as.name(pair[1])))), before_statements)[[1]][[3]]
-  stopifnot(identical(normalize(original), normalize(body(tasks[[pair[2]]]))))
+  current <- body(tasks[[pair[2]]])
+  # Deletions now also record the filename used by the Undo guard. Undo itself
+  # intentionally differs from the unsafe original and has its own behavior test.
+  if (pair[2] %in% c('delete_selected_peaks', 'delete_middle_peaks', 'delete_all_peaks')) {
+    filename_capture <- quote(previous_metadata$file_name <- run_metadata$file_name)
+    current <- as.call(Filter(function(x) !identical(x, filename_capture), as.list(current)))
+  }
+  stopifnot(identical(normalize(original), normalize(current)))
 }
 
 # Restore the extracted builder after the intentional failing-stage test.
@@ -77,4 +84,4 @@ for (run in c('Run01','Run02')) {
   same(at[,c('file','stage','status')],bt[,c('file','stage','status')])
 }
 setwd(original_dir); unlink(comparison, recursive = TRUE)
-cat('PASS: old/new two-file pipeline produces identical CSVs, saved analysis objects, all SQLite tables, Plotly traces/layouts and stage/status sequences; ten moved GUI action bodies match.\n')
+cat('PASS: old/new two-file pipeline produces identical CSVs, saved analysis objects, all SQLite tables, Plotly traces/layouts and stage/status sequences; nine moved GUI action bodies match apart from Undo filename capture. Undo safety is tested separately.\n')

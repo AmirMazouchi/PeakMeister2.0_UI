@@ -1,3 +1,6 @@
+# Undo refuses an empty or mismatched deletion history before changing state or
+# files. Snapshot writes validate traces and tables first, including before any
+# SQLite edit, so an empty session cannot overwrite saved electropherograms.
 # Saved-analysis loading runs once per connection/file change. Saved traces are
 # matched by exact list name or a unique saved label, with checks for missing or
 # malformed traces. RData is read once per file; SQLite edits remain authoritative.
@@ -2585,8 +2588,27 @@ server <- function(input, output, session){
     list(peak_area_df = peak_area_df, peak_mt_df = peak_mt_df)
   }
 
+  # Check a full snapshot before any save can replace existing traces or tables.
+  validate_analysis_snapshot <- function(plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df) {
+    tables <- list(peaks_df = peaks_df, mi_df = mi_df, peak_mt_df = peak_mt_df,
+                   peak_area_df = peak_area_df, comment_df = comment_df)
+    invalid <- names(tables)[!vapply(tables, function(x) is.data.frame(x) || is.matrix(x), logical(1))]
+    if (length(invalid)) stop("Saved analysis was not changed: incomplete snapshot (",
+                             paste(invalid, collapse = ", "), ").", call. = FALSE)
+    if (!is.list(plot_list) || !length(plot_list) || is.null(names(plot_list)) ||
+        anyNA(names(plot_list)) || any(!nzchar(names(plot_list))) || anyDuplicated(names(plot_list))) {
+      stop("Saved analysis was not changed: the snapshot has no valid named electropherograms.",
+           call. = FALSE)
+    }
+    for (metabolite in names(plot_list)) {
+      read_saved_electropherogram(plot_list, metabolite, "snapshot to be saved")
+    }
+    invisible(TRUE)
+  }
+
   # Save the named RData objects used by Visualization and database migration.
   save_analysis_snapshot <- function(subfolder_path, plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df) {
+    validate_analysis_snapshot(plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df)
     save(plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df,
          file = file.path(subfolder_path, "plot_list_data.RData"))
   }
@@ -3919,6 +3941,9 @@ server <- function(input, output, session){
     con       <- db_con()
     file_name <- plot_list_data_values$file_name
     folder    <- main_folder()
+    validate_analysis_snapshot(plot_list_data_values$plot_list, plot_list_data_values$peaks_df,
+      plot_list_data_values$mi_df, plot_list_data_values$peak_mt_df,
+      plot_list_data_values$peak_area_df, plot_list_data_values$comment_df)
     
     #Update existing annotation data
     ann <- plot_list_data_values$plot_list[[plotname]]$annotation_data
@@ -4004,8 +4029,7 @@ server <- function(input, output, session){
       peak_mt_df   <- plot_list_data_values$peak_mt_df
       peak_area_df <- plot_list_data_values$peak_area_df
       mi_df        <- plot_list_data_values$mi_df
-      save(plot_list, comment_df, peaks_df, peak_mt_df, mi_df, peak_area_df,
-           file = file.path(subfolder_path, "plot_list_data.RData"))
+      save_analysis_snapshot(subfolder_path, plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df)
     }
     
     #Update reactive values with new metabolite data.
@@ -4071,6 +4095,7 @@ server <- function(input, output, session){
     req(input$peak_info_table_rows_selected)
 
     #Store the current state before making changes
+    previous_metadata$file_name <- run_metadata$file_name
     previous_metadata$comment_df <- run_metadata$comment_df
     previous_metadata$plot_list <- run_metadata$plot_list
     previous_metadata$peaks_df <- run_metadata$peaks_df
@@ -4164,6 +4189,7 @@ server <- function(input, output, session){
     req(input$plot_table_rows_selected)
 
     #Store the current state before making changes
+    previous_metadata$file_name <- run_metadata$file_name
     previous_metadata$comment_df <- run_metadata$comment_df
     previous_metadata$plot_list <- run_metadata$plot_list
     previous_metadata$peaks_df <- run_metadata$peaks_df
@@ -4251,6 +4277,7 @@ server <- function(input, output, session){
     req(input$plot_table_rows_selected)
 
     #Store the current state before making changes
+    previous_metadata$file_name <- run_metadata$file_name
     previous_metadata$comment_df <- run_metadata$comment_df
     previous_metadata$plot_list <- run_metadata$plot_list
     previous_metadata$peaks_df <- run_metadata$peaks_df
@@ -4332,6 +4359,21 @@ server <- function(input, output, session){
   #####4.5 Undo peak deletion#####
   # Session action called by the undo button.
   undo_peak_deletion <- function() {
+    # Undo can be clicked before any deletion. Never save the initial NULL state.
+    keys <- c("plot_list", "comment_df", "peaks_df", "peak_mt_df", "peak_area_df", "mi_df")
+    if (any(vapply(keys, function(key) is.null(previous_metadata[[key]]), logical(1)))) {
+      showNotification("There is no peak deletion to undo for this analysis.", type = "message")
+      return(invisible(FALSE))
+    }
+    req(main_folder(), input$file_selector)
+    if (!identical(previous_metadata$file_name, input$file_selector) ||
+        !identical(run_metadata$file_name, input$file_selector)) {
+      showNotification("There is no peak deletion to undo for this analysis.", type = "message")
+      return(invisible(FALSE))
+    }
+    validate_analysis_snapshot(previous_metadata$plot_list, previous_metadata$peaks_df,
+      previous_metadata$mi_df, previous_metadata$peak_mt_df,
+      previous_metadata$peak_area_df, previous_metadata$comment_df)
     #Revert to the previous state
     run_metadata$comment_df <- previous_metadata$comment_df
     run_metadata$plot_list <- previous_metadata$plot_list
@@ -4358,7 +4400,7 @@ server <- function(input, output, session){
 
     #Save the reverted state back to the file
     subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
-    save(plot_list, comment_df, mi_df,  peaks_df, peak_mt_df, peak_area_df, mi_df, file = file.path(subfolder_path, "plot_list_data.RData"))
+    save_analysis_snapshot(subfolder_path, plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df)
 
     #Update the UI to reflect the reverted state
     output$peak_info_table <- DT::renderDataTable({
