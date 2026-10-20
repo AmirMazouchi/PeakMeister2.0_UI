@@ -14,8 +14,8 @@ get_event<-function(name) Filter(function(x)is_event(x,name),statements)[[1]]
 first<-which(vapply(statements,is_assign,logical(1),name='empty_mz5_files'))
 last<-which(vapply(statements,is_event,logical(1),name='initialize'))
 engine<-statements[first:(last-1)]
-engine<-Filter(function(x)!grepl('^output\\$(fileTable|mz5fileTable)',text(x)),engine)
-extra_names<-c('plot_list_data_values','run_metadata','previous_metadata','modified_peak_plots','plot_render_trigger','get_db_path','db_exists','list_results_folders','selected_results_filename','results_folders_reactive','last_results_filename','last_visualization_filename','db_con','clear_loaded_analysis','peak_areas_data','migration_times_data')
+engine<-Filter(function(x)!grepl('^output\\$fileTable',text(x)),engine)
+extra_names<-c('plot_list_data_values','run_metadata','previous_metadata','modified_peak_plots','plot_render_trigger','get_db_path','db_exists','list_results_folders','selected_results_filename','results_folders_reactive','last_results_filename','latest_results_folder','last_visualization_filename','db_con','clear_loaded_analysis','peak_areas_data','migration_times_data')
 extras<-lapply(extra_names,get_assign)
 selector<-Filter(function(x)is.call(x)&&identical(x[[1]],as.name('observeEvent'))&&grepl('^list\\(selected_results_filename\\(\\), results_folders_reactive\\(\\)\\)',text(x[[2]])),statements)
 stopifnot(length(selector)==1)
@@ -40,8 +40,9 @@ run_saved_selection_checks<-function(){
   path<-file.path(folder,'Data',filename);dir.create(path,recursive=TRUE,showWarnings=FALSE)
   placeholder<-list();save(placeholder,file=file.path(path,'plot_list_data.RData'))
  }
- make_result('./Results/Run01/Results first','Run01.mz5')
- make_result('./Results/Run01/Results second','Run01.mz5')
+ make_result('./Results/Run01/Results 2026-10-19','Run01.mz5')
+ make_result('./Results/Run01/Results 2026-10-20 2','Run01.mz5')
+ make_result('./Results/Run01/Results 2026-10-20 10','Run01.mz5')
  make_result('./Results/Run02/Results only','Run02.mz5')
  make_result('./Run01/Results prior-layout','Run01.mz5')
  make_result('./Results legacy','Run01.mz5')
@@ -60,8 +61,14 @@ run_saved_selection_checks<-function(){
   stopifnot(identical(selected_saved_run(),'Run01'))
   stopifnot(nrow(uploadedmz5())==1L,uploadedmz5()$FileName=='Run01.mz5',
    uploadedmz5()$Source=='saved_run',is.na(uploadedmz5()$FilePath))
-  stopifnot(setequal(results_folders_reactive(),c('./Results/Run01/Results first','./Results/Run01/Results second')))
-  stopifnot(isTRUE(check_saved_analysis('./Results/Run01/Results first','Run01.mz5')))
+  stopifnot(setequal(results_folders_reactive(),c('./Results/Run01/Results 2026-10-19','./Results/Run01/Results 2026-10-20 2','./Results/Run01/Results 2026-10-20 10')))
+  stopifnot(events$updates$results_folder$selected=='./Results/Run01/Results 2026-10-20 10')
+  stopifnot(latest_results_folder(character())=='')
+  session$setInputs(results_folder='./Results/Run01/Results 2026-10-19')
+  make_result('./Results/Run01/Results 2026-10-21','Run01.mz5')
+  session$elapse(5001)
+  stopifnot(events$updates$results_folder$selected=='./Results/Run01/Results 2026-10-19')
+  stopifnot(isTRUE(check_saved_analysis('./Results/Run01/Results 2026-10-19','Run01.mz5')))
   for(folder in c('./Results legacy','./Run01/Results prior-layout','./Results/Run02/Results only'))
    stopifnot(inherits(try(check_saved_analysis(folder,'Run01.mz5'),silent=TRUE),'try-error'))
   stopifnot(identical(output$show_visualization_file_selector,"false"))
@@ -71,20 +78,13 @@ run_saved_selection_checks<-function(){
   session$setInputs(existing_run='Run02',file_selector='Run02.mz5')
   stopifnot(uploadedmz5()$FileName=='Run02.mz5',
    identical(results_folders_reactive(),'./Results/Run02/Results only'),
-   events$updates$results_folder$selected=='',
+   events$updates$results_folder$selected=='./Results/Run02/Results only',
    is.null(plot_list_data_values$file_name),is.null(previous_metadata$comment_df))
   session$setInputs(clearFiles=1)
   stopifnot(nrow(uploadedmz5())==0L,length(selected_saved_run())==0L,length(results_folders_reactive())==0L)
   session$setInputs(existing_run='Missing')
   stopifnot(nrow(uploadedmz5())==0L,length(results_folders_reactive())==0L)
   session$setInputs(existing_run='Run01',file_selector='Run01.mz5')
-  pseudomz5names(data.frame(FileName='Run01'))
-  session$setInputs(generateFiles=1)
-  session$setInputs(existing_run='')
-  stopifnot(uploadedmz5()$Source=='pseudo',length(selected_saved_run())==0L,
-   length(results_folders_reactive())==4L)
-  stopifnot(identical(output$show_visualization_file_selector,"true"))
-  unlink(uploadedmz5()$FilePath)
   session$setInputs(analysis_mode='new')
   stopifnot(nrow(uploadedmz5())==0L,length(selected_saved_run())==0L,
    identical(output$show_visualization_file_selector,"true"))
@@ -107,4 +107,4 @@ run_saved_selection_checks<-function(){
  })
 }
 run_saved_selection_checks()
-cat('PASS: run discovery; invalid/incomplete/mismatched exclusion; saved filenames without raw reads; per-run version filtering; switching/clearing; Initialize guard; pseudo and new-upload workflows; missing/deleted runs.\n')
+cat('PASS: run discovery; invalid/incomplete/mismatched exclusion; saved filenames without raw reads; per-run version filtering; switching/clearing; latest-by-date/numeric-version selection; Initialize guard; new-upload workflow; missing/deleted runs.\n')

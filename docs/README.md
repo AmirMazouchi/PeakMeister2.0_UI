@@ -201,18 +201,20 @@ A Rdata file containing all generated interactive plotly plots. ALlows for visua
 
 Stores the raw metadata for each datafile. This includes all information required for generating the plots and calculating peak areas.
 
-##### *Generating pseudo .mz5 files*
+##### *Opening an existing analysis*
 
-PeakMeister2.0_UI is designed in some places to utilize the file names from the .mz5 files.  The app requires the name of the .mz5 files to access the stored data associated with each plot. Real .mz5 files are large and take up a lot of space on the computer, so it seems foolish to require the user to upload these large files (which can take ~15-20s) every time they want to process or analyze their data. PeakMeister2.0_UI has an option for generating "pseudo" .mz5 files. The word 'pseudo' is a prefix that means 'pretended' or 'not real.' These are empty files with the .mz5 extension, that have the same name as the .mz5 files used in the users data analysis. They essentially take up 0kb of space. The user can type the file name of their real .mz5 files into the data table. More rows can be added by clicking 'Add Empty Row'. The user can additionally upload and excel file titled 'file_upload_names' which contains a column titled 'FileName' which contains the file names of the .mz5 files you are trying to generate. Pseudo .mz5 files are generated when the user clicks the 'Generate Pseudo .mz5 Files' button. Note, these generated files are empty and must be cleared before the user processes and real files on the app.
+In **Engine**, choose **Open existing analysis**, then select a run folder under `Results`. The original `.mz5` file is not needed. For example, a run created from `Run01.mz5` is stored as `Results/Run01/Results YYYY-MM-DD/`.
+
+Selecting a run automatically selects and loads its most recent saved analysis. The date in the folder name determines the newest analysis; reruns on the same date are ordered numerically (`Results YYYY-MM-DD 10` is newer than `Results YYYY-MM-DD 2`). The **Select saved analysis for this file** dropdown in **Visualization** allows switching to an older version. A manually selected older version stays selected while the run remains open. If a saved analysis has no SQLite database, the existing database migration prompt is shown.
+
+**Clear Files** clears the active selection without deleting the original files or saved results. The same run can be selected again afterward. No empty `.mz5` files are generated or required.
 
 ##### 4. **Visualization**
 ***
 
-This tab is where users can view their results in an interactive plot format. Requires users to have uploaded their .mz5 files in the "Engine" tab. When this computation it run, it will automatically store the plots into the apps memory. These plots will remain until the app is closed. However, each run generates a .RData file called "plotly_objects" that store the information required for the plots. Users can click the "Browse" button under the "Uploaded .Rdata file" section which will allow users to upload the plots to the app. 
+Use **Visualization** in the left sidebar to view the analysis selected in Engine. For an existing analysis, its filename is selected internally and the **Select File** control is hidden. For new analyses with multiple uploaded files, **Select File** remains available to switch between files. Select a plot from **Loaded Plots** to display its electropherogram and peak information.
 
-.mz5 files will be shown under the "Select File:" dropdown menu. This allows users to switch between different files and each files associated metadata. Upon selecting a file, a data table will be displayed which will have a list of plots generated  from the specific selected file. Users can click a plot in the table which will cause it to display on the screen with its associated peak information.
-
-The user can also specify the folder they are working out of in the "Select Results Folder" dropdown menu. This allows the user to work across multiple runs of data. A results folder **must** be specified in order to access the correct data.
+The saved-analysis dropdown is populated and selected automatically when opening an existing run. It remains available for switching between dated analysis versions. Stored data and plots are loaded from the selected analysis folder.
 
 There are two subtabs to display the plots in which are titled "Plotting" or "Dual EIE View." The default is the "Plotting" tab.
 
@@ -252,7 +254,7 @@ This tab allows the user to display two electropherograms for use in identifying
 ##### 5. **Downstream Processing**
 ***
 
-This tab is where users can make large-scale modifications to their data after it has been edited or adjusted in the visualization tab. This requires you to have the 'Metabolite Peak Areas.csv' and the 'Metabolite Migration Times.csv' files. The user also must upload the 'Mass List and Parameters' file in the 'User Supplied Parameters' tab. While its not required to upload the files, the user should upload or generate .mz5 files or pseudo .mz5 files (generated in the 'Engine' tab). These files are required to properly generate the m/z versus migration time plot. To begin, the user must first select the results folder to work from. This is **not** connected to the results folder selection option in the visualization tab. Once a results folder is set, the user can click the button 'Load Migration and Peak Area Data' which will grab the required .csv files from the results folder you selected and upload their information to the app. The peak area data can be viewed at any time in the Metadata subtab.
+This tab is where users can make large-scale modifications to their data after it has been edited or adjusted in the visualization tab. This requires you to have the 'Metabolite Peak Areas.csv' and the 'Metabolite Migration Times.csv' files. The user also must upload the 'Mass List and Parameters' file in the 'User Supplied Parameters' tab. Choose the existing run in Engine to identify its saved data, or upload real files for a new analysis. Visualization's selected analysis is also selected in Downstream Processing. The downstream results-folder control remains available to change the analysis used there. Once a results folder is set, the user can click the button 'Load Migration and Peak Area Data' which will grab the required .csv files from the results folder you selected and upload their information to the app. The peak area data can be viewed at any time in the Metadata subtab.
 
 
 The app automatically generates a plot of the migration time versus the m/z and groups the data as internal standards and metabolites. The user can select the file they wish to look at in addition to selecting the peak being displayed.

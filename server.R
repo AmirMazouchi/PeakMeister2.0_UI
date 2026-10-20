@@ -1,21 +1,10 @@
-# Existing-analysis UI cleanup: removed Engine filename/status messages and its
-# navigation button. Visualization's file picker is shown for new analyses and
-# legacy pseudo-file selections; saved runs use their automatically selected file.
-# Open existing analysis now selects Results/<run> instead of a raw mz5 file.
-# The app reads saved directory names to identify the original filename, and
-# Visualization lists only analysis versions inside that selected run folder.
-# Startup/display fixes: show the rendered README as HTML in its own frame,
-# and wait for browser events before reading Plotly data. Main-plot and baseline
-# dialog events have separate sources. Use with the matching navigation fixes in ui.R.
-# Results are stored under Results/<mz5 filename without extension>/Results <date> [number].
-# Visualization lists saved analyses matching its selected mz5 filename, including
-# compatible legacy Results folders when using the retained pseudo-file workflow.
-# Multi-file new analyses write a separate Results folder for each input file.
-
-# Analysis modes added: New analysis reads uploaded mz5 data; Open existing
-# analysis uses saved run folders and opens the corresponding saved results.
-# The legacy pseudo-file workflow is retained. Source checks prevent saved-run
-# selections and pseudo files from reaching Initialize Run. Use with matching ui.R.
+# Existing analysis selects Results/<run> and automatically opens its latest
+# Results <date> [number] version. Dates and numeric rerun numbers determine the
+# default; choosing an older version remains possible in Visualization.
+# New analyses upload real mz5 files. Reopening uses saved filenames and never
+# reads raw mz5 contents. File-name generation controls and handlers are removed.
+# Run/analysis dropdowns support clearing and reselecting the same analysis.
+# README HTML and Plotly startup fixes are retained. Use with matching ui.R.
 
 # Timing instrumentation added for Initialize Run (2026-10-16).
 # Records elapsed seconds per input file for reading, calibration, extraction,
@@ -486,7 +475,6 @@ server <- function(input, output, session){
                stringsAsFactors = FALSE)
   }
   uploadedmz5 <- reactiveVal(empty_mz5_files())
-  pseudomz5names <- reactiveVal(data.frame(FileName = "", stringsAsFactors = FALSE))
   selected_saved_run <- reactiveVal(character())
   analysis_mode <- reactive({
     if (identical(input$analysis_mode, "existing")) "existing" else "new"
@@ -604,7 +592,7 @@ server <- function(input, output, session){
     DT::datatable(uploadedmz5()[, "FileName", drop = FALSE], options = list(pageLength = 5))
   })
   output$show_visualization_file_selector <- renderText({
-    if (analysis_mode() == "new" || any(uploadedmz5()$Source == "pseudo")) "true" else "false"
+    if (analysis_mode() == "new") "true" else "false"
   })
   outputOptions(output, "show_visualization_file_selector", suspendWhenHidden = FALSE)
 
@@ -621,7 +609,7 @@ server <- function(input, output, session){
     newFiles <- data.frame(FileName = input$mz5Files$name,
                            FilePath = input$mz5Files$datapath, Source = "upload",
                            stringsAsFactors = FALSE)
-    # Preserve uploads from this mode only; placeholders cannot become raw inputs.
+    # Preserve uploads from this mode only; saved selections cannot become raw inputs.
     current <- uploadedmz5()
     current <- current[current$Source == "upload", , drop = FALSE]
     uploadedmz5(rbind(current, newFiles))
@@ -631,9 +619,6 @@ server <- function(input, output, session){
   observeEvent(input$existing_run, {
     if (analysis_mode() != "existing") return()
     run <- input$existing_run
-    # Clearing the run selector must not erase a legacy pseudo-file selection.
-    if ((is.null(run) || identical(run, "")) &&
-        nrow(uploadedmz5()) && all(uploadedmz5()$Source == "pseudo")) return()
     uploadedmz5(empty_mz5_files())
     selected_saved_run(character())
     if (is.null(run) || identical(run, "")) return()
@@ -653,66 +638,11 @@ server <- function(input, output, session){
 
   observeEvent(input$clearFiles, {
     uploadedmz5(empty_mz5_files())
-    pseudomz5names(data.frame(FileName = "", stringsAsFactors = FALSE))
     selected_saved_run(character())
     updateSelectInput(session, "existing_run", selected = "")
     reset_raw_selection()
   })
 
-  ######3.1.2 Upload file names and generate pseudo .mz5 files######
-  #Render the editable data table
-  output$mz5fileTable <- DT::renderDataTable({
-    datatable(pseudomz5names(), editable = TRUE, options = list(pageLength = 5))
-  })
-  
-  #Observe changes in the table and update the reactive variable with the input information
-  observeEvent(input$mz5fileTable_cell_edit, {
-    info <- input$mz5fileTable_cell_edit
-    newFileNames <- pseudomz5names()
-    newFileNames[info$row, info$col] <- info$value
-    pseudomz5names(newFileNames)})
-  
-  #Update the reactive value with filenames from the uploaded Excel file
-  observeEvent(input$excelFile, {
-    req(input$excelFile)
-    excel_data <- read_excel(input$excelFile$datapath)
-    newFiles <- data.frame(
-      FileName = excel_data$FileName,
-      stringsAsFactors = FALSE)
-    pseudomz5names(newFiles)
-  })
-  
-  #Generate pseudo .mz5 files based on filenames in the data table. 
-  #These are empty .mz5 files soley used for accessing the metadata specific to each file without having to upload these large files every single time to process the data.
-  observeEvent(input$generateFiles, {
-    req(pseudomz5names())
-    
-    #Generate empty .mz5 files
-    newFiles <- data.frame(
-      FileName = paste0(pseudomz5names()$FileName, ".mz5"),
-      FilePath = sapply(pseudomz5names()$FileName, function(name) {
-        file_path <- tempfile(fileext = ".mz5")
-        file.create(file_path)
-        file_path
-      }), Source = "pseudo", stringsAsFactors = FALSE)
-    
-    #Store empty .mz5 files in the reactive variable for use elsewhere in the app.
-    selected_saved_run(character())
-    updateSelectInput(session, "existing_run", selected = "")
-    uploadedmz5(newFiles)
-    
-    showNotification("Pseudo .mz5 files generated", type = "message")
-  })
-  
-  #Add empty rows to the table
-  observeEvent(input$addRow, {
-    currentData <- pseudomz5names()
-    newRow <- data.frame(FileName = "", stringsAsFactors = FALSE)
-    updatedData <- rbind(currentData, newRow)
-    pseudomz5names(updatedData)
-  })
-  
-  
   #####3.2 Initialze Run Button - Main Content######
   #Initialize run button - main engine content 
   observeEvent(input$initialize, {
@@ -723,7 +653,7 @@ server <- function(input, output, session){
     files <- uploadedmz5()
     if (!nrow(files) || !valid_mz5_names(files$FileName) || any(files$Source != "upload") ||
         anyNA(files$FilePath) || !all(file.exists(files$FilePath))) {
-      shiny::showNotification("Upload real .mz5 files for a new analysis. Saved-analysis selections and pseudo files cannot be processed.", type = "error")
+      shiny::showNotification("Upload real .mz5 files for a new analysis. Saved-analysis selections cannot be processed.", type = "error")
       return(NULL)
     }
     
@@ -3315,6 +3245,24 @@ server <- function(input, output, session){
     checkFunc = function() list_results_folders(selected_results_filename(), selected_saved_run()),
     valueFunc = function() list_results_folders(selected_results_filename(), selected_saved_run()))
 
+  latest_results_folder <- function(folders) {
+    if (!length(folders)) return("")
+    parts <- regmatches(basename(folders), regexec(
+      "^Results ([0-9]{4}-[0-9]{2}-[0-9]{2})(?: ([0-9]+))?$", basename(folders), perl = TRUE))
+    dates <- as.Date(vapply(parts, function(x) if (length(x)) x[2] else NA_character_,
+      character(1)), format = "%Y-%m-%d")
+    versions <- vapply(parts, function(x) {
+      if (length(x) >= 3L && nzchar(x[3])) as.numeric(x[3]) else 1
+    }, numeric(1))
+    dated <- which(!is.na(dates))
+    if (length(dated)) {
+      return(folders[dated[order(dates[dated], versions[dated], folders[dated],
+        decreasing = TRUE)[1]]])
+    }
+    # Retain support for saved folders with older, nonstandard names.
+    folders[order(file.info(folders)$mtime, folders, decreasing = TRUE, na.last = TRUE)[1]]
+  }
+
   output$results_folder_status <- renderText({
     filename <- selected_results_filename()
     if (!length(filename)) return("In Engine, select a saved run or upload files for a new analysis.")
@@ -3331,8 +3279,9 @@ server <- function(input, output, session){
     same_file <- identical(filename, last_results_filename())
     last_results_filename(filename)
     choices <- c("Select a saved analysis" = "", stats::setNames(folders, folders))
-    updateSelectInput(session, "results_folder", choices = choices,
-      selected = if (same_file && length(current) == 1L && current %in% folders) current else "")
+    selected <- if (same_file && length(current) == 1L && current %in% folders) current else
+      if (analysis_mode() == "existing" && length(selected_saved_run())) latest_results_folder(folders) else ""
+    updateSelectInput(session, "results_folder", choices = choices, selected = selected)
   }, ignoreNULL = FALSE)
 
   db_con <- reactiveVal(NULL)

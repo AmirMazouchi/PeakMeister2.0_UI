@@ -1,17 +1,8 @@
-# Existing-analysis cleanup: Engine keeps the run picker and uses sidebar navigation;
-# Visualization hides its redundant file picker for saved runs. New analyses and
-# the retained pseudo-file workflow keep file selection. The folder reminder is removed.
-# Clear/reselect fix: run and analysis dropdowns start with an explicit empty
-# option so Shiny reports cleared selections and allows choosing the same run again.
-# Startup/display fix: Engine uses a normal layout container because it has no
-# sub-tabs. Real tab sets elsewhere retain their existing panels and controls.
-# Open existing analysis selects a run folder under Results; no raw mz5 selection
-# or upload is needed. Visualization selects a saved analysis for that run.
-
-# Analysis modes added: New analysis uploads real mz5 files; Open existing analysis
-# uses the filenames recorded inside the selected saved run folder.
-# The legacy pseudo-file controls are retained and styled green for later removal.
-# Use this ui.R together with server.R from the same analysis-mode branch.
+# Existing analysis selects a Results/<run> folder and automatically opens its
+# latest dated analysis. Visualization keeps the version selector for older results.
+# File selection is shown only for new analyses; file-name generation controls
+# have been removed. Empty run/analysis selections are reported correctly to Shiny.
+# Use this ui.R with server.R from the same branch.
 
 #PeakMeister2.0_UI was written by Erick Helmeczi and Liam Surry 
 #Initialized 2024-11-12 @McMaster University
@@ -118,17 +109,6 @@ ui <- dashboardPage(
       }
       "))
     ),
-    tags$style(HTML("
-      #pseudo_file_workflow,
-      #pseudo_file_workflow h4,
-      #pseudo_file_workflow label,
-      #pseudo_file_workflow .form-control,
-      #pseudo_file_workflow .btn,
-      #pseudo_file_workflow table th,
-      #pseudo_file_workflow table td,
-      #pseudo_file_workflow input,
-      #pseudo_file_workflow select { color: #188038 !important; }
-    ")),
     useShinyjs(),
     use_waiter(),
 
@@ -339,19 +319,9 @@ ui <- dashboardPage(
                      tags$h4("Open existing analysis"),
                      selectInput("existing_run", "Select run folder in Results:",
                                  choices = c("Select a run" = "")),
-                     helpText("Choose a saved run. The original .mz5 file is not needed.")
+                     helpText("The latest saved analysis opens automatically. The original .mz5 file is not needed.")
                    ),
-                   actionButton("clearFiles", "Clear Files"),
-            ),
-            column(1,),
-            column(5,
-                   div(id = "pseudo_file_workflow",
-                   tags$h4(style = "text-decoration: underline;", "Generate Pseudo .mz5 Files to Access Stored Datafiles"),
-                   fileInput("excelFile", "Upload Excel File of File Names (.xlsx)", accept = c(".xlsx")),
-                   DTOutput("mz5fileTable"),
-                   actionButton("addRow", "Add Empty Row"),
-                   actionButton("generateFiles", "Generate Pseudo .mz5 Files")
-                   )
+                   actionButton("clearFiles", "Clear Files")
             )
           )
         ),
