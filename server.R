@@ -1,3 +1,6 @@
+# Saved-analysis loading runs once per connection/file change. Saved traces are
+# matched by exact list name or a unique saved label, with checks for missing or
+# malformed traces. RData is read once per file; SQLite edits remain authoritative.
 # Metadata is shared at Results/<run>/metadata.csv for all saved analyses of
 # that raw file. Existing analysis/Data/metadata.csv remains a fallback; the
 # shared file takes priority. Merged results stay inside the selected analysis.
@@ -3102,24 +3105,63 @@ server <- function(input, output, session){
     })
   }
   
-  #Read one metabolites plot data from database and eie_df from .Rdata file
-  read_plot_data_from_db <- function(con, results_folder, file_name, metabolite) {
-    
-    #eie_data: load from .RData -> in .Rdata for now since eie_df is the largest dataset for each metabolite. Its never edited so, for now its in here.
-    rdata_path <- file.path(results_folder, "Data",
-                            paste0(file_name, ".mz5"),
+  # Read immutable traces once when opening a file; editable data stays in SQLite.
+  load_saved_plot_list <- function(results_folder, file_name) {
+    rdata_path <- file.path(results_folder, "Data", paste0(file_name, ".mz5"),
                             "plot_list_data.RData")
-    #Load into new environment 
-    env <- new.env()
+    if (!file.exists(rdata_path)) stop("Saved plot data file is missing: ", rdata_path,
+                                      call. = FALSE)
+    env <- new.env(parent = emptyenv())
     load(rdata_path, envir = env)
-    eie_raw <- env$plot_list[[metabolite]]$eie_data
-    rm(env)
-    
-    eie_db <- data.frame(
-      mt.seconds = eie_raw[[1]],
-      intensity  = eie_raw[[2]],
-      stringsAsFactors = FALSE
-    )
+    plots <- env[["plot_list"]]
+    if (!is.list(plots) || !length(plots)) {
+      stop("No saved plot_list was found in ", rdata_path, call. = FALSE)
+    }
+    plots
+  }
+
+  # Never guess by list position: names or the stored metabolite label must agree.
+  read_saved_electropherogram <- function(plots, metabolite, rdata_path) {
+    matches <- which(names(plots) == metabolite)
+    if (!length(matches)) {
+      matches <- which(vapply(plots, function(plot) {
+        if (!is.list(plot)) return(FALSE)
+        label <- plot[["label_data"]]
+        length(label) > 0L && !is.na(label[1]) && identical(as.character(label[1]), metabolite)
+      }, logical(1)))
+    }
+    problem <- function(detail) stop(
+      "Cannot load saved electropherogram for '", metabolite, "': ", detail,
+      ". File: ", rdata_path,
+      ". The saved RData and results.sqlite must belong to the same analysis; keep both files together.",
+      call. = FALSE)
+    if (length(matches) != 1L) {
+      problem(if (length(matches)) "multiple saved traces match this metabolite" else
+                "the database metabolite has no matching saved trace")
+    }
+    plot <- plots[[matches]]
+    if (!is.list(plot)) problem("the saved plot entry is invalid")
+    trace <- plot[["eie_data"]]
+    # Positional plot entries use the first component for the trace.
+    if (is.null(trace) && is.null(names(plot)) && length(plot)) trace <- plot[[1]]
+    if (!(is.data.frame(trace) || is.matrix(trace)) || ncol(trace) < 2L || nrow(trace) == 0L) {
+      problem("the saved trace is missing or has no time/intensity columns")
+    }
+    times <- if (is.matrix(trace)) trace[, 1] else trace[[1]]
+    intensities <- if (is.matrix(trace)) trace[, 2] else trace[[2]]
+    if (!is.numeric(times) || !is.numeric(intensities) ||
+        !any(is.finite(times) & is.finite(intensities))) {
+      problem("the saved trace has no usable numeric time/intensity pairs")
+    }
+    data.frame(mt.seconds = times, intensity = intensities, stringsAsFactors = FALSE)
+  }
+
+  # Read one metabolite's editable plot data from SQLite and its saved trace.
+  read_plot_data_from_db <- function(con, results_folder, file_name, metabolite, saved_plots = NULL) {
+    rdata_path <- file.path(results_folder, "Data", paste0(file_name, ".mz5"),
+                            "plot_list_data.RData")
+    if (is.null(saved_plots)) saved_plots <- load_saved_plot_list(results_folder, file_name)
+    eie_db <- read_saved_electropherogram(saved_plots, metabolite, rdata_path)
     colnames(eie_db)[2] <- paste(metabolite, "intensity")
     
     #annotation_data
@@ -3345,8 +3387,10 @@ server <- function(input, output, session){
                               "SELECT DISTINCT metabolite FROM plot_axis_data WHERE file_name =?",
                               params = list(file_name)
                               )$metabolite
+    if (!length(metabolites)) stop("No saved plot records found for ", file_name, call. = FALSE)
+    saved_plots <- load_saved_plot_list(results_folder, file_name)
     plot_list <- lapply(metabolites, function(metab){
-      read_plot_data_from_db(con, results_folder, file_name, metab)
+      read_plot_data_from_db(con, results_folder, file_name, metab, saved_plots)
     })
     names(plot_list) <- metabolites
     plot_list
@@ -3583,8 +3627,8 @@ server <- function(input, output, session){
     }
   })
   
-  #When file selector changes, load all data from database into reactive values
-  observe_action(input$file_selector, {
+  # One loader handles both opening a connection and switching the selected file.
+  observe_action(list(db_con(), input$file_selector), {
     req(db_con(), input$file_selector)
     con       <- db_con()
     folder    <- main_folder()
@@ -3603,16 +3647,8 @@ server <- function(input, output, session){
       return()
     }
     
-    #Load plot_list (eie from .RData, rest from database)
-    plot_list <- tryCatch(
-      load_plot_list_from_db(con, folder, file_name),
-      error = function(e) {
-        showNotification(paste("Error loading data:", conditionMessage(e)),
-                         type = "error")
-        NULL
-      }
-    )
-    req(!is.null(plot_list))
+    # Validate both sources before replacing any session state.
+    plot_list <- load_plot_list_from_db(con, folder, file_name)
 
     #Load wide-format data for integration functions
     wide <- load_wide_data_from_db(con, file_name)
@@ -3638,67 +3674,9 @@ server <- function(input, output, session){
         "| metabolites:", length(plot_list), "\n")
 
     plot_render_trigger(plot_render_trigger() + 1)
-  })
-  
-#Obsereve block for loading data when app first launches when a results folder is selected and files havent been changed. Required for direct data acquisition after app startup and no file switch.
-  observe_action(db_con(), {
-    req(db_con(), input$file_selector)
-    con       <- db_con()
-    folder    <- main_folder()
-    file_name <- sub("\\.mz5$", "", input$file_selector)
-    
-    #Check for datafile
-    file_exists_in_db <- tryCatch({
-      count <- dbGetQuery(con,
-                          "SELECT COUNT(*) FROM plot_axis_data WHERE file_name = ?",
-                          params = list(file_name))[[1]]
-      count > 0
-    }, error = function(e) FALSE)
-    
-    if (!file_exists_in_db) {
-      cat("File not yet in database, skipping load:", file_name, "\n")
-      return()
-    }
-    
-    #Load plot list eie_data and editable ddata from database
-    plot_list <- tryCatch(
-      load_plot_list_from_db(con, folder, file_name),
-      error = function(e) {
-        showNotification(paste("Error loading data:", conditionMessage(e)),
-                         type = "error")
-        NULL
-      }
-    )
-    req(!is.null(plot_list))
-    
-    #load data in wide format for integration and editing functions
-    wide <- load_wide_data_from_db(con, file_name)
-    
-    #Populate values
-    plot_list_data_values$plot_list    <- plot_list
-    plot_list_data_values$comment_df   <- wide$comment_df
-    plot_list_data_values$peaks_df     <- wide$peaks_df
-    plot_list_data_values$peak_mt_df   <- wide$peak_mt_df
-    plot_list_data_values$peak_area_df <- wide$peak_area_df
-    plot_list_data_values$mi_df        <- wide$mi_df
-    plot_list_data_values$file_name    <- file_name
-    
-    run_metadata$plot_list    <- plot_list
-    run_metadata$comment_df   <- wide$comment_df
-    run_metadata$peaks_df     <- wide$peaks_df
-    run_metadata$peak_mt_df   <- wide$peak_mt_df
-    run_metadata$peak_area_df <- wide$peak_area_df
-    run_metadata$mi_df        <- wide$mi_df
-    run_metadata$file_name    <- input$file_selector
-    
-    cat("Loaded from database (on connection):", file_name,
-        "| metabolites:", length(plot_list), "\n")
-    
-    #Update annotation table rendering with new data
-    plot_render_trigger(plot_render_trigger() + 1)
-  })
-  
-  
+  }, on_error = function() clear_loaded_analysis())
+
+
   #####4.3 Render and display plots and annotation information#####
   
   ######4.3.1 Populate plot table and render selected plot######

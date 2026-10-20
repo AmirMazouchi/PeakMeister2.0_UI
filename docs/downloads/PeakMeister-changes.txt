@@ -39,6 +39,16 @@ ui.R
 
 server.R
 
+- Replaced duplicate saved-analysis load observers with one observer for both
+  connection and file selection. Opening a saved file reads its RData once.
+- Match saved electropherograms by exact list name or a unique saved metabolite
+  label. Support numeric matrices and positional trace entries. Preserve SQLite
+  peak edits; do not rebuild or overwrite saved results during loading.
+- Check missing/empty/malformed/ambiguous traces before assigning column names.
+  Show one error identifying the metabolite and saved file, clear stale editing
+  state, and keep the session available for another selection.
+- Added tests/saved-analysis-loading.R reproducing the reported names/vector
+  exception and exercising real saved-data loading, recovery, and run switching.
 - Share metadata across dated analyses at Results/<run>/metadata.csv. Derive the
   run folder from the selected analysis; the shared file takes priority over an
   existing <analysis>/Data/metadata.csv, which remains a compatibility fallback.

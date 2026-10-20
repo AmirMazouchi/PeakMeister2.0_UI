@@ -36,6 +36,7 @@ processing starts on **Engine**.
 | Save PNGs and build interactive plots | `save_static_plots()`, `build_interactive_plots()` | Engine → New analysis → Initialize Run |
 | Prepare report tables | `build_result_tables()` | Engine → New analysis → Initialize Run |
 | Save RData, SQLite, CSVs and Plotly objects | `save_analysis_snapshot()`, `save_analysis_database()`, `export_result_csvs()`, `save_interactive_plots()` | Engine → New analysis → Initialize Run |
+| Load saved traces and editable peak data | `load_saved_plot_list()`, `read_saved_electropherogram()`, `read_plot_data_from_db()`, `load_plot_list_from_db()`, `load_wide_data_from_db()` | Engine → Open existing analysis → Select run folder; Visualization → Select saved analysis for this file / Select File |
 | Stage timing and error/interrupt reports | `new_run_timer()` | Engine → New analysis → Initialize Run |
 | Delete selected/middle/all peaks and undo | `delete_selected_peaks()`, `delete_middle_peaks()`, `delete_all_peaks()`, `undo_peak_deletion()` | Visualization → Plotting → Delete Selected Peaks / Delete Middle Peaks / Delete all peaks / Undo Peak Deletion, respectively |
 | Regenerate changed plots | `regenerate_changed_plots()` | Visualization → Plotting → Other → Regenerate Changed Plots |
@@ -53,6 +54,15 @@ GUI action helpers use their own Shiny session's reactive state. The observers
 remain responsible for reacting to buttons and updating the GUI. Existing saved
 analysis discovery, SQLite helpers, manual integration and baseline functions
 remain in place.
+
+Saved analyses use one load observer for connection/file changes, replacing two
+duplicate observers. Each opening reads `plot_list_data.RData` once, then joins
+its immutable traces to SQLite's current edited data. Traces match by exact list
+name, or by a unique stored metabolite label when list names differ. Matrix and
+positional trace entries are supported. Missing, ambiguous, empty or malformed
+traces produce one guarded message identifying the metabolite and RData path;
+stale editing/undo state is cleared. A missing trace cannot be reconstructed from
+SQLite alone. Loading does not rebuild the database or overwrite stored edits.
 
 Metadata is shared between dated analyses at `Results/<run>/metadata.csv`.
 `metadata_file_paths()` derives that path from the selected analysis, so switching
@@ -111,6 +121,7 @@ Validation:
 
 - `Rscript --vanilla tests/gui-startup.R`
 - `Rscript --vanilla tests/saved-run-selection.R`
+- `Rscript --vanilla tests/saved-analysis-loading.R`
 - `Rscript --vanilla tests/modular-server.R`
 - `Rscript --vanilla tests/quality-metrics.R`
 - `Rscript --vanilla tests/action-errors.R`
@@ -124,6 +135,13 @@ and failure cleanup. PNG writing and raw MSnbase decoding use test adapters.
 The equivalence check compares those outputs with the pre-refactor server
 (commit `3604a346c92089342519746d578ecb19f0bf4488`) and compares the moved GUI
 action bodies. GUI startup and saved-run tests use the actual handlers.
+
+The saved-analysis-loading test reproduces the reported `'names' attribute [2]`
+error with a missing list key. Real SQLite/RData fixtures verify recovery by a
+unique saved label, matrix/positional traces, retained database edits, one load
+per connection/file update, informative errors for unrecoverable traces, and
+switching dated analyses/runs after a failure. The user's saved files were not
+available for testing.
 
 The quality-metrics tests use a 12-sample, 20-metabolite fixture to verify PCA
 against an independent correlation-matrix eigendecomposition. They exercise
