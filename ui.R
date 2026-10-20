@@ -1,3 +1,8 @@
+# Analysis modes added: New analysis uploads real mz5 files; Open existing analysis
+# uses a browser-only picker that sends filenames without uploading file contents.
+# The legacy pseudo-file controls are retained and styled green for later removal.
+# Use this ui.R together with server.R from the same analysis-mode branch.
+
 #PeakMeister2.0_UI was written by Erick Helmeczi and Liam Surry 
 #Initialized 2024-11-12 @McMaster University
 #Department of Chemistry and Chemical Biology 
@@ -22,7 +27,7 @@ ui <- dashboardPage(
   #### 2. Sidebar Main Tabs ####
   #Set up sidebar and tabs
   dashboardSidebar(
-    sidebarMenu(
+    sidebarMenu(id = "main_navigation",
       #About tab -> for README and instructions
       menuItem("About",
         tabName = "about",
@@ -102,7 +107,35 @@ ui <- dashboardPage(
         color: #1999CC;
       }
       "))
-    ),useShinyjs(),
+    ),
+    tags$style(HTML("
+      #pseudo_file_workflow,
+      #pseudo_file_workflow h4,
+      #pseudo_file_workflow label,
+      #pseudo_file_workflow .form-control,
+      #pseudo_file_workflow .btn,
+      #pseudo_file_workflow table th,
+      #pseudo_file_workflow table td,
+      #pseudo_file_workflow input,
+      #pseudo_file_workflow select { color: #188038 !important; }
+    ")),
+    tags$script(HTML("
+      window.peakMeisterChooseExistingFiles = function () {
+        var picker = document.createElement('input');
+        picker.type = 'file';
+        picker.accept = '.mz5';
+        picker.multiple = true;
+        // Keep the picker outside the DOM so Shiny cannot bind it as an upload.
+        picker.addEventListener('change', function () {
+          var names = Array.from(picker.files || []).map(function (file) { return file.name; });
+          if (names.length && window.Shiny) {
+            Shiny.setInputValue('existing_mz5_selection', { names: names }, { priority: 'event' });
+          }
+        });
+        picker.click();
+      };
+    ")),
+    useShinyjs(),
     use_waiter(),
 
     tabItems(
@@ -299,26 +332,40 @@ ui <- dashboardPage(
           id = "Setup",
           fluidRow(
             column(6,
-                   tags$h4(style = "text-decoration: underline;", "File Uploads for Initializing Data Preprocessing"),
-                   #File upload button
-                   fileInput("mz5Files", "Upload .mz5 Files", accept = c(".mz5"), multiple = TRUE),
-                  #checkbox to enable autoinitialization or not 
-                  checkboxInput("autorun", "Start run automatically after upload", value = FALSE),
-                   #Display uploaded files in table 
-                   DT::dataTableOutput("fileTable"),
-                   #Clear uploaded files
-                  actionButton("clearFiles", "Clear Files"),
+                   radioButtons("analysis_mode", "Choose analysis mode",
+                                choices = c("New analysis" = "new", "Open existing analysis" = "existing"),
+                                selected = "new"),
+                   helpText("Switching modes clears the selected file list. Saved results are kept."),
+                   conditionalPanel("input.analysis_mode === 'new'",
+                     tags$h4(style = "text-decoration: underline;", "File Uploads for Initializing Data Preprocessing"),
+                     fileInput("mz5Files", "Upload .mz5 Files", accept = c(".mz5"), multiple = TRUE),
+                     checkboxInput("autorun", "Start run automatically after upload", value = FALSE)
+                   ),
+                   conditionalPanel("input.analysis_mode === 'existing'",
+                     tags$h4("Open existing analysis"),
+                     selectInput("existing_results_folder", "Select saved Results folder:", choices = NULL),
+                     tags$button(id = "choose_existing_mz5", type = "button", class = "btn btn-default",
+                                 onclick = "peakMeisterChooseExistingFiles()", "Select real .mz5 files (names only)"),
+                     helpText("The selected raw files stay on your computer. Only their names are sent to the app."),
+                     textOutput("existing_selection_summary"),
+                     actionButton("open_existing_analysis", "Open Existing Analysis"),
+                     textOutput("existing_analysis_status")
+                   ),
+                   actionButton("clearFiles", "Clear Files"),
             ),
             column(1,),
             column(5,
+                   div(id = "pseudo_file_workflow",
                    tags$h4(style = "text-decoration: underline;", "Generate Pseudo .mz5 Files to Access Stored Datafiles"),
                    fileInput("excelFile", "Upload Excel File of File Names (.xlsx)", accept = c(".xlsx")),
                    DTOutput("mz5fileTable"),
                    actionButton("addRow", "Add Empty Row"),
-                   actionButton("generateFiles", "Generate Pseudo .mz5 Files"),
+                   actionButton("generateFiles", "Generate Pseudo .mz5 Files")
+                   )
             )
           )
         ),
+        conditionalPanel("input.analysis_mode === 'new'",
         fluidRow(
           column(6,
                  #Big red button for initializing the run.This is where most of the calculations are done
@@ -330,7 +377,9 @@ ui <- dashboardPage(
                       border-width:10px;
                       border-radius:0%;
                       font-size:40px; width: 100%;")),
-              ),
+              )
+        ),
+       DT::dataTableOutput("fileTable"),
       #Create progress bar for monitoring computation 
        uiOutput("progressBar")
       ),

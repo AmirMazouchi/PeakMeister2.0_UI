@@ -1,3 +1,8 @@
+# Analysis modes added: New analysis reads uploaded mz5 data; Open existing
+# analysis accepts filenames only and opens the corresponding saved results.
+# The legacy pseudo-file workflow is retained. Source checks prevent name-only
+# selections and pseudo files from reaching Initialize Run. Use with matching ui.R.
+
 # Timing instrumentation added for Initialize Run (2026-10-16).
 # Records elapsed seconds per input file for reading, calibration, extraction,
 # smoothing, peak processing, plotting, RData saving, SQLite writes and exports.
@@ -447,44 +452,130 @@ server <- function(input, output, session){
   ####3. Engine tab####
   #####3.1 mz5 file upload#####
   ######3.1.1 Upload real .mz5 files######
-  #Initialize reactive value to store uploaded files
-  uploadedmz5 <- reactiveVal(data.frame(FileName = character(), FilePath = character(), stringsAsFactors = FALSE))
-  
-  #Reactive value to store pseudo .mz5 files if they are being generated
+  empty_mz5_files <- function() {
+    data.frame(FileName = character(), FilePath = character(), Source = character(),
+               stringsAsFactors = FALSE)
+  }
+  uploadedmz5 <- reactiveVal(empty_mz5_files())
   pseudomz5names <- reactiveVal(data.frame(FileName = "", stringsAsFactors = FALSE))
+  existing_mz5_names <- reactiveVal(character())
+  existing_analysis_status <- reactiveVal("")
+  analysis_mode <- reactive({
+    if (identical(input$analysis_mode, "existing")) "existing" else "new"
+  })
+
+  reset_raw_selection <- function() shinyjs::reset("mz5Files")
+  request_new_analysis <- function() shinyjs::click("initialize")
+
+  # Reject ambiguous names before constructing paths or matching stored records.
+  valid_mz5_names <- function(names) {
+    is.character(names) && length(names) > 0L && !anyNA(names) &&
+      all(nzchar(names)) && !anyDuplicated(names) &&
+      all(grepl("\\.mz5$", names, ignore.case = TRUE)) &&
+      !any(grepl("[/\\\\]", names))
+  }
+
+  # Only inspect saved result files/database; never open the selected raw files.
+  check_saved_analysis <- function(folder, names) {
+    if (!valid_mz5_names(names)) stop("Select real .mz5 files with distinct filenames.")
+    if (length(folder) != 1L || is.na(folder) || !folder %in% list_results_folders()) {
+      stop("Select an available saved Results folder.")
+    }
+    paths <- file.path(folder, "Data", names, "plot_list_data.RData")
+    missing <- names[!file.exists(paths)]
+    if (length(missing)) {
+      stop("No saved results found for: ", paste(missing, collapse = ", "),
+           ". Select the matching Results folder and original filenames.")
+    }
+    # If no database exists, the existing migration dialog will offer to build it.
+    if (db_exists(folder)) {
+      con <- DBI::dbConnect(RSQLite::SQLite(), get_db_path(folder), flags = RSQLite::SQLITE_RO)
+      on.exit(DBI::dbDisconnect(con), add = TRUE)
+      stored <- DBI::dbGetQuery(con, "SELECT DISTINCT file_name FROM plot_axis_data")$file_name
+      missing <- names[!sub("\\.mz5$", "", names) %in% stored]
+      if (length(missing)) stop("Files are missing from the saved database: ", paste(missing, collapse = ", "))
+    }
+    invisible(TRUE)
+  }
+
+  output$fileTable <- DT::renderDataTable({
+    DT::datatable(uploadedmz5()[, "FileName", drop = FALSE], options = list(pageLength = 5))
+  })
+  output$existing_selection_summary <- renderText({
+    names <- existing_mz5_names()
+    if (!length(names)) "No files selected." else paste(names, collapse = ", ")
+  })
+  output$existing_analysis_status <- renderText(existing_analysis_status())
+
+  observeEvent(input$analysis_mode, {
+    uploadedmz5(empty_mz5_files())
+    existing_mz5_names(character())
+    existing_analysis_status("")
+    reset_raw_selection()
+  }, ignoreInit = TRUE, priority = 100)
 
   observeEvent(input$mz5Files, {
-    req(input$mz5Files)  
-    
-    #Get the names and paths of the uploaded files
-    newFiles <- data.frame(
-      FileName = input$mz5Files$name,
-      FilePath = input$mz5Files$datapath,
-      stringsAsFactors = FALSE)
-    
-    #Update the reactive value with the new files
-    updatedFiles <- bind_rows(uploadedmz5(), newFiles) 
-    uploadedmz5(updatedFiles)
+    if (analysis_mode() != "new") return()
+    req(input$mz5Files)
+    newFiles <- data.frame(FileName = input$mz5Files$name,
+                           FilePath = input$mz5Files$datapath, Source = "upload",
+                           stringsAsFactors = FALSE)
+    # Preserve uploads from this mode only; placeholders cannot become raw inputs.
+    current <- uploadedmz5()
+    current <- current[current$Source == "upload", , drop = FALSE]
+    uploadedmz5(rbind(current, newFiles))
+    if (isTRUE(input$autorun)) request_new_analysis()
+  })
 
-    
-    #Render the data table automatically when files are uploaded
-    output$fileTable <- DT::renderDataTable({
-      DT::datatable(uploadedmz5(), options = list(pageLength = 5))
-    })
-    
-    #Automatically start run if checkbox is checked: Note, will not display updated file tables until run is finished. 
-    if (input$autorun){
-      shinyjs::click("initialize")
+  observeEvent(input$existing_mz5_selection, {
+    if (analysis_mode() != "existing") return()
+    names <- unlist(input$existing_mz5_selection$names, use.names = FALSE)
+    uploadedmz5(empty_mz5_files())
+    existing_mz5_names(character())
+    existing_analysis_status("")
+    if (!valid_mz5_names(names)) {
+      showNotification("Select real .mz5 files with distinct filenames.", type = "error")
+      return()
     }
+    existing_mz5_names(names)
   })
-  
-  #Clear uploaded files
+
+  observeEvent(input$existing_results_folder, {
+    if (analysis_mode() != "existing") return()
+    uploadedmz5(empty_mz5_files())
+    existing_analysis_status("")
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$open_existing_analysis, {
+    if (analysis_mode() != "existing") return()
+    names <- existing_mz5_names()
+    folder <- input$existing_results_folder
+    uploadedmz5(empty_mz5_files())
+    existing_analysis_status("")
+    error <- tryCatch({ check_saved_analysis(folder, names); NULL },
+                      error = function(e) conditionMessage(e))
+    if (!is.null(error)) {
+      existing_analysis_status(error)
+      showNotification(error, type = "error", duration = 10)
+      return()
+    }
+    uploadedmz5(data.frame(FileName = names, FilePath = NA_character_,
+                           Source = "name_only", stringsAsFactors = FALSE))
+    folders <- list_results_folders()
+    updateSelectInput(session, "results_folder", choices = folders, selected = folder)
+    updateSelectInput(session, "results_folder2", choices = folders, selected = folder)
+    updateTabItems(session, "main_navigation", selected = "processing")
+    existing_analysis_status(paste("Opened saved results for", length(names), "file(s)."))
+    showNotification("Saved results opened. Select a target in Loaded Plots to view it.", type = "message")
+  })
+
   observeEvent(input$clearFiles, {
-    #Clear the uploaded files
-    uploadedmz5(data.frame(FileName = character(), FilePath = character(), stringsAsFactors = FALSE))
+    uploadedmz5(empty_mz5_files())
     pseudomz5names(data.frame(FileName = "", stringsAsFactors = FALSE))
+    existing_mz5_names(character())
+    existing_analysis_status("")
+    reset_raw_selection()
   })
-  
 
   ######3.1.2 Upload file names and generate pseudo .mz5 files######
   #Render the editable data table
@@ -520,15 +611,12 @@ server <- function(input, output, session){
       FilePath = sapply(pseudomz5names()$FileName, function(name) {
         file_path <- tempfile(fileext = ".mz5")
         file.create(file_path)
-      }),stringsAsFactors = FALSE)
+        file_path
+      }), Source = "pseudo", stringsAsFactors = FALSE)
     
     #Store empty .mz5 files in the reactive variable for use elsewhere in the app.
     uploadedmz5(newFiles)
     
-    #Render the data table automatically when files are uploaded
-    output$fileTable <- DT::renderDataTable({
-      DT::datatable(uploadedmz5(), options = list(pageLength = 5))
-    })
     showNotification("Pseudo .mz5 files generated", type = "message")
   })
   
@@ -544,9 +632,16 @@ server <- function(input, output, session){
   #####3.2 Initialze Run Button - Main Content######
   #Initialize run button - main engine content 
   observeEvent(input$initialize, {
-    if (is.null(input$mz5Files)) {
-      shiny::showNotification("File upload required", type = "error")
-      return(NULL)}
+    if (analysis_mode() != "new") {
+      shiny::showNotification("Choose New analysis to process raw files.", type = "error")
+      return(NULL)
+    }
+    files <- uploadedmz5()
+    if (!nrow(files) || any(files$Source != "upload") ||
+        anyNA(files$FilePath) || !all(file.exists(files$FilePath))) {
+      shiny::showNotification("Upload real .mz5 files for a new analysis. Name-only selections and pseudo files cannot be processed.", type = "error")
+      return(NULL)
+    }
     
     #Generate a results folder that will not overwrite previous results folders
     count <- 1
@@ -3150,8 +3245,11 @@ server <- function(input, output, session){
   observeEvent(results_folders_reactive(), {
     new_choices <- results_folders_reactive()
     current     <- input$results_folder
-    updateSelectInput(session,"results_folder",choices  = new_choices,
-      selected = if (current %in% new_choices) current else new_choices[1])
+    updateSelectInput(session, "results_folder", choices = new_choices,
+      selected = if (length(current) == 1L && current %in% new_choices) current else head(new_choices, 1L))
+    current_existing <- input$existing_results_folder
+    updateSelectInput(session, "existing_results_folder", choices = new_choices,
+      selected = if (length(current_existing) == 1L && current_existing %in% new_choices) current_existing else head(new_choices, 1L))
   })
   
   #Reactive variable holding SQL database connection.-> very important variable for all other SQL functions
