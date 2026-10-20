@@ -1,10 +1,10 @@
 # Startup/display fix: Engine uses a normal layout container because it has no
 # sub-tabs. Real tab sets elsewhere retain their existing panels and controls.
-# Saved analyses are selected only in Visualization after choosing an mz5 name.
-# Results folders are filtered by that filename; Engine no longer duplicates the folder selector.
+# Open existing analysis selects a run folder under Results; no raw mz5 selection
+# or upload is needed. Visualization selects a saved analysis for that run.
 
 # Analysis modes added: New analysis uploads real mz5 files; Open existing analysis
-# uses a browser-only picker that sends filenames without uploading file contents.
+# uses the filenames recorded inside the selected saved run folder.
 # The legacy pseudo-file controls are retained and styled green for later removal.
 # Use this ui.R together with server.R from the same analysis-mode branch.
 
@@ -123,22 +123,6 @@ ui <- dashboardPage(
       #pseudo_file_workflow table td,
       #pseudo_file_workflow input,
       #pseudo_file_workflow select { color: #188038 !important; }
-    ")),
-    tags$script(HTML("
-      window.peakMeisterChooseExistingFiles = function () {
-        var picker = document.createElement('input');
-        picker.type = 'file';
-        picker.accept = '.mz5';
-        picker.multiple = true;
-        // Keep the picker outside the DOM so Shiny cannot bind it as an upload.
-        picker.addEventListener('change', function () {
-          var names = Array.from(picker.files || []).map(function (file) { return file.name; });
-          if (names.length && window.Shiny) {
-            Shiny.setInputValue('existing_mz5_selection', { names: names }, { priority: 'event' });
-          }
-        });
-        picker.click();
-      };
     ")),
     useShinyjs(),
     use_waiter(),
@@ -348,9 +332,8 @@ ui <- dashboardPage(
                    ),
                    conditionalPanel("input.analysis_mode === 'existing'",
                      tags$h4("Open existing analysis"),
-                     tags$button(id = "choose_existing_mz5", type = "button", class = "btn btn-default",
-                                 onclick = "peakMeisterChooseExistingFiles()", "Select real .mz5 files (names only)"),
-                     helpText("The selected raw files stay on your computer. Only their names are sent to the app."),
+                     selectInput("existing_run", "Select run folder in Results:", choices = NULL),
+                     helpText("Choose a saved run. The original .mz5 file is not needed."),
                      textOutput("existing_selection_summary"),
                      actionButton("open_existing_analysis", "Show Saved Results in Visualization"),
                      textOutput("existing_analysis_status")

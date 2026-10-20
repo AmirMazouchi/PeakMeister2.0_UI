@@ -1,14 +1,17 @@
+# Open existing analysis now selects Results/<run> instead of a raw mz5 file.
+# The app reads saved directory names to identify the original filename, and
+# Visualization lists only analysis versions inside that selected run folder.
 # Startup/display fixes: show the rendered README as HTML in its own frame,
 # and wait for browser events before reading Plotly data. Main-plot and baseline
 # dialog events have separate sources. Use with the matching navigation fixes in ui.R.
 # Results are stored under Results/<mz5 filename without extension>/Results <date> [number].
 # Visualization lists saved analyses matching its selected mz5 filename, including
-# compatible legacy Results folders. Engine selects filenames only when reopening.
+# compatible legacy Results folders when using the retained pseudo-file workflow.
 # Multi-file new analyses write a separate Results folder for each input file.
 
 # Analysis modes added: New analysis reads uploaded mz5 data; Open existing
-# analysis accepts filenames only and opens the corresponding saved results.
-# The legacy pseudo-file workflow is retained. Source checks prevent name-only
+# analysis uses saved run folders and opens the corresponding saved results.
+# The legacy pseudo-file workflow is retained. Source checks prevent saved-run
 # selections and pseudo files from reaching Initialize Run. Use with matching ui.R.
 
 # Timing instrumentation added for Initialize Run (2026-10-16).
@@ -482,6 +485,7 @@ server <- function(input, output, session){
   uploadedmz5 <- reactiveVal(empty_mz5_files())
   pseudomz5names <- reactiveVal(data.frame(FileName = "", stringsAsFactors = FALSE))
   existing_mz5_names <- reactiveVal(character())
+  selected_saved_run <- reactiveVal(character())
   existing_analysis_status <- reactiveVal("")
   analysis_mode <- reactive({
     if (identical(input$analysis_mode, "existing")) "existing" else "new"
@@ -504,6 +508,42 @@ server <- function(input, output, session){
     if (stem %in% c("", ".", "..")) stop("The mz5 filename must have a nonempty name.")
     file.path(".", "Results", stem)
   }
+
+  # Inspect directory names and saved-data presence only; never read raw mz5 data.
+  saved_run_files <- function(run) {
+    if (length(run) != 1L || is.na(run) || !nzchar(run) ||
+        run %in% c(".", "..") || grepl("[/\\\\]", run)) return(character())
+    parent <- mz5_result_parent(paste0(run, ".mz5"))
+    if (!dir.exists(parent)) return(character())
+    versions <- list.dirs(parent, full.names = TRUE, recursive = FALSE)
+    versions <- versions[grepl("^Results", basename(versions))]
+    files <- unlist(lapply(versions, function(folder) {
+      data_dirs <- list.dirs(file.path(folder, "Data"), full.names = TRUE, recursive = FALSE)
+      names <- basename(data_dirs)
+      keep <- grepl("\\.mz5$", names, ignore.case = TRUE) &
+        sub("\\.mz5$", "", names, ignore.case = TRUE) == run &
+        file.exists(file.path(data_dirs, "plot_list_data.RData"))
+      names[keep]
+    }), use.names = FALSE)
+    sort(unique(as.character(files)))
+  }
+
+  list_saved_runs <- function() {
+    if (!dir.exists("./Results")) return(character())
+    runs <- basename(list.dirs("./Results", full.names = TRUE, recursive = FALSE))
+    sort(runs[vapply(runs, function(run) length(saved_run_files(run)) > 0L, logical(1))])
+  }
+  saved_runs <- reactivePoll(5000, session,
+    checkFunc = list_saved_runs, valueFunc = list_saved_runs)
+
+  observe({
+    runs <- saved_runs()
+    current <- isolate(selected_saved_run())
+    updateSelectInput(session, "existing_run",
+      choices = c("Select a run" = "", stats::setNames(runs, runs)),
+      selected = if (analysis_mode() == "existing" && length(current) == 1L &&
+                     current %in% runs) current else "")
+  })
 
   create_results_folder <- function(filename) {
     parent <- mz5_result_parent(filename)
@@ -535,17 +575,18 @@ server <- function(input, output, session){
     }
   }
 
-  # Only inspect saved result files/database; never open the selected raw files.
+  # Only inspect saved result files/database; never open raw files.
   check_saved_analysis <- function(folder, names) {
-    if (!valid_mz5_names(names)) stop("Select real .mz5 files with distinct filenames.")
-    if (length(folder) != 1L || is.na(folder) || !folder %in% list_results_folders(names[1])) {
+    if (!valid_mz5_names(names)) stop("Select valid, distinct mz5 filenames.")
+    if (length(folder) != 1L || is.na(folder) ||
+        !folder %in% list_results_folders(names[1], selected_saved_run())) {
       stop("Select an available saved Results folder.")
     }
     paths <- file.path(folder, "Data", names, "plot_list_data.RData")
     missing <- names[!file.exists(paths)]
     if (length(missing)) {
       stop("No saved results found for: ", paste(missing, collapse = ", "),
-           ". Select the matching Results folder and original filenames.")
+           ". Select the matching saved analysis.")
     }
     # If no database exists, the existing migration dialog will offer to build it.
     if (db_exists(folder)) {
@@ -563,14 +604,17 @@ server <- function(input, output, session){
   })
   output$existing_selection_summary <- renderText({
     names <- existing_mz5_names()
-    if (!length(names)) "No files selected." else paste(names, collapse = ", ")
+    if (!length(saved_runs())) "No saved runs found under Results." else
+      if (!length(names)) "No run selected." else paste("Saved file:", paste(names, collapse = ", "))
   })
   output$existing_analysis_status <- renderText(existing_analysis_status())
 
   observeEvent(input$analysis_mode, {
     uploadedmz5(empty_mz5_files())
     existing_mz5_names(character())
+    selected_saved_run(character())
     existing_analysis_status("")
+    updateSelectInput(session, "existing_run", selected = "")
     reset_raw_selection()
   }, ignoreInit = TRUE, priority = 100)
 
@@ -587,26 +631,42 @@ server <- function(input, output, session){
     if (isTRUE(input$autorun)) request_new_analysis()
   })
 
-  observeEvent(input$existing_mz5_selection, {
+  observeEvent(input$existing_run, {
     if (analysis_mode() != "existing") return()
-    names <- unlist(input$existing_mz5_selection$names, use.names = FALSE)
+    run <- input$existing_run
+    # Clearing the run selector must not erase a legacy pseudo-file selection.
+    if ((is.null(run) || identical(run, "")) &&
+        nrow(uploadedmz5()) && all(uploadedmz5()$Source == "pseudo")) return()
     uploadedmz5(empty_mz5_files())
     existing_mz5_names(character())
+    selected_saved_run(character())
     existing_analysis_status("")
-    if (!valid_mz5_names(names)) {
-      showNotification("Select real .mz5 files with distinct filenames.", type = "error")
+    if (is.null(run) || identical(run, "")) return()
+    if (length(run) != 1L || is.na(run) || !run %in% list_saved_runs()) {
+      showNotification("Select an available run folder under Results.", type = "error")
       return()
     }
+    names <- saved_run_files(run)
+    if (!valid_mz5_names(names)) {
+      showNotification("No matching saved data found in this run folder.", type = "error")
+      return()
+    }
+    selected_saved_run(run)
     existing_mz5_names(names)
     uploadedmz5(data.frame(FileName = names, FilePath = NA_character_,
-                           Source = "name_only", stringsAsFactors = FALSE))
-    existing_analysis_status("Filenames selected. In Visualization, select a file and one of its saved analyses.")
-  })
+                           Source = "saved_run", stringsAsFactors = FALSE))
+    existing_analysis_status("Run selected. Choose a saved analysis in Visualization.")
+  }, ignoreNULL = FALSE)
 
   observeEvent(input$open_existing_analysis, {
     if (analysis_mode() != "existing") return()
     if (!nrow(uploadedmz5())) {
-      showNotification("Select real .mz5 files first (names only).", type = "error")
+      showNotification("Select a saved run folder first.", type = "error")
+      return()
+    }
+    run <- selected_saved_run()
+    if (length(run) && !all(uploadedmz5()$FileName %in% saved_run_files(run))) {
+      showNotification("This saved run is no longer available. Select another run.", type = "error")
       return()
     }
     updateTabItems(session, "main_navigation", selected = "processing")
@@ -616,7 +676,9 @@ server <- function(input, output, session){
     uploadedmz5(empty_mz5_files())
     pseudomz5names(data.frame(FileName = "", stringsAsFactors = FALSE))
     existing_mz5_names(character())
+    selected_saved_run(character())
     existing_analysis_status("")
+    updateSelectInput(session, "existing_run", selected = "")
     reset_raw_selection()
   })
 
@@ -658,6 +720,10 @@ server <- function(input, output, session){
       }), Source = "pseudo", stringsAsFactors = FALSE)
     
     #Store empty .mz5 files in the reactive variable for use elsewhere in the app.
+    selected_saved_run(character())
+    existing_mz5_names(character())
+    existing_analysis_status("")
+    updateSelectInput(session, "existing_run", selected = "")
     uploadedmz5(newFiles)
     
     showNotification("Pseudo .mz5 files generated", type = "message")
@@ -682,7 +748,7 @@ server <- function(input, output, session){
     files <- uploadedmz5()
     if (!nrow(files) || !valid_mz5_names(files$FileName) || any(files$Source != "upload") ||
         anyNA(files$FilePath) || !all(file.exists(files$FilePath))) {
-      shiny::showNotification("Upload real .mz5 files for a new analysis. Name-only selections and pseudo files cannot be processed.", type = "error")
+      shiny::showNotification("Upload real .mz5 files for a new analysis. Saved-analysis selections and pseudo files cannot be processed.", type = "error")
       return(NULL)
     }
     
@@ -3232,7 +3298,7 @@ server <- function(input, output, session){
   
   #####4.2 Environmental initialization: File upload, and folder selection#####
   
-  # Select filenames before looking for matching saved analyses.
+  # Use uploaded filenames for new runs and saved-data filenames for reopening.
   observe({
     files <- uploadedmz5()$FileName
     current <- isolate(input$file_selector)
@@ -3249,12 +3315,18 @@ server <- function(input, output, session){
 
   # Inspect the matching filename parent and both earlier folder layouts only.
   # Checking Data/<filename>/plot_list_data.RData does not load raw mz5 contents.
-  list_results_folders <- function(filename) {
+  list_results_folders <- function(filename, run = character()) {
     if (length(filename) != 1L || !valid_mz5_names(filename)) return(character())
     parent <- tryCatch(mz5_result_parent(filename), error = function(e) NULL)
     if (is.null(parent)) return(character())
-    legacy_parent <- file.path(".", basename(parent))
-    roots <- unique(c(".", parent, legacy_parent))
+    if (length(run)) {
+      if (length(run) != 1L || is.na(run) ||
+          !identical(sub("\\.mz5$", "", filename, ignore.case = TRUE), run)) return(character())
+      roots <- parent
+    } else {
+      legacy_parent <- file.path(".", basename(parent))
+      roots <- unique(c(".", parent, legacy_parent))
+    }
     roots <- roots[dir.exists(roots)]
     candidates <- unique(unlist(lapply(roots, function(path) {
       list.dirs(path, full.names = TRUE, recursive = FALSE)
@@ -3265,12 +3337,12 @@ server <- function(input, output, session){
   }
 
   results_folders_reactive <- reactivePoll(5000, session,
-    checkFunc = function() list_results_folders(selected_results_filename()),
-    valueFunc = function() list_results_folders(selected_results_filename()))
+    checkFunc = function() list_results_folders(selected_results_filename(), selected_saved_run()),
+    valueFunc = function() list_results_folders(selected_results_filename(), selected_saved_run()))
 
   output$results_folder_status <- renderText({
     filename <- selected_results_filename()
-    if (!length(filename)) return("Select an mz5 filename first in Engine.")
+    if (!length(filename)) return("In Engine, select a saved run or upload files for a new analysis.")
     if (!length(results_folders_reactive())) {
       paste("No saved analyses found for", filename)
     } else paste("Saved analyses matching", filename)
@@ -3320,8 +3392,9 @@ server <- function(input, output, session){
       return()
     }
     updateSelectInput(session, "file_selector2", choices = uploadedmz5()$FileName, selected = filename)
+    folders <- list_results_folders(filename, selected_saved_run())
     updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
-                      stats::setNames(list_results_folders(filename), list_results_folders(filename))), selected = folder)
+                      stats::setNames(folders, folders)), selected = folder)
 
     if (db_exists(folder)) {
       #Database exists — open it and we're done
@@ -5463,7 +5536,7 @@ server <- function(input, output, session){
     files <- uploadedmz5()$FileName
     filename <- input$file_selector2
     if (length(filename) != 1L || !filename %in% files) filename <- head(files, 1L)
-    folders <- list_results_folders(filename)
+    folders <- list_results_folders(filename, selected_saved_run())
     current <- isolate(input$results_folder2)
     updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
                       stats::setNames(folders, folders)),
