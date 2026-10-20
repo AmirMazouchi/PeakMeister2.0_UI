@@ -1,4 +1,5 @@
-# Visualization shows short dated-folder labels and retains full paths internally.
+# Visualization and Downstream Processing show dated-folder labels while keeping
+# full paths internally. Downstream defaults to Visualization's selected analysis.
 # Existing analysis selects Results/<run> and automatically opens its latest
 # Results <date> [number] version. Dates and numeric rerun numbers determine the
 # default; choosing an older version remains possible in Visualization.
@@ -3319,7 +3320,7 @@ server <- function(input, output, session){
     updateSelectInput(session, "file_selector2", choices = uploadedmz5()$FileName, selected = filename)
     folders <- list_results_folders(filename, selected_saved_run())
     updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
-                      stats::setNames(folders, folders)), selected = folder)
+                      stats::setNames(folders, basename(folders))), selected = folder)
 
     if (db_exists(folder)) {
       #Database exists — open it and we're done
@@ -5463,9 +5464,11 @@ server <- function(input, output, session){
     if (length(filename) != 1L || !filename %in% files) filename <- head(files, 1L)
     folders <- list_results_folders(filename, selected_saved_run())
     current <- isolate(input$results_folder2)
+    visualization <- isolate(input$results_folder)
     updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
-                      stats::setNames(folders, folders)),
-      selected = if (length(current) == 1L && current %in% folders) current else "")
+                      stats::setNames(folders, basename(folders))),
+      selected = if (length(current) == 1L && current %in% folders) current else
+        if (length(visualization) == 1L && visualization %in% folders) visualization else "")
   })
   observe({
     files <- uploadedmz5()$FileName
