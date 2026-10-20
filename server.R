@@ -1,3 +1,6 @@
+# Quality/CV stability: validate metadata, QC groups and numeric inputs before
+# calculation. PCA uses base R SVD with the previous centering/unit scaling,
+# avoiding the failing irlba backend. CVs remain available if PCA is unavailable.
 # Modular server refactor: the new-analysis pipeline calls task functions for
 # extraction, smoothing, peak processing, filtering, plotting and result exports.
 # Helpers use explicit inputs/returns; GUI actions use this session's state.
@@ -5865,8 +5868,10 @@ server <- function(input, output, session){
   
   #CV calculation function 
   calculate_cv <- function(data){
-    cv <- apply(data, 2, function(x) sd(x) / mean(x) * 100)
-    return(cv)
+    apply(as.matrix(data), 2, function(x) {
+      if (length(x) < 2L || any(!is.finite(x)) || mean(x) == 0) return(NA_real_)
+      sd(x) / mean(x) * 100
+    })
   }
   
   #Reactive expression to calculate CVs
@@ -5887,37 +5892,56 @@ server <- function(input, output, session){
   #Function for removing columns with zero variance
   remove_zero_variance <- function(data) {
     data_matrix <- as.matrix(data)
-    zero_variance_cols <- apply(data_matrix, 2, function(x) var(x) == 0)
-    data_matrix <- data_matrix[, !zero_variance_cols]
-    return(data_matrix)
+    variances <- apply(data_matrix, 2, var)
+    data_matrix[, is.finite(variances) & variances > 0, drop = FALSE]
   }
   
   #Function to perform PCA with additional checks
   perform_pca <- function(data) {
-    data <- remove_zero_variance(data)
-    
-    #Check for missing or infinite values
-    if (any(is.na(data)) || any(is.infinite(data))) {
-      showNotification("PCA Data contains missing or infinite values.", type = "error")
-    }
-    #Identify columns with all missing or infinite values
-    cols_to_exclude <- which(apply(data, 2, function(x) all(is.na(x)) || all(is.infinite(x))))
-    if (length(cols_to_exclude) > 0) {
-      excluded_cols <- colnames(data)[cols_to_exclude]
-      showNotification(paste("Excluding columns with all missing or infinite values:", paste(excluded_cols, collapse = ", ")), type = "warning")
-      data <- data[, -cols_to_exclude]}
-    
-    #Check for any remaining missing or infinite values
-    if (any(is.na(data)) || any(is.infinite(data))) {
-      showNotification("Data still contains missing or infinite values. Filter failed. Please manually edit data.", type = "error")
-      return(NULL)
-    } else {
-      showNotification("Filtering successful.", type = "message")
-    }
+    tryCatch({
+      data <- as.data.frame(data)
+      if (nrow(data) < 3L || !ncol(data) ||
+          !all(vapply(data, is.numeric, logical(1))) ||
+          any(!is.finite(as.matrix(data)))) {
+        stop("PCA requires at least three samples and finite numeric metabolite values.")
+      }
+      sample_names <- rownames(data)
+      data <- remove_zero_variance(data)
+      if (ncol(data) < 2L) {
+        stop("PCA needs at least two metabolites with nonzero variance.")
+      }
 
-    scaled_data <- pareto_scale(data)
-    pca_result <- PCA(scaled_data, graph = FALSE)
-    return(pca_result)
+      scaled_data <- pareto_scale(data)
+      # Preserve the previous PCA(scaled_data, scale.unit = TRUE) behavior:
+      # center again and divide by population standard deviations before SVD.
+      centered <- scale(scaled_data, center = TRUE, scale = FALSE)
+      population_sd <- sqrt(colMeans(centered^2))
+      population_sd[population_sd <= 1e-16] <- 1
+      standardized <- sweep(centered, 2, population_sd, "/")
+      ncp <- min(5L, nrow(standardized) - 1L, ncol(standardized))
+      fit <- stats::prcomp(standardized, center = FALSE, scale. = FALSE, rank. = ncp)
+      if (sum(fit$sdev > fit$sdev[1] * sqrt(.Machine$double.eps)) < 2L) {
+        stop("PCA needs at least two independent components; these data have fewer.")
+      }
+      # Match the existing orientation and the two fields used by the GUI.
+      direction <- sign(colSums(fit$rotation))
+      direction[direction == 0] <- 1
+      coordinates <- sweep(fit$x, 2, direction, "*")
+      rownames(coordinates) <- sample_names
+      colnames(coordinates) <- paste0("Dim.", seq_len(ncp))
+      eigenvalues <- fit$sdev^2 * (nrow(standardized) - 1) / nrow(standardized)
+      percent <- eigenvalues[seq_len(ncp)] / sum(eigenvalues) * 100
+      eig <- cbind(eigenvalue = eigenvalues[seq_len(ncp)],
+                   "percentage of variance" = percent,
+                   "cumulative percentage of variance" = cumsum(percent))
+      rownames(eig) <- paste("comp", seq_len(ncp))
+      list(ind = list(coord = coordinates), eig = eig)
+    }, error = function(e) {
+      showNotification(paste("PCA unavailable:", conditionMessage(e),
+                             "CV results are still available."),
+                       type = "warning", duration = 10)
+      NULL
+    })
   }
   
   #PCA expression
@@ -5933,170 +5957,178 @@ server <- function(input, output, session){
   #Separate QCs and other samples based on user input
   # Split QC/sample groups, calculate CVs and prepare the PCA result.
   compute_quality_metrics <- function(data, category_input, exclude_ids) {
-    #Ensure column name exists
+    if (is.null(data) || !nrow(data)) {
+      showNotification("Load peak-area data before calculating CVs.", type = "error")
+      return(NULL)
+    }
     if (!"PBM Sample ID" %in% colnames(data)) {
       showNotification("Column 'PBM Sample ID' not found in data. Please connect metadata to results", type = "error")
-      return()
-    }
-
-    #Extract user specified dynamic categories
-    user_categories <- strsplit(category_input, ",")[[1]]
-    user_categories <- sapply(user_categories, function(x) {
-      kv <- strsplit(x, "=")[[1]]
-      setNames(trimws(gsub("'", "", kv[2])), trimws(kv[1]))
-    }, USE.NAMES = FALSE)
-
-    #Exclude specific sample IDs from CV analysis.
-    exclude_ids <- strsplit(exclude_ids, ",")[[1]]
-    exclude_ids <- trimws(exclude_ids)
-    data <- data %>% filter(!`PBM Sample ID` %in% exclude_ids)
-
-    qc_samples <- data %>% filter(grepl(user_categories[["QC"]], `PBM Sample ID`, ignore.case = TRUE))
-    non_qc_samples <- data %>% filter(!grepl(user_categories[["QC"]], `PBM Sample ID`, ignore.case = TRUE))
-    #Deal with cases where columns contain all missing or all infinite samples. Occurs when there is ZERO detection of a metabolite in ANY sample which makes the data either all NAs or ALL infinite. Occurs rarely but will crash app if not handled correctly.
-    #Identify columns with all missing or infinite values in QC and non-QC samples
-    qc_exclusions <- which(apply(qc_samples[, 4:ncol(qc_samples)], 2, function(x) all(is.na(x)) || all(is.infinite(x))))
-    if (length(qc_exclusions) > 0) {
-      excluded_qc_cols <- colnames(qc_samples)[qc_exclusions + 3]
-      showNotification(paste("Excluding columns with all missing or infinite values in QC samples:", paste(excluded_qc_cols, collapse = ", ")), type = "warning", duration = 6)
-      qc_samples <- qc_samples[, -qc_exclusions - 3] 
-    }
-
-    non_qc_exclusions <- which(apply(non_qc_samples[, 4:ncol(non_qc_samples)], 2, function(x) all(is.na(x)) || all(is.infinite(x))))
-    if (length(non_qc_exclusions) > 0) {
-      excluded_non_qc_cols <- colnames(non_qc_samples)[non_qc_exclusions + 3] 
-      showNotification(paste("Excluding columns with all missing or infinite values in non-QC samples:", paste(excluded_non_qc_cols, collapse = ", ")), type = "warning", duration = 6)
-      non_qc_samples <- non_qc_samples[, -non_qc_exclusions - 3] 
-    }
-
-    #Ensure the remaining columns have the same number of rows
-    common_cols <- intersect(colnames(qc_samples), colnames(non_qc_samples))
-    qc_samples <- qc_samples[, common_cols]
-    non_qc_samples <- non_qc_samples[, common_cols]
-
-    #Check for any remaining missing or infinite values in samples
-    if (any(sapply(qc_samples[, 4:ncol(qc_samples)], is.na)) || any(sapply(qc_samples[, 4:ncol(qc_samples)], is.infinite))) {
-      showNotification("QC samples still contain missing or infinite values. Filter failed. Please manually edit data.", type = "error")
       return(NULL)
     }
-
-    if (any(sapply(non_qc_samples[, 4:ncol(non_qc_samples)], is.na)) || any(sapply(non_qc_samples[, 4:ncol(non_qc_samples)], is.infinite))) {
-      showNotification("Non-QC samples still contain missing or infinite values. Filter failed. Please manually edit data.", type = "error")
+    categories <- strsplit(if (is.null(category_input)) "" else category_input, ",", fixed = TRUE)[[1]]
+    pairs <- lapply(categories, function(x) trimws(strsplit(x, "=", fixed = TRUE)[[1]]))
+    qc <- Filter(function(x) length(x) == 2L && identical(x[1], "QC"), pairs)
+    pattern <- if (length(qc) == 1L) trimws(gsub("['\"]", "", qc[[1]][2])) else ""
+    if (!nzchar(pattern)) {
+      showNotification("Enter a QC identifier such as QC=NIST; QC= alone is incomplete.", type = "error")
       return(NULL)
     }
-
-    showNotification("Filtering successful.", type = "message")
-
-    #Calculate CVs for QC and non-QC samples
-    qc_cv <- calculate_cv(qc_samples[, 4:ncol(qc_samples)])
-    non_qc_cv <- calculate_cv(non_qc_samples[, 4:ncol(non_qc_samples)])
-
-    #Combine QC and non-QC samples for PCA and store values
+    excluded <- trimws(strsplit(if (is.null(exclude_ids)) "" else exclude_ids, ",", fixed = TRUE)[[1]])
+    data <- data[!data$`PBM Sample ID` %in% excluded[nzchar(excluded)], , drop = FALSE]
+    if (anyNA(data$`PBM Sample ID`) || any(!nzchar(trimws(data$`PBM Sample ID`)))) {
+      showNotification("Some sample IDs are missing. Check that metadata Data file names match the results, then reconnect metadata.", type = "error", duration = 10)
+      return(NULL)
+    }
+    is_qc <- tryCatch(suppressWarnings(grepl(pattern, data$`PBM Sample ID`, ignore.case = TRUE)),
+                      error = function(e) NULL)
+    if (is.null(is_qc)) {
+      showNotification("The QC identifier contains an invalid matching pattern.", type = "error")
+      return(NULL)
+    }
+    if (sum(is_qc) < 2L || sum(!is_qc) < 2L) {
+      showNotification(sprintf("At least two QC and two non-QC samples are needed for this comparison (found %d QC and %d non-QC after exclusions). Check the QC identifier and excluded IDs.", sum(is_qc), sum(!is_qc)),
+                       type = "error", duration = 10)
+      return(NULL)
+    }
+    metabolites <- setdiff(names(data), c("file.name", "peak.number", "PBM Sample ID"))
+    if (!length(metabolites)) {
+      showNotification("No metabolite columns are available for CV calculation.", type = "error")
+      return(NULL)
+    }
+    for (name in metabolites) {
+      data[[name]] <- suppressWarnings(as.numeric(as.character(data[[name]])))
+    }
+    # Exclude a column only when one group has no finite measurements at all.
+    unusable <- vapply(data[, metabolites, drop = FALSE], function(x) {
+      all(!is.finite(x[is_qc])) || all(!is.finite(x[!is_qc]))
+    }, logical(1))
+    if (any(unusable)) {
+      showNotification(paste("Excluding metabolites with no finite values in QC or non-QC samples:",
+                             paste(metabolites[unusable], collapse = ", ")),
+                       type = "warning", duration = 10)
+      metabolites <- metabolites[!unusable]
+    }
+    if (!length(metabolites)) {
+      showNotification("No usable metabolite columns remain for CV calculation.", type = "error")
+      return(NULL)
+    }
+    if (any(!is.finite(as.matrix(data[, metabolites, drop = FALSE])))) {
+      showNotification("Peak areas contain missing, nonnumeric or infinite values. Replace missing values or correct the affected data before calculating CVs.", type = "error", duration = 10)
+      return(NULL)
+    }
+    metadata_columns <- intersect(names(data), c("file.name", "peak.number", "PBM Sample ID"))
+    data <- data[, c(metadata_columns, metabolites), drop = FALSE]
+    qc_samples <- data[is_qc, , drop = FALSE]
+    non_qc_samples <- data[!is_qc, , drop = FALSE]
+    qc_cv <- calculate_cv(qc_samples[, metabolites, drop = FALSE])
+    non_qc_cv <- calculate_cv(non_qc_samples[, metabolites, drop = FALSE])
+    average_finite <- function(x) if (any(is.finite(x))) mean(x[is.finite(x)]) else NA_real_
     combined_data <- rbind(qc_samples, non_qc_samples)
-    pca_result <- perform_pca(combined_data[, 4:ncol(combined_data)])
-    list(qc_cv = mean(qc_cv), non_qc_cv = mean(non_qc_cv), non_qc_cv_values = non_qc_cv, pca_result = pca_result, qc_samples = qc_samples, non_qc_samples = non_qc_samples, qc_cv_values = qc_cv)
+    pca_result <- perform_pca(combined_data[, metabolites, drop = FALSE])
+    list(qc_cv = average_finite(qc_cv), non_qc_cv = average_finite(non_qc_cv),
+         non_qc_cv_values = non_qc_cv, qc_cv_values = qc_cv,
+         pca_result = pca_result, qc_samples = qc_samples, non_qc_samples = non_qc_samples)
   }
 
   average_cv <- reactive({
     compute_quality_metrics(peak_areas_data(), input$category_input, input$exclude_ids)
   })
+
+  # Keep QC and non-QC values attached to the same metabolites after filtering/sorting.
+  build_quality_cv_plot <- function(metrics) {
+    metabolites <- names(metrics$non_qc_cv_values)
+    plot_data <- suppressWarnings(extract_mass(metabolites))
+    plot_data$qc_cv <- unname(metrics$qc_cv_values[metabolites])
+    plot_data$non_qc_cv <- unname(metrics$non_qc_cv_values[metabolites])
+    plot_data <- plot_data[is.finite(plot_data$mz) &
+      (is.finite(plot_data$qc_cv) | is.finite(plot_data$non_qc_cv)), , drop = FALSE]
+    plot_data <- plot_data[order(plot_data$mz), , drop = FALSE]
+    if (!nrow(plot_data)) {
+      showNotification("No finite CVs with m/z-labelled metabolites are available to plot.", type = "warning")
+      return(NULL)
+    }
+    plot <- plot_ly(plot_data, x = ~mz, y = ~non_qc_cv, type = "scatter",
+      mode = "lines+markers", text = ~name, hoverinfo = "text+x+y", name = "Non-QC CV") %>%
+      add_trace(x = ~mz, y = ~qc_cv, type = "scatter", mode = "lines+markers",
+        marker = list(color = "#780116"), line = list(color = "#780116"), name = "QC CV")
+    for (group in c("non_qc_cv", "qc_cv")) {
+      values <- metrics[[paste0(group, "_values")]]
+      if (any(is.finite(values))) {
+        plot <- add_trace(plot, x = plot_data$mz,
+          y = rep(median(values[is.finite(values)]), nrow(plot_data)),
+          type = "scatter", mode = "lines", inherit = FALSE,
+          line = list(dash = "dash", color = if (group == "qc_cv") "green" else "black"),
+          name = if (group == "qc_cv") "Median QC CV" else "Median Non-QC CV")
+      }
+    }
+    plot %>% layout(title = "CV per Metabolite (QC and non-QC samples)",
+      xaxis = list(title = "m/z"), yaxis = list(title = "CV (%)"),
+      legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2))
+  }
+
+  # Only draw confidence ellipses for groups with enough independent observations.
+  build_quality_pca_plot <- function(metrics) {
+    if (is.null(metrics$pca_result)) return(NULL)
+    pca_data <- data.frame(metrics$pca_result$ind$coord)
+    pca_data$SampleType <- rep(c("QC", "Non-QC"),
+      c(nrow(metrics$qc_samples), nrow(metrics$non_qc_samples)))
+    variance_explained <- metrics$pca_result$eig[1:2, 2]
+    plot <- ggplot(pca_data, aes(x = Dim.1, y = Dim.2, color = SampleType)) +
+      geom_point() +
+      scale_color_manual(values = c("QC" = "#38A700", "Non-QC" = "#780116")) +
+      theme_classic() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+        legend.text = element_text(size = 14), legend.title = element_text(size = 16),
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold")) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+      labs(title = "Quality Control PCA Plot for QCs and Non-QC Samples (PC1 & PC2)",
+        x = paste0("PC1 (", round(variance_explained[1], 2), "%)"),
+        y = paste0("PC2 (", round(variance_explained[2], 2), "%)"), colour = "Sample Type")
+    groups <- Filter(function(group) {
+      nrow(group) >= 4L &&
+        qr(scale(as.matrix(group[, c("Dim.1", "Dim.2")]), scale = FALSE))$rank == 2L
+    }, split(pca_data, pca_data$SampleType))
+    if (length(groups)) plot <- plot + stat_ellipse(data = do.call(rbind, groups))
+    plot
+  }
   
   
   ######5.7.4 Output for CV processing######
   observeEvent(input$compute_cv, {
-    #######5.7.4.1 CV plot#######
-    
-    #Check if peak_areas_data() is NULL
-    if (is.null(peak_areas_data())) {
-      showNotification("No data uploaded. Please upload data before proceeding.", type = "error")
-      return()}
-    
-    avg_cv <- average_cv()
-    
-    median_cv <- median(avg_cv$non_qc_cv_values, na.rm = TRUE)
-    median_qc_cv <- median(avg_cv$qc_cv_values, na.rm = TRUE)
-    
-    #Create a data frame for the average CV values
-    cv_table <- data.frame(
-      Type = c("Technical CV (%)", "Biological CV (%)"),
-      `Average CV` = c(avg_cv$qc_cv, avg_cv$non_qc_cv))
-    
-    #Render the table
-    output$average_cv_table <- renderTable({
-      cv_table})
-    
-    #Extract m/z values and names and create a dataframe to plot m/z vs CV
-    mz_names <- extract_mass(colnames(peak_areas_data())[4:ncol(peak_areas_data())])
-    
-    #Filter out excluded columns that contained NAs or Infs
-    valid_indices <- which(!is.na(avg_cv$non_qc_cv_values) & !is.infinite(avg_cv$non_qc_cv_values))
-    filtered_mz_names <- mz_names$mz[valid_indices]
-    filtered_colnames <- colnames(peak_areas_data())[4:ncol(peak_areas_data())][valid_indices]
-    filtered_cv_values <- avg_cv$non_qc_cv_values[valid_indices]
-    
-    #Finalize dataframe
-    plot_data <- data.frame(mz = filtered_mz_names, cv = filtered_cv_values, name = filtered_colnames)
-    
-    #Sort the data frame by m/z values
-    plot_data <- plot_data[order(plot_data$mz), ]
-    
-    #Create the plot
-    output$cv_plot <- renderPlotly({
-      plot_ly(plot_data, x = ~mz, y = ~cv, type = 'scatter', mode = 'lines+markers', text = ~name, hoverinfo = 'text+x+y', name = 'Non-QC CV') %>%
-        add_trace(x = ~mz, y = rep(median_cv, length(plot_data$mz)), type = 'scatter', mode = 'lines', line = list(dash = 'dash', color = 'black'), name = 'Median Non-QC CV') %>%
-        add_trace(x = ~mz, y = avg_cv$qc_cv_values, type = 'scatter', mode = 'lines+markers', marker = list(color = '#780116'), line = list(color = '#780116'), name = 'QC CV') %>%
-        add_trace(x = ~mz, y = rep(median_qc_cv, length(plot_data$mz)), type = 'scatter', mode = 'lines', line = list(dash = 'dash', color = 'green'), name = 'Median QC CV') %>%
-        layout(title = "CV per Metabolite (QC and non-QC samples)",
-               xaxis = list(title = "m/z"),
-               yaxis = list(title = "CV (%)"),
-               legend = list(orientation = 'h', x = 0.5, xanchor = 'center', y = -0.2))
+    # Clear previous results so rejected inputs cannot leave stale plots visible.
+    output$average_cv_table <- renderTable(NULL)
+    output$cv_plot <- renderPlotly(NULL)
+    output$pca_plot <- renderPlot(NULL)
+    avg_cv <- tryCatch(average_cv(), error = function(e) {
+      showNotification(paste("Could not calculate quality metrics:", conditionMessage(e)),
+                       type = "error", duration = 10)
+      NULL
     })
-    
-    #######5.7.4.2 Create PCA plot#######
+    if (is.null(avg_cv)) return()
+
+    output$average_cv_table <- renderTable({
+      data.frame(Type = c("Technical CV (%)", "Biological CV (%)"),
+                 `Average CV` = c(avg_cv$qc_cv, avg_cv$non_qc_cv))
+    })
+    output$cv_plot <- renderPlotly({ build_quality_cv_plot(avg_cv) })
     output$pca_plot <- renderPlot({
-      
-      #Intialize environment 
-      qc_samples <- avg_cv$qc_samples
-      non_qc_samples <- avg_cv$non_qc_samples
-      pca_data <- data.frame(avg_cv$pca_result$ind$coord)
-      pca_data$SampleType <- rep(c("QC", "Non-QC"), c(nrow(qc_samples), nrow(non_qc_samples)))
-      variance_explained <- avg_cv$pca_result$eig[1:2, 2]
-      results_path <- main_folder2()
-      data_folder <- file.path(results_path, "Data")
-      
-      #Generate plot 
-      pca_plot <- ggplot(pca_data, aes(x = Dim.1, y = Dim.2, color = SampleType)) +
-        geom_point() +
-        stat_ellipse() +
-        scale_color_manual(values = c("QC" = "#38A700", "Non-QC" = "#780116")) +
-        theme_classic() +
-        theme(
-          panel.grid.major = element_blank(),
-          panel.grid.minor = element_blank(),
-          axis.text = element_text(size = 14),
-          axis.title = element_text(size = 16),
-          legend.text = element_text(size = 14),
-          legend.title = element_text(size = 16),
-          plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
-        ) +
-        geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
-        geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
-        labs(
-          title = "Quality Control PCA Plot for QCs and Non-QC Samples (PC1 & PC2)",
-          x = paste0("PC1 (", round(variance_explained[1], 2), "%)"),
-          y = paste0("PC2 (", round(variance_explained[2], 2), "%)"), colour = "Sample Type"
-        )
-      
-      #Save the plot
-      ggsave(file.path(data_folder, "QC_PCA_plot.png"), plot = pca_plot, width = 9, height = 6, dpi = 300)
-      
-      #Display the plot
+      validate(need(!is.null(avg_cv$pca_result),
+        "PCA is unavailable for these data. CV results are shown separately."))
+      pca_plot <- build_quality_pca_plot(avg_cv)
+      data_folder <- file.path(main_folder2(), "Data")
+      tryCatch({
+        ggsave(file.path(data_folder, "QC_PCA_plot.png"), plot = pca_plot,
+               width = 9, height = 6, dpi = 300)
+      }, error = function(e) {
+        showNotification(paste("PCA is displayed but its PNG could not be saved:",
+                               conditionMessage(e)), type = "warning")
+      })
       pca_plot
-      
     })
   })
-  
-  
+
   #####5.8 Display Data#####
   #Display data
   output$peak_area_table <- renderDT({

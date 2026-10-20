@@ -36,6 +36,17 @@ ui.R
 
 server.R
 
+- Fixed Calculate CVs ending the Shiny session when the FactoMineR/irlba PCA
+  backend raises the reported NULL-object error. PCA now uses base R SVD,
+  retaining the previous centering and unit scaling after Pareto scaling.
+- Validate connected sample IDs, complete QC identifiers, at least two QC and
+  two non-QC samples, and usable numeric peak areas before quality calculations.
+- Keep CV results when PCA has insufficient dimensions or fails. Return a clear
+  message, clear stale results on invalid input, and keep the session running.
+- Preserve metabolite/value alignment when filtering and sorting CV plots.
+  Zero-mean CVs display as missing; unsupported PCA ellipses are omitted.
+- Added tests/quality-metrics.R for numerical PCA validation and actual button
+  handling of the reported failure, invalid data, continued CVs, and recovery.
 - Replaced the long Initialize Run body with a call to run_new_analysis(),
   which prepares inputs and calls process_mz5_file() for each uploaded file.
 - Separated reading, mass calibration, extraction preparation, trace extraction,
