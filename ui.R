@@ -1,3 +1,6 @@
+# Saved analyses are selected only in Visualization after choosing an mz5 name.
+# Results folders are filtered by that filename; Engine no longer duplicates the folder selector.
+
 # Analysis modes added: New analysis uploads real mz5 files; Open existing analysis
 # uses a browser-only picker that sends filenames without uploading file contents.
 # The legacy pseudo-file controls are retained and styled green for later removal.
@@ -343,12 +346,11 @@ ui <- dashboardPage(
                    ),
                    conditionalPanel("input.analysis_mode === 'existing'",
                      tags$h4("Open existing analysis"),
-                     selectInput("existing_results_folder", "Select saved Results folder:", choices = NULL),
                      tags$button(id = "choose_existing_mz5", type = "button", class = "btn btn-default",
                                  onclick = "peakMeisterChooseExistingFiles()", "Select real .mz5 files (names only)"),
                      helpText("The selected raw files stay on your computer. Only their names are sent to the app."),
                      textOutput("existing_selection_summary"),
-                     actionButton("open_existing_analysis", "Open Existing Analysis"),
+                     actionButton("open_existing_analysis", "Show Saved Results in Visualization"),
                      textOutput("existing_analysis_status")
                    ),
                    actionButton("clearFiles", "Clear Files"),
@@ -398,7 +400,8 @@ ui <- dashboardPage(
                        HTML("<p><strong></<strong><u>Don't forget</strong></u> to set your results folder!</p>"),
                        
                        #Select results folder to work out of 
-                       selectInput("results_folder", "Select Results Folder:", choices = NULL),
+                       selectInput("results_folder", "Select saved analysis for this file:", choices = NULL),
+                       textOutput("results_folder_status"),
                        #Select plots, display plots
                        tags$h4(style = "text-decoration: underline;", "Loaded Plots"),
                        #Datatable for displaying modified plots

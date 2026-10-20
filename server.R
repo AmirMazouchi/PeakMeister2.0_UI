@@ -1,3 +1,8 @@
+# Results are stored under <mz5 filename without extension>/Results <date> [number].
+# Visualization lists saved analyses matching its selected mz5 filename, including
+# compatible legacy Results folders. Engine selects filenames only when reopening.
+# Multi-file new analyses write a separate Results folder for each input file.
+
 # Analysis modes added: New analysis reads uploaded mz5 data; Open existing
 # analysis accepts filenames only and opens the corresponding saved results.
 # The legacy pseudo-file workflow is retained. Source checks prevent name-only
@@ -475,10 +480,47 @@ server <- function(input, output, session){
       !any(grepl("[/\\\\]", names))
   }
 
+  mz5_result_parent <- function(filename) {
+    if (length(filename) != 1L || !valid_mz5_names(filename)) stop("Select a valid mz5 filename.")
+    stem <- sub("\\.mz5$", "", filename, ignore.case = TRUE)
+    if (stem %in% c("", ".", "..")) stop("The mz5 filename must have a nonempty name.")
+    file.path(".", stem)
+  }
+
+  create_results_folder <- function(filename) {
+    parent <- mz5_result_parent(filename)
+    if (!dir.exists(parent) && !dir.create(parent, recursive = TRUE)) {
+      stop("Could not create the results parent folder: ", parent)
+    }
+    count <- 1L
+    repeat {
+      leaf <- paste("Results", Sys.Date(), if (count == 1L) "" else count)
+      folder <- file.path(parent, trimws(leaf))
+      if (!file.exists(folder) && dir.create(folder, showWarnings = FALSE)) return(folder)
+      if (!file.exists(folder)) stop("Could not create the Results folder: ", folder)
+      count <- count + 1L
+    }
+  }
+
+  prepare_results_folder <- function(folder, masses, references, parameters, indexes = NULL) {
+    for (name in c("Plots", "Data")) dir.create(file.path(folder, name), showWarnings = FALSE)
+    if (parameters$plot.format == "Metabolite") {
+      for (name in c(references$name, masses$name)) {
+        dir.create(file.path(folder, "Plots", name), showWarnings = FALSE)
+      }
+    }
+    write_xlsx(list(Parameters = parameters, 'Mass List' = masses,
+                    'Reference Mass List' = references),
+               path = file.path(folder, paste0("Mass List and Parameters", Sys.Date(), ".xlsx")))
+    if (!is.null(indexes)) {
+      write.csv(indexes, file.path(folder, "Migration Index Summary.csv"), row.names = FALSE)
+    }
+  }
+
   # Only inspect saved result files/database; never open the selected raw files.
   check_saved_analysis <- function(folder, names) {
     if (!valid_mz5_names(names)) stop("Select real .mz5 files with distinct filenames.")
-    if (length(folder) != 1L || is.na(folder) || !folder %in% list_results_folders()) {
+    if (length(folder) != 1L || is.na(folder) || !folder %in% list_results_folders(names[1])) {
       stop("Select an available saved Results folder.")
     }
     paths <- file.path(folder, "Data", names, "plot_list_data.RData")
@@ -538,35 +580,18 @@ server <- function(input, output, session){
       return()
     }
     existing_mz5_names(names)
+    uploadedmz5(data.frame(FileName = names, FilePath = NA_character_,
+                           Source = "name_only", stringsAsFactors = FALSE))
+    existing_analysis_status("Filenames selected. In Visualization, select a file and one of its saved analyses.")
   })
-
-  observeEvent(input$existing_results_folder, {
-    if (analysis_mode() != "existing") return()
-    uploadedmz5(empty_mz5_files())
-    existing_analysis_status("")
-  }, ignoreInit = TRUE)
 
   observeEvent(input$open_existing_analysis, {
     if (analysis_mode() != "existing") return()
-    names <- existing_mz5_names()
-    folder <- input$existing_results_folder
-    uploadedmz5(empty_mz5_files())
-    existing_analysis_status("")
-    error <- tryCatch({ check_saved_analysis(folder, names); NULL },
-                      error = function(e) conditionMessage(e))
-    if (!is.null(error)) {
-      existing_analysis_status(error)
-      showNotification(error, type = "error", duration = 10)
+    if (!nrow(uploadedmz5())) {
+      showNotification("Select real .mz5 files first (names only).", type = "error")
       return()
     }
-    uploadedmz5(data.frame(FileName = names, FilePath = NA_character_,
-                           Source = "name_only", stringsAsFactors = FALSE))
-    folders <- list_results_folders()
-    updateSelectInput(session, "results_folder", choices = folders, selected = folder)
-    updateSelectInput(session, "results_folder2", choices = folders, selected = folder)
     updateTabItems(session, "main_navigation", selected = "processing")
-    existing_analysis_status(paste("Opened saved results for", length(names), "file(s)."))
-    showNotification("Saved results opened. Select a target in Loaded Plots to view it.", type = "message")
   })
 
   observeEvent(input$clearFiles, {
@@ -637,20 +662,15 @@ server <- function(input, output, session){
       return(NULL)
     }
     files <- uploadedmz5()
-    if (!nrow(files) || any(files$Source != "upload") ||
+    if (!nrow(files) || !valid_mz5_names(files$FileName) || any(files$Source != "upload") ||
         anyNA(files$FilePath) || !all(file.exists(files$FilePath))) {
       shiny::showNotification("Upload real .mz5 files for a new analysis. Name-only selections and pseudo files cannot be processed.", type = "error")
       return(NULL)
     }
     
-    #Generate a results folder that will not overwrite previous results folders
-    count <- 1
-    file_name <- paste("Results", Sys.Date(), sep = " ")
-    while (dir.exists(file_name)) {
-      count <- count + 1
-      file_name <- paste("Results", Sys.Date(), count, sep = " ")}
-    dir.create(path = file_name, showWarnings = FALSE)
-    
+    # Prepare the first file's output; subsequent files get their own folders.
+    file_name <- create_results_folder(files$FileName[1])
+
     # Stage-level timings use elapsed time, including file I/O and database waits.
     # The CSV is refreshed at every stage boundary so completed stages survive errors.
     new_run_timer <- function(path, notify = function(stage, file) NULL) {
@@ -704,12 +724,6 @@ server <- function(input, output, session){
     tryCatch({
     timing$stage("Validate parameters and calculate migration indexes")
 
-    #Create a "Plots" folder to store figures
-    dir.create(path = file.path(file_name, "Plots"), showWarnings = FALSE)
-    
-    #Create a data folder to store raw data for future processing
-    dir.create(path = file.path(file_name, "Data"), showWarnings = FALSE)
-    
     #Create a vector of metabolite and internal standard names
     name_vec <- c(refMassListData()$name, massData()$name)
     
@@ -725,22 +739,8 @@ server <- function(input, output, session){
     #Get the number of injections
     num_of_injections <- parametersData()$number.of.injections[1]
     
-    #Create metabolite sub-folders if plotting is set to "Metabolite"
-    if (parametersData()$plot.format == "Metabolite") {
-      for (i in 1:length(name_vec)) {
-        dir.create(path = file.path(file_name, "Plots", name_vec[i]), showWarnings = FALSE)
-      }
-    }
-    
-    #Generate an Excel file of the mass list and parameters
-    excel_file_path <- file.path(file_name, paste("Mass List and Parameters", Sys.Date(), ".xlsx", sep = ""))
-    
-    write_xlsx(list(
-      Parameters = parametersData(),
-      'Mass List' = massData(),
-      'Reference Mass List' = refMassListData()
-    ), path = excel_file_path)
-    
+    prepare_results_folder(file_name, massData(), refMassListData(), parametersData())
+
     #####3.3 Migration Index Calculation#####
     
     #Summarize user supplied migration time data
@@ -879,7 +879,18 @@ server <- function(input, output, session){
     
     
     
-    for (d in 1:length(data_files)){
+    for (d in seq_along(data_files)){
+      if (d > 1L) {
+        file_name <- create_results_folder(data_file_names[d])
+        timing <- new_run_timer(file.path(file_name, "run_timings.csv"),
+          notify = function(stage, file) {
+            if (nzchar(file)) shiny::setProgress(detail = stage)
+          })
+        timing$stage("Prepare output folders")
+        prepare_results_folder(file_name, massData(), refMassListData(), parametersData(), mi_df)
+      }
+      # Each folder contains only this file's reports and plot objects.
+      plotly_objects <- list()
       #Initialize progress bar
       withProgress(message = paste("Processing data file:", data_file_names[d]), value = 0,{ total_steps <- 7
  
@@ -2285,15 +2296,8 @@ server <- function(input, output, session){
         
         #Create sub-folders
         
-        if (d == 1){
-          
-          dir.create(path = paste(file_name, "/Plots/", "Analytes", sep = ""),
-                     showWarnings = TRUE)
-          
-          dir.create(path = paste(file_name, "/Plots/", "Internal Standards", sep = ""),
-                     showWarnings = TRUE)
-          
-        }
+        dir.create(file.path(file_name, "Plots", "Analytes"), showWarnings = FALSE)
+        dir.create(file.path(file_name, "Plots", "Internal Standards"), showWarnings = FALSE)
         
         dir.create(path = paste(file_name, "/Plots/", "Internal Standards", "/", data_files_name[d], sep = ""),
                    showWarnings = TRUE)
@@ -2537,11 +2541,7 @@ server <- function(input, output, session){
         peak_area_df[i,3:ncol(peak_area_df)] <- ifelse(comment_df[i,] == "", peak_area_df[i, 3:ncol(peak_area_df)], comment_df[i,])
       }
       
-      if(d == 1){
-        peak_area_report = peak_area_df
-      }else{
-        peak_area_report = rbind(peak_area_report, peak_area_df)
-      }
+      peak_area_report <- peak_area_df
       
       
       ######3.12.2 Generate peak migration time data frame######
@@ -2551,11 +2551,7 @@ server <- function(input, output, session){
                           peaks_df[,seq(from = 2, to = ncol(peaks_df), by = 7)] / 60)
       colnames(peak_mt_df)[3:(length(name_vec) + 2)] <- name_vec
       
-      if(d == 1){
-        peak_mt_report = peak_mt_df
-      }else{
-        peak_mt_report = rbind(peak_mt_report, peak_mt_df)
-      }
+      peak_mt_report <- peak_mt_df
       
       timing$stage("Save plot_list_data.RData", data_file_names[d])
       #Save the entire plot_list to a .RData file in the subfolder as well as peaks_df
@@ -2611,7 +2607,7 @@ server <- function(input, output, session){
       timing$stage("Save plotly_objects.RData", data_file_names[d])
       #Save plotly_objects to .RDA file
       save_plotly_objects(file_name)
-      timing$end_stage()
+      timing$finish()
       })
     }#End of loop
     
@@ -2664,7 +2660,7 @@ server <- function(input, output, session){
   
   #Reactive expression to store the path to the selected results folder. Required to grab the correct annotation_data information from the subsequent runs and useful for processing data if you have closed the app.
   main_folder <- reactive({
-    req(input$results_folder)
+    req(input$results_folder, input$results_folder %in% results_folders_reactive())
     input$results_folder
   })
   
@@ -2687,7 +2683,7 @@ server <- function(input, output, session){
   
   #Reactive expression to get the plot names associated with a specified .mz5 file from the SQL database, based on the naming pattern.
   filtered_plot_names <- reactive({
-    req(db_con(), input$file_selector)
+    req(db_con(), input$file_selector, main_folder())
     con       <- db_con()
     file_name <- sub("\\.mz5$", "", input$file_selector)
     tryCatch({
@@ -3218,47 +3214,74 @@ server <- function(input, output, session){
   
   #####4.2 Environmental initialization: File upload, and folder selection#####
   
-  #Function to select files based on uploaded .mz5 files
+  # Select filenames before looking for matching saved analyses.
   observe({
-    updateSelectInput(session, "file_selector", choices = uploadedmz5()$FileName)
+    files <- uploadedmz5()$FileName
+    current <- isolate(input$file_selector)
+    updateSelectInput(session, "file_selector", choices = files,
+      selected = if (length(current) == 1L && current %in% files) current else head(files, 1L))
   })
-  
 
-  #List all "Results" folders in the main directory
-  list_results_folders <- function() {
-    results_folders <- list.dirs(path = ".", full.names = TRUE, recursive = FALSE)
-    results_folders <- results_folders[grepl("Results", results_folders)]
-    results_folders
-  }
-  
-  #This requires the app to periodically check for new Results folders so that the generated results folder in the app can be retrieved
-  results_folders_reactive <- reactivePoll(5000, session,
-                                           checkFunc = function() {
-                                             list_results_folders()
-                                           },
-                                           valueFunc = function() {
-                                             list_results_folders()
-                                           }
-  )
-  
-  #Observe the reactive polling and update the select input
-  observeEvent(results_folders_reactive(), {
-    new_choices <- results_folders_reactive()
-    current     <- input$results_folder
-    updateSelectInput(session, "results_folder", choices = new_choices,
-      selected = if (length(current) == 1L && current %in% new_choices) current else head(new_choices, 1L))
-    current_existing <- input$existing_results_folder
-    updateSelectInput(session, "existing_results_folder", choices = new_choices,
-      selected = if (length(current_existing) == 1L && current_existing %in% new_choices) current_existing else head(new_choices, 1L))
+  selected_results_filename <- reactive({
+    files <- uploadedmz5()$FileName
+    current <- input$file_selector
+    if (!length(files)) return(character())
+    if (length(current) == 1L && current %in% files) current else files[1]
   })
-  
-  #Reactive variable holding SQL database connection.-> very important variable for all other SQL functions
+
+  # Inspect the matching filename parent and old top-level Results folders only.
+  # Checking Data/<filename>/plot_list_data.RData does not load raw mz5 contents.
+  list_results_folders <- function(filename) {
+    if (length(filename) != 1L || !valid_mz5_names(filename)) return(character())
+    parent <- tryCatch(mz5_result_parent(filename), error = function(e) NULL)
+    if (is.null(parent)) return(character())
+    roots <- c(".", if (dir.exists(parent)) parent)
+    candidates <- unique(unlist(lapply(roots, function(path) {
+      list.dirs(path, full.names = TRUE, recursive = FALSE)
+    }), use.names = FALSE))
+    candidates <- candidates[grepl("^Results", basename(candidates))]
+    candidates <- candidates[file.exists(file.path(candidates, "Data", filename, "plot_list_data.RData"))]
+    sort(candidates)
+  }
+
+  results_folders_reactive <- reactivePoll(5000, session,
+    checkFunc = function() list_results_folders(selected_results_filename()),
+    valueFunc = function() list_results_folders(selected_results_filename()))
+
+  output$results_folder_status <- renderText({
+    filename <- selected_results_filename()
+    if (!length(filename)) return("Select an mz5 filename first in Engine.")
+    if (!length(results_folders_reactive())) {
+      paste("No saved analyses found for", filename)
+    } else paste("Saved analyses matching", filename)
+  })
+
+  last_results_filename <- reactiveVal(character())
+  observeEvent(list(selected_results_filename(), results_folders_reactive()), {
+    filename <- selected_results_filename()
+    folders <- results_folders_reactive()
+    current <- input$results_folder
+    same_file <- identical(filename, last_results_filename())
+    last_results_filename(filename)
+    choices <- c("Select a saved analysis" = "", stats::setNames(folders, folders))
+    updateSelectInput(session, "results_folder", choices = choices,
+      selected = if (same_file && length(current) == 1L && current %in% folders) current else "")
+  }, ignoreNULL = FALSE)
+
   db_con <- reactiveVal(NULL)
-  
+
+  clear_loaded_analysis <- function() {
+    for (state in list(plot_list_data_values, run_metadata, previous_metadata)) {
+      for (key in c("plot_list", "comment_df", "peaks_df", "peak_mt_df", "peak_area_df", "mi_df", "file_name")) {
+        state[[key]] <- NULL
+      }
+    }
+    modified_peak_plots$names <- character()
+    plot_render_trigger(plot_render_trigger() + 1L)
+  }
+
   #Deal with changing results folder and then load database or make database
   observeEvent(input$results_folder, {
-    req(input$results_folder)
-    
     #Close previous connection if open
     old_con <- db_con()
     if (!is.null(old_con)) {
@@ -3266,8 +3289,20 @@ server <- function(input, output, session){
       db_con(NULL)
     }
     
+    clear_loaded_analysis()
     folder <- input$results_folder
-    
+    if (length(folder) != 1L || !nzchar(folder)) return()
+    filename <- selected_results_filename()
+    error <- tryCatch({ check_saved_analysis(folder, filename); NULL },
+                      error = function(e) conditionMessage(e))
+    if (!is.null(error)) {
+      showNotification(error, type = "error", duration = 10)
+      return()
+    }
+    updateSelectInput(session, "file_selector2", choices = uploadedmz5()$FileName, selected = filename)
+    updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
+                      stats::setNames(list_results_folders(filename), list_results_folders(filename))), selected = folder)
+
     if (db_exists(folder)) {
       #Database exists — open it and we're done
       con <- open_db(folder)
@@ -3298,14 +3333,32 @@ server <- function(input, output, session){
         easyClose = FALSE
       ))
     }
-  }, ignoreNULL = TRUE)
-  
+  }, ignoreNULL = FALSE)
+
+  # Clear stale editing/undo state only when the selected filename actually changes.
+  last_visualization_filename <- reactiveVal(character())
+  observeEvent(selected_results_filename(), {
+    filename <- selected_results_filename()
+    if (identical(filename, last_visualization_filename())) return()
+    last_visualization_filename(filename)
+    con <- isolate(db_con())
+    if (!is.null(con)) tryCatch(dbDisconnect(con), error = function(e) NULL)
+    db_con(NULL)
+    clear_loaded_analysis()
+  }, ignoreNULL = FALSE, priority = 100)
+
   #Handle migration confirmation
   observeEvent(input$confirm_migration, {
     removeModal()
     req(input$results_folder)
     folder <- input$results_folder
-    
+    error <- tryCatch({ check_saved_analysis(folder, selected_results_filename()); NULL },
+                      error = function(e) conditionMessage(e))
+    if (!is.null(error)) {
+      showNotification(error, type = "error")
+      return()
+    }
+
     #Show progress modal
     showModal(modalDialog(
       title = "Building Database",
@@ -5352,6 +5405,12 @@ server <- function(input, output, session){
   #Define reactive variables for the dataframes
   peak_areas_data <- reactiveVal(NULL)
   migration_times_data <- reactiveVal(NULL)
+
+  # A different saved analysis must be loaded before downstream transformations.
+  observeEvent(input$results_folder2, {
+    peak_areas_data(NULL)
+    migration_times_data(NULL)
+  }, ignoreNULL = FALSE, priority = 100)
   
   #Observer for the action button
   observeEvent(input$load_migration_area, {
@@ -5371,9 +5430,22 @@ server <- function(input, output, session){
   
   #Observe functions for selecting files and results folders to work with
   observe({
-    updateSelectInput(session, "results_folder2", choices = results_folders_reactive())})
+    results_folders_reactive()  # Refresh when completed results are discovered.
+    files <- uploadedmz5()$FileName
+    filename <- input$file_selector2
+    if (length(filename) != 1L || !filename %in% files) filename <- head(files, 1L)
+    folders <- list_results_folders(filename)
+    current <- isolate(input$results_folder2)
+    updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
+                      stats::setNames(folders, folders)),
+      selected = if (length(current) == 1L && current %in% folders) current else "")
+  })
   observe({
-    updateSelectInput(session, "file_selector2", choices = uploadedmz5()$FileName)})
+    files <- uploadedmz5()$FileName
+    current <- isolate(input$file_selector2)
+    updateSelectInput(session, "file_selector2", choices = files,
+      selected = if (length(current) == 1L && current %in% files) current else head(files, 1L))
+  })
   
   
   #####5.2 Plot for m/z vs migration time #####
