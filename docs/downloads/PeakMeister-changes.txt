@@ -1,0 +1,121 @@
+PeakMeister - application change summary
+Repository: AmirMazouchi/PeakMeister2.0_UI
+Branch: feature/new-or-open-analysis
+Application snapshot: 627aee645c4d7501f691a7d3c63e470d246752b7
+
+This describes the current changes to the original application. Intermediate
+workflows that were later replaced are described only in their final form.
+
+ui.R
+
+- Added separate New analysis and Open existing analysis modes in Engine.
+- New analysis retains real .mz5 uploads, multiple-file selection, and the
+  optional automatic start after uploading.
+- Open existing analysis uses a run-folder dropdown populated from Results.
+  It does not require selecting or uploading the original .mz5 file.
+- Removed Generate Pseudo .mz5 Files, its editable filename table, Add Empty
+  Row, the filename Excel upload, and the associated green styling.
+- Removed the redundant Saved file / Run selected messages and the button
+  that navigated from Engine to Visualization. Navigation uses the sidebar.
+- Hid Engine's filename table, Search box, entry-count control, and pagination
+  in Open existing analysis. They remain available for new uploads.
+- Hid Visualization's Select File control in Open existing analysis because
+  the selected run already identifies the file.
+- Removed Visualization's reminder to select a results folder.
+- Initialized run and analysis dropdowns with an explicit empty option so
+  clearing and reselecting the same run or analysis works correctly.
+- Replaced Engine's tab container without tab panels with a normal layout
+  container to remove the navigation-container warning.
+- Added source-workbook labels to the parameter subtabs. Browse remains
+  available to replace the automatically loaded workbooks.
+- Gave the Mass List, Reference Mass List, and Parameters upload controls
+  distinct input IDs so each can replace the shared three-sheet workbook.
+- Added comments at the top describing the modifications.
+
+server.R
+
+- Added stage timing for Initialize Run, including reading .mz5 files,
+  calibration, extraction, smoothing, peak processing, plotting, SQLite
+  writes, and report exports.
+- Added elapsed-time messages and run_timings.csv. Completed stages and
+  partial timings are retained when a run fails or is interrupted.
+- Changed new result storage to:
+    Results/<mz5 filename without extension>/Results <date> [rerun number]/
+- A batch with multiple .mz5 files writes separate reports, saved plot data,
+  databases, and timing files for each input file.
+- Repeated analyses create numbered folders rather than overwriting an
+  existing result folder.
+- Discover saved runs from matching saved-data directories under Results,
+  without reading the raw .mz5 contents. Incomplete or mismatched run folders
+  are omitted from the run list.
+- Selecting a saved run automatically selects its newest analysis and uses
+  the existing saved-data/database loading handlers.
+- Newest analysis is determined by the folder date and numeric rerun number;
+  for example, version 10 is newer than version 2. Nonstandard older folder
+  names use folder modification time as a fallback.
+- A manually selected older analysis stays selected while that run remains
+  open and the selected version remains available.
+- Filter analysis choices by the current run/file and clear stale loaded
+  analysis and undo state when the active file changes.
+- Keep full result paths as dropdown values, while showing only dated folder
+  names in Visualization and Downstream Processing.
+- Default the downstream results-folder selection to Visualization's analysis.
+  A different downstream version may be selected; changing Visualization's
+  analysis synchronizes the downstream selection again.
+- Clear previously loaded downstream peak-area and migration-time matrices
+  when its selected analysis changes, so the new reports must be loaded.
+- Removed the pseudo-file generation state, temporary-file creation, filename
+  Excel reading, editable-table handlers, and Add Empty Row handler.
+- Prevent saved-analysis selections from reaching raw-data processing through
+  Initialize Run; new processing requires real uploaded files.
+- Fixed the About README display by rendering standalone HTML and displaying
+  it in its own frame, avoiding a second Markdown conversion. Temporary README
+  resources are cleaned up when the session ends.
+- Wait for browser events before reading Plotly event data. Main-plot and
+  baseline-dialog clicks use separate sources to avoid cross-triggering.
+- Automatically load these project-relative workbooks for each new session:
+    Sample Files/Mass List and Parameters.xlsx
+    Sample Files/User Supplied Migration Indexes.xlsx
+- Load Mass List, Reference Mass List, and Parameters from the first workbook,
+  and migration indexes from the second. Loading indexes does not change the
+  Manual.Indexes parameter.
+- Read all three mass-workbook sheets before replacing the active tables.
+  Failed replacement uploads retain the previous data.
+- Uploads replace the loaded defaults. Missing or unreadable defaults report
+  a warning and leave the upload controls available.
+- Clear All leaves the relevant table empty until another upload or a new
+  session; defaults do not repeatedly refill cleared tables.
+- Added comments at the top describing the modifications.
+
+docs/README.md
+
+- Replaced the pseudo-file instructions with the saved-run opening workflow.
+- Documented automatic newest-analysis selection, manual version switching,
+  Clear Files, short dropdown labels, and downstream synchronization.
+- Documented automatic workbook loading and replacement through Browse.
+
+Supporting files
+
+- tests/gui-startup.R checks GUI construction, clearable dropdown settings,
+  README rendering, resource cleanup, and Plotly event handling.
+- tests/saved-run-selection.R checks saved-run discovery, version selection,
+  preservation of an older selection, switching/clearing, and upload guards.
+- docs/downloads/PeakMeister-analysis-modes.zip contains matching plain-source
+  ui.R, server.R, docs/README.md, installation instructions, and checksums.
+- The two sample Excel workbooks themselves were not modified. The browser's
+  upload boxes are not prefilled; the server loads the defaults directly and
+  identifies them in the source-workbook labels.
+- Existing raw files and saved results are not deleted by these workflow changes.
+
+Verification and limits
+
+- Earlier changes passed focused R and browser checks, including real saved
+  SQLite/RData loading, plot display, version-specific CSV loading, repeated
+  clear/reselect cycles, and multiple-file upload behavior.
+- For the latest default-workbook update, the file paths, expected worksheet
+  names, unique upload-control IDs, and diff checks were verified.
+- Runtime verification of the default-workbook update was not completed:
+  the R verification command was denied. Do not treat this latest update as
+  verified in a running app.
+- Full scientific processing of a real .mz5 dataset was not rerun. This work
+  did not redesign the scientific extraction or peak-processing algorithms.
