@@ -1,4 +1,4 @@
-# Results are stored under <mz5 filename without extension>/Results <date> [number].
+# Results are stored under Results/<mz5 filename without extension>/Results <date> [number].
 # Visualization lists saved analyses matching its selected mz5 filename, including
 # compatible legacy Results folders. Engine selects filenames only when reopening.
 # Multi-file new analyses write a separate Results folder for each input file.
@@ -484,7 +484,7 @@ server <- function(input, output, session){
     if (length(filename) != 1L || !valid_mz5_names(filename)) stop("Select a valid mz5 filename.")
     stem <- sub("\\.mz5$", "", filename, ignore.case = TRUE)
     if (stem %in% c("", ".", "..")) stop("The mz5 filename must have a nonempty name.")
-    file.path(".", stem)
+    file.path(".", "Results", stem)
   }
 
   create_results_folder <- function(filename) {
@@ -3229,13 +3229,15 @@ server <- function(input, output, session){
     if (length(current) == 1L && current %in% files) current else files[1]
   })
 
-  # Inspect the matching filename parent and old top-level Results folders only.
+  # Inspect the matching filename parent and both earlier folder layouts only.
   # Checking Data/<filename>/plot_list_data.RData does not load raw mz5 contents.
   list_results_folders <- function(filename) {
     if (length(filename) != 1L || !valid_mz5_names(filename)) return(character())
     parent <- tryCatch(mz5_result_parent(filename), error = function(e) NULL)
     if (is.null(parent)) return(character())
-    roots <- c(".", if (dir.exists(parent)) parent)
+    legacy_parent <- file.path(".", basename(parent))
+    roots <- unique(c(".", parent, legacy_parent))
+    roots <- roots[dir.exists(roots)]
     candidates <- unique(unlist(lapply(roots, function(path) {
       list.dirs(path, full.names = TRUE, recursive = FALSE)
     }), use.names = FALSE))
