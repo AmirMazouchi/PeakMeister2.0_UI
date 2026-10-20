@@ -51,7 +51,8 @@ server.R
 - Preserved calculation formulas, result formats, folder layout and timing
   stages. Removed the redundant assignment of already-built last-plot data.
 - Ensure temporary raw copies and pipeline SQLite connections close on errors.
-- Added docs/modular-server.md with the task/function map and validation notes.
+- Added docs/modular-server.md with the task/function map, relevant UI pages
+  and triggering controls, and validation notes.
 - Added synthetic processing and before/after comparison tests. These checked
   two-file CSV/RData/SQLite output, Plotly traces/layouts, timing stages, error
   cleanup and downstream transformations. A complete real mz5 run was not

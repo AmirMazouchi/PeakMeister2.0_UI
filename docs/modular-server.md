@@ -8,30 +8,39 @@ The Initialize button validates the selected uploads and calls
 `process_mz5_file()` for each uploaded file. The per-file function calls the
 processing tasks in order and records their existing timing stages.
 
-| Task | Function(s) |
-| --- | --- |
-| Validate parameters and calculate/override migration indexes | `prepare_analysis_parameters()` |
-| Read the temporary raw file | `read_mz5_data()` |
-| Optional mass calibration | `calibrate_masses()` |
-| Prepare extraction windows and sort spectra | `prepare_extraction_spectra()` |
-| Extract traces and construct `eie_df` | `extract_electropherograms()`, `build_eie_dataframe()` |
-| Optional smoothing | `smooth_electropherograms()` |
-| Detect, integrate and filter internal standards | `process_internal_standard_peaks()` |
-| Detect, integrate and align metabolites | `process_metabolite_peaks()` |
-| Flag low/undetected and interfered peaks | `flag_peaks_below_lod()`, `flag_interfered_peaks()` |
-| Prepare annotations, integration ribbons and axes | `build_plot_data()` |
-| Save PNGs and build interactive plots | `save_static_plots()`, `build_interactive_plots()` |
-| Prepare report tables | `build_result_tables()` |
-| Save RData, SQLite, CSVs and Plotly objects | `save_analysis_snapshot()`, `save_analysis_database()`, `export_result_csvs()`, `save_interactive_plots()` |
-| Stage timing and error/interrupt reports | `new_run_timer()`, `run_new_analysis()` |
-| Delete selected/middle/all peaks and undo | `delete_selected_peaks()`, `delete_middle_peaks()`, `delete_all_peaks()`, `undo_peak_deletion()` |
-| Regenerate changed plots and mark interferences | `regenerate_changed_plots()`, `mark_peak_interferences()` |
-| Normalize and replace missing data | `normalize_peak_areas()`, `replace_missing_peak_areas()` |
-| Join metadata to sample injections | `connect_peak_area_metadata()` |
-| Control charts, CVs and PCA | `build_control_chart()`, `compute_quality_metrics()`, existing `calculate_cv()` and `perform_pca()` |
-| Batch correction | `load_batch_correction_packages()`, `apply_batch_correction()` |
-| MetaboAnalyst matrix | `build_metaboanalyst_matrix()` |
-| Drug databases | `load_drug_databases()`, `parse_and_save_drugbank()` |
+The UI page/trigger column identifies where the user starts each task. Helpers
+are generally called indirectly through server functions, rather than directly
+by `ui.R`. Engine tasks also run when **Start run automatically after upload**
+is enabled. Their parameter tables come from **User Supplied Parameters**;
+processing starts on **Engine**.
+
+| Task | Function(s) | UI page / trigger |
+| --- | --- | --- |
+| Coordinate uploaded files and process each file | `run_new_analysis()`, `process_mz5_file()` | Engine → New analysis → Initialize Run |
+| Validate parameters and calculate/override migration indexes | `prepare_analysis_parameters()` | Engine → New analysis → Initialize Run |
+| Read the temporary raw file | `read_mz5_data()` | Engine → New analysis → Initialize Run |
+| Optional mass calibration | `calibrate_masses()` | Engine → New analysis → Initialize Run |
+| Prepare extraction windows and sort spectra | `prepare_extraction_spectra()` | Engine → New analysis → Initialize Run |
+| Extract traces and construct `eie_df` | `extract_electropherograms()`, `build_eie_dataframe()` | Engine → New analysis → Initialize Run |
+| Optional smoothing | `smooth_electropherograms()` | Engine → New analysis → Initialize Run |
+| Detect, integrate and filter internal standards | `process_internal_standard_peaks()` | Engine → New analysis → Initialize Run |
+| Detect, integrate and align metabolites | `process_metabolite_peaks()` | Engine → New analysis → Initialize Run |
+| Flag low/undetected and interfered peaks | `flag_peaks_below_lod()`, `flag_interfered_peaks()` | Engine → New analysis → Initialize Run |
+| Prepare annotations, integration ribbons and axes | `build_plot_data()` | Engine → New analysis → Initialize Run |
+| Save PNGs and build interactive plots | `save_static_plots()`, `build_interactive_plots()` | Engine → New analysis → Initialize Run |
+| Prepare report tables | `build_result_tables()` | Engine → New analysis → Initialize Run |
+| Save RData, SQLite, CSVs and Plotly objects | `save_analysis_snapshot()`, `save_analysis_database()`, `export_result_csvs()`, `save_interactive_plots()` | Engine → New analysis → Initialize Run |
+| Stage timing and error/interrupt reports | `new_run_timer()` | Engine → New analysis → Initialize Run |
+| Delete selected/middle/all peaks and undo | `delete_selected_peaks()`, `delete_middle_peaks()`, `delete_all_peaks()`, `undo_peak_deletion()` | Visualization → Plotting → Delete Selected Peaks / Delete Middle Peaks / Delete all peaks / Undo Peak Deletion, respectively |
+| Regenerate changed plots | `regenerate_changed_plots()` | Visualization → Plotting → Other → Regenerate Changed Plots |
+| Mark peak interferences | `mark_peak_interferences()` | Visualization → Plotting → Mark Peak Interference |
+| Normalize and replace missing data | `normalize_peak_areas()`, `replace_missing_peak_areas()` | Downstream Processing → left controls → Normalize Data (then Normalize in the dialog) / Replace Missing Data, respectively |
+| Join metadata to sample injections | `connect_peak_area_metadata()` | Downstream Processing → left controls → Connect Metadata to Results; merged table appears in Metadata |
+| Control charts | `build_control_chart()` | Downstream Processing → left controls → Create Control Chart; plots appear in Control Charts |
+| CVs and PCA | `compute_quality_metrics()`, existing `calculate_cv()` and `perform_pca()` | Downstream Processing → Data Quality & Variability → Calculate CVs |
+| Batch correction | `load_batch_correction_packages()`, `apply_batch_correction()` | Downstream Processing → Batch Correction → Initialize Packages / Perform Batch Correction, respectively |
+| MetaboAnalyst matrix | `build_metaboanalyst_matrix()` | Reporting → Generate Data Matrix for MetaboAnalyst |
+| Drug databases | `load_drug_databases()`, `parse_and_save_drugbank()` | Drug Analysis → Load Drug Databases; parsing starts with Yes, parse now in the DrugBank Database Not Found dialog |
 
 Data-processing helpers accept tables/objects explicitly and return their results.
 GUI action helpers use their own Shiny session's reactive state. The observers
