@@ -1,3 +1,5 @@
+# Engine's upload table is shown only for new analyses. Saved-analysis dropdown
+# labels use dated folder names, while server.R keeps full paths as their values.
 # Existing analysis selects a Results/<run> folder and automatically opens its
 # latest dated analysis. Visualization keeps the version selector for older results.
 # File selection is shown only for new analyses; file-name generation controls
@@ -339,7 +341,8 @@ ui <- dashboardPage(
                       font-size:40px; width: 100%;")),
               )
         ),
-       DT::dataTableOutput("fileTable"),
+       conditionalPanel("input.analysis_mode === 'new'",
+         DT::dataTableOutput("fileTable")),
       #Create progress bar for monitoring computation 
        uiOutput("progressBar")
       ),

@@ -1,3 +1,4 @@
+# Visualization shows short dated-folder labels and retains full paths internally.
 # Existing analysis selects Results/<run> and automatically opens its latest
 # Results <date> [number] version. Dates and numeric rerun numbers determine the
 # default; choosing an older version remains possible in Visualization.
@@ -3278,7 +3279,7 @@ server <- function(input, output, session){
     current <- input$results_folder
     same_file <- identical(filename, last_results_filename())
     last_results_filename(filename)
-    choices <- c("Select a saved analysis" = "", stats::setNames(folders, folders))
+    choices <- c("Select a saved analysis" = "", stats::setNames(folders, basename(folders)))
     selected <- if (same_file && length(current) == 1L && current %in% folders) current else
       if (analysis_mode() == "existing" && length(selected_saved_run())) latest_results_folder(folders) else ""
     updateSelectInput(session, "results_folder", choices = choices, selected = selected)
