@@ -1,3 +1,7 @@
+# Startup workbook defaults: load both bundled Sample Files workbooks into the
+# parameter tables for each session. Uploads replace the loaded data; source labels
+# identify defaults/replacements. Mass/reference/parameter upload controls share
+# one loader with unique input IDs. Clearing a table does not reload defaults.
 # Visualization and Downstream Processing show dated-folder labels while keeping
 # full paths internally. Downstream defaults to Visualization's selected analysis.
 # Existing analysis selects Results/<run> and automatically opens its latest
@@ -125,6 +129,43 @@ server <- function(input, output, session){
     stringsAsFactors = FALSE
   ))
   
+  mass_workbook_source <- reactiveVal("No workbook loaded.")
+  migration_workbook_source <- reactiveVal("No workbook loaded.")
+
+  load_mass_workbook <- function(path, source) {
+    # Read every sheet before replacing any table, so failed uploads keep prior data.
+    masses <- as.data.frame(readxl::read_excel(path, sheet = "Mass List"))
+    references <- as.data.frame(readxl::read_excel(path, sheet = "Reference Mass List"))
+    parameters <- as.data.frame(readxl::read_excel(path, sheet = "Parameters"))
+    massData(masses)
+    refMassListData(references)
+    parametersData(parameters)
+    mass_workbook_source(paste("Source workbook:", source))
+  }
+
+  load_migration_workbook <- function(path, source) {
+    indexes <- as.data.frame(readxl::read_excel(path, sheet = "User Supplied Migration Indexes"))
+    userMTI(indexes)
+    migration_workbook_source(paste("Source workbook:", source))
+  }
+
+  load_default_workbook <- function(path, loader, source_status) {
+    tryCatch(loader(path, paste0(path, " (default)")), error = function(e) {
+      source_status(paste("Default workbook unavailable:", path))
+      showNotification(paste("Could not load default workbook:", path, conditionMessage(e)),
+        type = "warning", duration = 10)
+    })
+  }
+  load_default_workbook(file.path("Sample Files", "Mass List and Parameters.xlsx"),
+    load_mass_workbook, mass_workbook_source)
+  load_default_workbook(file.path("Sample Files", "User Supplied Migration Indexes.xlsx"),
+    load_migration_workbook, migration_workbook_source)
+
+  output$mass_workbook_source <- renderText(mass_workbook_source())
+  output$reference_workbook_source <- renderText(mass_workbook_source())
+  output$parameters_workbook_source <- renderText(mass_workbook_source())
+  output$migration_workbook_source <- renderText(migration_workbook_source())
+
   #Render editable tables
   output$massListData <- DT::renderDataTable({ massData() }, editable = TRUE)
   output$refMassListData <- DT::renderDataTable({ refMassListData() }, editable = TRUE)
@@ -132,35 +173,17 @@ server <- function(input, output, session){
   output$userMTIdata <- DT::renderDataTable({userMTIdata()}, editable = TRUE)
   
   #####2.2 Data Table Input#####
-  #Look for an excel file/read parameters file.
-  observeEvent(input$massList,
-               {
-                 req(input$massList)
-                 #Load data from the uploaded file -> excel sheet must have sheet names "Mass List, Reference Mass List, and Paramaters"
-                 #Mass List
-                 mass_df <- readxl::read_excel(input$massList$datapath, sheet = "Mass List") %>%
-                   as.data.frame()
-                 #Reference Mass List
-                 is_df <- readxl::read_excel(input$massList$datapath, sheet = "Reference Mass List") %>%
-                   as.data.frame()
-                 #Paramaters
-                 parameters_df <- readxl::read_excel(input$massList$datapath, sheet = "Parameters") %>%
-                   as.data.frame()
-                 #Store the data in reactive values
-                 massData(mass_df)
-                 refMassListData(is_df)
-                 parametersData(parameters_df)
-                 })
-  
-  #Handle manual input when no file is uploaded -> allows users to input their own data manually 
-  observeEvent(input$massList, {
-    if (is.null(input$massList)) {
-      massData(data.frame())  
-      refMassListData(data.frame())  
-      parametersData(data.frame())
-    }
-  })
-  
+  # Each subtab can replace the same three-sheet workbook.
+  replace_mass_workbook <- function(file) {
+    req(file)
+    tryCatch(load_mass_workbook(file$datapath, file$name), error = function(e) {
+      showNotification(paste("Could not load workbook:", conditionMessage(e)), type = "error")
+    })
+  }
+  observeEvent(input$massList, replace_mass_workbook(input$massList))
+  observeEvent(input$massListReference, replace_mass_workbook(input$massListReference))
+  observeEvent(input$massListParameters, replace_mass_workbook(input$massListParameters))
+
   #####2.3 Manual Mass List Input#####
   #Add a row in the table 
   observeEvent(input$addMassRow, {
@@ -384,15 +407,14 @@ server <- function(input, output, session){
   
   #####2.7 Manual MTI input#####
   
-  #Upload excel sheet titled user supplied migration indexes
+  # Uploaded migration indexes replace the startup workbook.
   observeEvent(input$userMTI, {
     req(input$userMTI)
-    userMTI_df <- readxl::read_excel(input$userMTI$datapath, sheet = "User Supplied Migration Indexes") %>% as.data.frame()
-    
-    #Store file in reactive value
-    userMTI(userMTI_df)
+    tryCatch(load_migration_workbook(input$userMTI$datapath, input$userMTI$name), error = function(e) {
+      showNotification(paste("Could not load migration indexes:", conditionMessage(e)), type = "error")
+    })
   })
-  
+
   #Manual Data Input
   observeEvent(input$addMTIrow, {
     newRow <- data.frame(

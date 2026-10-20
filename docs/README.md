@@ -146,6 +146,8 @@ This tabs contains information about the app including the detailed README file 
 ##### 2. **User Supplied Parameters**
 ***
 
+On startup, the app automatically loads `Sample Files/Mass List and Parameters.xlsx` (Mass List, Reference Mass List, and Parameters sheets) and `Sample Files/User Supplied Migration Indexes.xlsx`. The source-workbook labels identify the loaded defaults. Use Browse to replace either workbook; replacing the mass workbook from any of its three subtabs updates all three tables. Each new app session starts with the bundled defaults. Manual edits and Clear All remain available, and cleared tables are not automatically refilled during that session. Loading migration indexes does not change the `Manual.Indexes` setting.
+
 User supplied parameters is the location where an individual will specify the paramaters used in the PeakMeister computations. Users can upload excel files with the required information (supplied in the Sample Files folder) which will automatically populate the data table with the contained information. If a table is not available, users can input their data using the app interface in addition to saving this data to a prelabeled parameters datafile. Uploaded data can also be edited direcly in the table by double clicking column. The tabs are as following
 
 1. Mass List 

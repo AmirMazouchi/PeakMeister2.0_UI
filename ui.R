@@ -1,3 +1,5 @@
+# Parameter workbooks load automatically from Sample Files on startup. Source
+# labels show the active workbook; Browse can replace it from any relevant subtab.
 # Engine's upload table is shown only for new analyses. Saved-analysis dropdown
 # labels use dated folder names, while server.R keeps full paths as their values.
 # Existing analysis selects a Results/<run> folder and automatically opens its
@@ -147,7 +149,9 @@ ui <- dashboardPage(
           
           #####4.1. Mass List Subtab##### 
           tabPanel("Mass List",
-                   fileInput("massList", "Upload Mass List and Parameters (Excel)", accept = c(".xlsx")),
+                   fileInput("massList", "Upload Mass List and Parameters (Excel)", accept = c(".xlsx"),
+                             placeholder = "Choose another workbook"),
+                   textOutput("mass_workbook_source"),
                    div(style = "overflow-x: auto;",
                    DT::dataTableOutput("massListData")),
                    fluidRow(
@@ -182,7 +186,9 @@ ui <- dashboardPage(
           
           #####4.2 Reference Mass List Subtab#####
           tabPanel("Reference Mass List",
-                   fileInput("massList", "Upload Mass List and Parameters (Excel)", accept = c(".xlsx")),
+                   fileInput("massListReference", "Upload Mass List and Parameters (Excel)", accept = c(".xlsx"),
+                             placeholder = "Choose another workbook"),
+                   textOutput("reference_workbook_source"),
                    div(style = "overflow-x: auto;",
                    DT::dataTableOutput("refMassListData")),
                    fluidRow(
@@ -216,7 +222,9 @@ ui <- dashboardPage(
                    
           #####4.3 Parameters list subtab#####
           tabPanel("Parameters",
-                   fileInput("massList", "Upload Mass List and Parameters (Excel)", accept = c(".xlsx")),
+                   fileInput("massListParameters", "Upload Mass List and Parameters (Excel)", accept = c(".xlsx"),
+                             placeholder = "Choose another workbook"),
+                   textOutput("parameters_workbook_source"),
                    div(style = "overflow-x: auto;",
                    DT::dataTableOutput("parametersData")),
                    fluidRow(
@@ -269,7 +277,9 @@ ui <- dashboardPage(
           
           #####4.5: Manual Migration Index Input#####
           tabPanel("User Supplied Migration Indexes",
-                   fileInput("userMTI", "User Supplied Migration Indexes (Excel)", accept = c(".xlsx")),
+                   fileInput("userMTI", "User Supplied Migration Indexes (Excel)", accept = c(".xlsx"),
+                             placeholder = "Choose another workbook"),
+                   textOutput("migration_workbook_source"),
                    div(style = "overflow-x: auto;",
                        DT::dataTableOutput("userMTIdata")),
                    fluidRow(
