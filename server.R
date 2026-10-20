@@ -1,3 +1,6 @@
+# Startup/display fixes: show the rendered README as HTML in its own frame,
+# and wait for browser events before reading Plotly data. Main-plot and baseline
+# dialog events have separate sources. Use with the matching navigation fixes in ui.R.
 # Results are stored under Results/<mz5 filename without extension>/Results <date> [number].
 # Visualization lists saved analyses matching its selected mz5 filename, including
 # compatible legacy Results folders. Engine selects filenames only when reopening.
@@ -37,12 +40,27 @@ server <- function(input, output, session){
   line_positions <- reactiveValues(red = 2, blue = 4)
   
   ####1. About tab####
+  # Keep the standalone HTML document intact instead of parsing it as Markdown.
+  readme_dir <- tempfile("peakmeister-readme-")
+  dir.create(readme_dir)
+  readme_resource <- basename(readme_dir)
+  session$onSessionEnded(function() {
+    if (readme_resource %in% names(shiny::resourcePaths())) {
+      shiny::removeResourcePath(readme_resource)
+    }
+    unlink(readme_dir, recursive = TRUE)
+  })
   #Functions for "About" tab page -> reading information from markdown files
   output$disclaimerContent <- renderUI({
     includeMarkdown("docs/DISCLAIMER.md")
   })
   output$readmeContent <- renderUI({
-    includeMarkdown(rmarkdown::render("docs/README.md"))
+    rmarkdown::render("docs/README.md", output_file = "README.html",
+      output_dir = readme_dir, output_options = list(self_contained = TRUE),
+      quiet = TRUE, envir = new.env(parent = globalenv()))
+    shiny::addResourcePath(readme_resource, readme_dir)
+    tags$iframe(src = paste0(readme_resource, "/README.html"),
+      title = "PeakMeister README", style = "width:100%; height:75vh; border:0;")
   })
   output$updatesContent <- renderUI({
     includeMarkdown("docs/UPDATES.md")
@@ -2229,8 +2247,8 @@ server <- function(input, output, session){
       }
       
       ######3.11.3 Create Plot Function for making plotly plots######
-      plot_function_plotly <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data) {
-        plot_ly() %>%
+      plot_function_plotly <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data, source = "A") {
+        plot_ly(source = source) %>%
           add_lines(
             x = ~eie_data[,1] / 60,
             y = ~eie_data[,2],
@@ -3542,6 +3560,13 @@ server <- function(input, output, session){
 
   
   #Render and construct plot on demand from SQL databse data
+  # A nonempty browser event means its widget has rendered and registered events.
+  # Reading event_data earlier produces warnings when no plot has been loaded yet.
+  plot_event_data <- function(event, source) {
+    req(input[[paste(event, source, sep = "-")]])
+    plotly::event_data(event, source = source)
+  }
+
   output$selected_plot <- renderPlotly({
     plot_render_trigger()
     req(input$plot_table_rows_selected, db_con())
@@ -3564,7 +3589,8 @@ server <- function(input, output, session){
       integration_data = plot_data$integration_data,
       label_data       = plot_data$label_data,
       x_axis_data      = plot_data$x_axis_data,
-      y_axis_data      = plot_data$y_axis_data
+      y_axis_data      = plot_data$y_axis_data,
+      source           = "peakmeister_selected"
     )
     
     #Restore zoom state if one exists -> so that the plot doesnt reset every single time you make an edit.
@@ -3614,8 +3640,8 @@ server <- function(input, output, session){
   )
   
   #Capture zoom from relayout events for regenerating plot.
-  observeEvent(event_data("plotly_relayout"), {
-    rd <- event_data("plotly_relayout")
+  observeEvent(plot_event_data("plotly_relayout", "peakmeister_selected"), {
+    rd <- plot_event_data("plotly_relayout", "peakmeister_selected")
     if (!is.null(rd[["xaxis.range[0]"]])) {
       zoom_state$xmin <- rd[["xaxis.range[0]"]]
       zoom_state$xmax <- rd[["xaxis.range[1]"]]
@@ -3640,8 +3666,8 @@ server <- function(input, output, session){
   }) 
   
   #Deal with events occuring on the plot (drawing boxes)
-  observeEvent(event_data("plotly_relayout"), {
-    relayout_data <- event_data("plotly_relayout")
+  observeEvent(plot_event_data("plotly_relayout", "peakmeister_selected"), {
+    relayout_data <- plot_event_data("plotly_relayout", "peakmeister_selected")
     print(paste("Current drag_mode:", drag_mode()))
     print(relayout_data)
     
@@ -4252,8 +4278,8 @@ server <- function(input, output, session){
    }
   
    #plotly function
-   plot_function_plotly <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data) {
-     plot_ly() %>%
+   plot_function_plotly <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data, source = "A") {
+     plot_ly(source = source) %>%
        add_lines(
          x = ~eie_data[,1] / 60,
          y = ~eie_data[,2],
@@ -5044,9 +5070,9 @@ server <- function(input, output, session){
   })
   
   #Observe click events on the plot only when baseline adjustment mode is active
-  observeEvent(event_data("plotly_click"), {
+  observeEvent(plot_event_data("plotly_click", "peakmeister_selected"), {
     if (baseline_adjustment_mode()) {
-      click_data <- event_data("plotly_click")
+      click_data <- plot_event_data("plotly_click", "peakmeister_selected")
       if (!is.null(click_data)) {
         clicked_x <- click_data$x
         clicked_y <- click_data$y
@@ -5202,7 +5228,8 @@ server <- function(input, output, session){
       integration_data = plot_data$integration_data,
       label_data       = plot_data$label_data,
       x_axis_data      = plot_data$x_axis_data,
-      y_axis_data      = plot_data$y_axis_data
+      y_axis_data      = plot_data$y_axis_data,
+      source           = "peakmeister_baseline"
     )
     
     plot %>%
@@ -5211,9 +5238,9 @@ server <- function(input, output, session){
   })
   
   #Observer for handling click data events on the plotly plot rendered in the modal to acquire the new baseline
-  observeEvent(event_data("plotly_click"), {
+  observeEvent(plot_event_data("plotly_click", "peakmeister_baseline"), {
     if (plotbaseline_adjustment_mode()) {
-      click_data <- event_data("plotly_click")
+      click_data <- plot_event_data("plotly_click", "peakmeister_baseline")
       if (!is.null(click_data)) {
         plot_baseline <- click_data$y
         

@@ -1,3 +1,5 @@
+# Startup/display fix: Engine uses a normal layout container because it has no
+# sub-tabs. Real tab sets elsewhere retain their existing panels and controls.
 # Saved analyses are selected only in Visualization after choosing an mz5 name.
 # Results folders are filtered by that filename; Engine no longer duplicates the folder selector.
 
@@ -331,7 +333,7 @@ ui <- dashboardPage(
       ####5. Engine####
       tabItem(
         tabName = "engine",
-        tabsetPanel(
+        div(
           id = "Setup",
           fluidRow(
             column(6,
