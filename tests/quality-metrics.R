@@ -1,7 +1,7 @@
 # Rscript --vanilla tests/quality-metrics.R
 # Exercises the actual CV/PCA helpers and Calculate CVs observer. No raw mz5,
 # FactoMineR, irlba, or Matrix package is required for this calculation.
-suppressPackageStartupMessages({ library(shiny); library(plotly) })
+suppressPackageStartupMessages({ library(shiny); library(plotly); library(jsonlite) })
 
 is_assignment <- function(x, name) {
   is.call(x) && identical(x[[1]], as.name("<-")) && identical(x[[2]], as.name(name))
@@ -95,6 +95,9 @@ observer <- Filter(function(x) is.call(x) && identical(x[[1]], as.name("observeE
                      identical(x[[2]], quote(input$compute_cv)), statements)[[1]]
 result_folder <- tempfile("quality-metrics-"); dir.create(file.path(result_folder, "Data"), recursive = TRUE)
 testServer(function(input, output, session) {
+  # App dependencies can mask shiny::validate (jsonlite is loaded after shiny
+  # in ui.R). Reproduce the reported S3 validate(NULL) failure as well.
+  validate <- function(object, ...) UseMethod("validate")
   for (name in helper_names) eval(assignment(name), envir = environment())
   showNotification <- helpers$showNotification
   peak_areas_data <- reactiveVal(quality_data)

@@ -36,6 +36,9 @@ ui.R
 
 server.R
 
+- Fixed the PCA panel's validate(NULL) method error by explicitly calling
+  shiny::validate() and shiny::need(). The regression check reproduces the
+  exact masked-validator error and verifies PCA display and error messages.
 - Fixed Calculate CVs ending the Shiny session when the FactoMineR/irlba PCA
   backend raises the reported NULL-object error. PCA now uses base R SVD,
   retaining the previous centering and unit scaling after Pareto scaling.

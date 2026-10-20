@@ -69,6 +69,8 @@ rank or a PCA error produce a message while retaining the CV results. Confidence
 ellipses are drawn only for groups with at least four points and full rank in
 the two displayed dimensions. Invalid input clears previous results; the button
 handler catches errors without ending the session.
+PCA panel checks explicitly call `shiny::validate()` and `shiny::need()` so
+other packages' validators cannot mask Shiny's display validation.
 
 Validation:
 
@@ -90,6 +92,8 @@ The quality-metrics tests use a 12-sample, 20-metabolite fixture to verify PCA
 against an independent correlation-matrix eigendecomposition. They exercise
 the actual Calculate CVs observer, including the reported NULL-object failure,
 continued CV display, invalid input, and recovery on the next valid calculation.
+The observer is also tested with `jsonlite` loaded after Shiny and an S3
+validator that reproduces the reported `validate(NULL)` method error.
 The native PCA scores and eigenvalues were also compared with FactoMineR's
 full-SVD reference source, independently of irlba.
 

@@ -1,3 +1,5 @@
+# PCA panel validation uses shiny::validate/shiny::need explicitly so packages
+# loaded after Shiny cannot mask the display check with a different validator.
 # Quality/CV stability: validate metadata, QC groups and numeric inputs before
 # calculation. PCA uses base R SVD with the previous centering/unit scaling,
 # avoiding the failing irlba backend. CVs remain available if PCA is unavailable.
@@ -6114,7 +6116,7 @@ server <- function(input, output, session){
     })
     output$cv_plot <- renderPlotly({ build_quality_cv_plot(avg_cv) })
     output$pca_plot <- renderPlot({
-      validate(need(!is.null(avg_cv$pca_result),
+      shiny::validate(shiny::need(!is.null(avg_cv$pca_result),
         "PCA is unavailable for these data. CV results are shown separately."))
       pca_plot <- build_quality_pca_plot(avg_cv)
       data_folder <- file.path(main_folder2(), "Data")
