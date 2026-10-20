@@ -1,3 +1,6 @@
+# Existing-analysis UI cleanup: removed Engine filename/status messages and its
+# navigation button. Visualization's file picker is shown for new analyses and
+# legacy pseudo-file selections; saved runs use their automatically selected file.
 # Open existing analysis now selects Results/<run> instead of a raw mz5 file.
 # The app reads saved directory names to identify the original filename, and
 # Visualization lists only analysis versions inside that selected run folder.
@@ -484,9 +487,7 @@ server <- function(input, output, session){
   }
   uploadedmz5 <- reactiveVal(empty_mz5_files())
   pseudomz5names <- reactiveVal(data.frame(FileName = "", stringsAsFactors = FALSE))
-  existing_mz5_names <- reactiveVal(character())
   selected_saved_run <- reactiveVal(character())
-  existing_analysis_status <- reactiveVal("")
   analysis_mode <- reactive({
     if (identical(input$analysis_mode, "existing")) "existing" else "new"
   })
@@ -602,18 +603,14 @@ server <- function(input, output, session){
   output$fileTable <- DT::renderDataTable({
     DT::datatable(uploadedmz5()[, "FileName", drop = FALSE], options = list(pageLength = 5))
   })
-  output$existing_selection_summary <- renderText({
-    names <- existing_mz5_names()
-    if (!length(saved_runs())) "No saved runs found under Results." else
-      if (!length(names)) "No run selected." else paste("Saved file:", paste(names, collapse = ", "))
+  output$show_visualization_file_selector <- renderText({
+    if (analysis_mode() == "new" || any(uploadedmz5()$Source == "pseudo")) "true" else "false"
   })
-  output$existing_analysis_status <- renderText(existing_analysis_status())
+  outputOptions(output, "show_visualization_file_selector", suspendWhenHidden = FALSE)
 
   observeEvent(input$analysis_mode, {
     uploadedmz5(empty_mz5_files())
-    existing_mz5_names(character())
     selected_saved_run(character())
-    existing_analysis_status("")
     updateSelectInput(session, "existing_run", selected = "")
     reset_raw_selection()
   }, ignoreInit = TRUE, priority = 100)
@@ -638,9 +635,7 @@ server <- function(input, output, session){
     if ((is.null(run) || identical(run, "")) &&
         nrow(uploadedmz5()) && all(uploadedmz5()$Source == "pseudo")) return()
     uploadedmz5(empty_mz5_files())
-    existing_mz5_names(character())
     selected_saved_run(character())
-    existing_analysis_status("")
     if (is.null(run) || identical(run, "")) return()
     if (length(run) != 1L || is.na(run) || !run %in% list_saved_runs()) {
       showNotification("Select an available run folder under Results.", type = "error")
@@ -652,32 +647,14 @@ server <- function(input, output, session){
       return()
     }
     selected_saved_run(run)
-    existing_mz5_names(names)
     uploadedmz5(data.frame(FileName = names, FilePath = NA_character_,
                            Source = "saved_run", stringsAsFactors = FALSE))
-    existing_analysis_status("Run selected. Choose a saved analysis in Visualization.")
   }, ignoreNULL = FALSE)
-
-  observeEvent(input$open_existing_analysis, {
-    if (analysis_mode() != "existing") return()
-    if (!nrow(uploadedmz5())) {
-      showNotification("Select a saved run folder first.", type = "error")
-      return()
-    }
-    run <- selected_saved_run()
-    if (length(run) && !all(uploadedmz5()$FileName %in% saved_run_files(run))) {
-      showNotification("This saved run is no longer available. Select another run.", type = "error")
-      return()
-    }
-    updateTabItems(session, "main_navigation", selected = "processing")
-  })
 
   observeEvent(input$clearFiles, {
     uploadedmz5(empty_mz5_files())
     pseudomz5names(data.frame(FileName = "", stringsAsFactors = FALSE))
-    existing_mz5_names(character())
     selected_saved_run(character())
-    existing_analysis_status("")
     updateSelectInput(session, "existing_run", selected = "")
     reset_raw_selection()
   })
@@ -721,8 +698,6 @@ server <- function(input, output, session){
     
     #Store empty .mz5 files in the reactive variable for use elsewhere in the app.
     selected_saved_run(character())
-    existing_mz5_names(character())
-    existing_analysis_status("")
     updateSelectInput(session, "existing_run", selected = "")
     uploadedmz5(newFiles)
     
@@ -3328,9 +3303,9 @@ server <- function(input, output, session){
       roots <- unique(c(".", parent, legacy_parent))
     }
     roots <- roots[dir.exists(roots)]
-    candidates <- unique(unlist(lapply(roots, function(path) {
+    candidates <- unique(as.character(unlist(lapply(roots, function(path) {
       list.dirs(path, full.names = TRUE, recursive = FALSE)
-    }), use.names = FALSE))
+    }), use.names = FALSE)))
     candidates <- candidates[grepl("^Results", basename(candidates))]
     candidates <- candidates[file.exists(file.path(candidates, "Data", filename, "plot_list_data.RData"))]
     sort(candidates)

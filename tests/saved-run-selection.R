@@ -64,8 +64,7 @@ run_saved_selection_checks<-function(){
   stopifnot(isTRUE(check_saved_analysis('./Results/Run01/Results first','Run01.mz5')))
   for(folder in c('./Results legacy','./Run01/Results prior-layout','./Results/Run02/Results only'))
    stopifnot(inherits(try(check_saved_analysis(folder,'Run01.mz5'),silent=TRUE),'try-error'))
-  session$setInputs(open_existing_analysis=1)
-  stopifnot(events$nav=='processing')
+  stopifnot(identical(output$show_visualization_file_selector,"false"))
   session$setInputs(initialize=1)
   stopifnot(events$analyses==0L)
   plot_list_data_values$file_name<-'old';previous_metadata$comment_df<-data.frame(a=1)
@@ -84,9 +83,11 @@ run_saved_selection_checks<-function(){
   session$setInputs(existing_run='')
   stopifnot(uploadedmz5()$Source=='pseudo',length(selected_saved_run())==0L,
    length(results_folders_reactive())==4L)
+  stopifnot(identical(output$show_visualization_file_selector,"true"))
   unlink(uploadedmz5()$FilePath)
   session$setInputs(analysis_mode='new')
-  stopifnot(nrow(uploadedmz5())==0L,length(selected_saved_run())==0L)
+  stopifnot(nrow(uploadedmz5())==0L,length(selected_saved_run())==0L,
+   identical(output$show_visualization_file_selector,"true"))
   raw<-tempfile(fileext='.mz5');writeLines('test upload',raw)
   session$setInputs(mz5Files=data.frame(name='New.mz5',datapath=raw),autorun=FALSE)
   stopifnot(uploadedmz5()$Source=='upload',uploadedmz5()$FileName=='New.mz5')
@@ -95,9 +96,8 @@ run_saved_selection_checks<-function(){
   unlink(raw)
   session$setInputs(analysis_mode='existing',existing_run='Run02')
   unlink('./Results/Run02',recursive=TRUE)
-  events$nav<-NULL
-  session$setInputs(open_existing_analysis=2)
-  stopifnot(is.null(events$nav))
+  stopifnot(length(saved_run_files('Run02'))==0L,
+   length(list_results_folders('Run02.mz5',selected_saved_run()))==0L)
  })
  # Missing Results root is a normal empty state.
  unlink('Results',recursive=TRUE)

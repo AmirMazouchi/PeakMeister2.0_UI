@@ -1,3 +1,6 @@
+# Existing-analysis cleanup: Engine keeps the run picker and uses sidebar navigation;
+# Visualization hides its redundant file picker for saved runs. New analyses and
+# the retained pseudo-file workflow keep file selection. The folder reminder is removed.
 # Clear/reselect fix: run and analysis dropdowns start with an explicit empty
 # option so Shiny reports cleared selections and allows choosing the same run again.
 # Startup/display fix: Engine uses a normal layout container because it has no
@@ -336,10 +339,7 @@ ui <- dashboardPage(
                      tags$h4("Open existing analysis"),
                      selectInput("existing_run", "Select run folder in Results:",
                                  choices = c("Select a run" = "")),
-                     helpText("Choose a saved run. The original .mz5 file is not needed."),
-                     textOutput("existing_selection_summary"),
-                     actionButton("open_existing_analysis", "Show Saved Results in Visualization"),
-                     textOutput("existing_analysis_status")
+                     helpText("Choose a saved run. The original .mz5 file is not needed.")
                    ),
                    actionButton("clearFiles", "Clear Files"),
             ),
@@ -384,8 +384,8 @@ ui <- dashboardPage(
                        #Button for reseting uploaded plot data
                        actionButton("resetplotlydata","Clear uploaded data"),
                        #Button for selecting files -> will subset/filter data to choose plots
-                       selectInput("file_selector", "Select File:", choices = NULL),
-                       HTML("<p><strong></<strong><u>Don't forget</strong></u> to set your results folder!</p>"),
+                       conditionalPanel("output.show_visualization_file_selector === 'true'",
+                         selectInput("file_selector", "Select File:", choices = NULL)),
                        
                        #Select results folder to work out of 
                        selectInput("results_folder", "Select saved analysis for this file:",
