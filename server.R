@@ -1,3 +1,6 @@
+# Metadata is shared at Results/<run>/metadata.csv for all saved analyses of
+# that raw file. Existing analysis/Data/metadata.csv remains a fallback; the
+# shared file takes priority. Merged results stay inside the selected analysis.
 # Shared action guards catch ordinary R errors in buttons, uploads, selection
 # events and background observers. They show the action/error, log details,
 # release loading overlays and keep the session open. Shiny validation remains
@@ -5861,19 +5864,31 @@ server <- function(input, output, session){
   }
 
   #####5.5 Connect Peak Position with Metadata#####
+
+  # Resolve from the selected analysis path, independently of other file selectors.
+  metadata_file_paths <- function(results_path) {
+    folder <- normalizePath(results_path, winslash = "/", mustWork = TRUE)
+    paths <- file.path(folder, "Data", "metadata.csv")
+    run_folder <- dirname(folder)
+    if (identical(basename(dirname(run_folder)), "Results") &&
+        grepl("^Results", basename(folder))) {
+      paths <- c(file.path(run_folder, "metadata.csv"), paths)
+    }
+    paths
+  }
   
   #Observe action button for connecting metadata
   observe_action(input$connect_metadata, {
     results_path <- main_folder2()
-    data_folder <- file.path(results_path, "Data")
+    paths <- metadata_file_paths(results_path)
+    available <- paths[file.exists(paths) & !dir.exists(paths)]
     
-    #Look for path to metadata file
-    metadata_path <- file.path(data_folder, "metadata.csv")
-    
-    if (!file.exists(metadata_path)) {
-      showNotification("metadata.csv not found in Data subfolder. Are you working out of the right results folder?", type = "warning")
+    if (!length(available)) {
+      showNotification(paste("metadata.csv not found. Place it at", paths[1]),
+                       type = "warning", duration = 10)
       return(NULL)
     }
+    metadata_path <- available[1]
     
     #Load data
     metadata <- read.csv(metadata_path, check.names = FALSE)
@@ -5897,7 +5912,10 @@ server <- function(input, output, session){
     peak_areas_data(merged_data)
     
     write.csv(merged_data, file.path(results_path, "merged_peak_area.csv"), row.names = FALSE, fileEncoding = "UTF-8")
-    showNotification("Metadata succesffuly connected to peak areas", type = "message")
+    source <- if (length(paths) > 1L && identical(metadata_path, paths[1])) {
+      "the shared run metadata.csv"
+    } else "the analysis Data/metadata.csv"
+    showNotification(paste("Metadata successfully connected from", source), type = "message")
   })
   
   

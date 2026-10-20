@@ -274,7 +274,19 @@ SelectInput("normalize_by", "Normalize By", choices = c("114.0667_Creatinine", "
 Once normalized, the new data will again be saved as a new .csv file titled 'Normalized Metabolite Peak Areas.csv' and the original peak area data will remain untouched.
 
 
-Once the missing values have been replaced and the data has been normalized (normalization is not required, but encouraged), the user can connect existing metadata to their peak area results. This assigns a sample ID to the peak position. The name of the column for the sample ID is currently hard-coded to 'PBM Sample ID'. This can be edited in the server.R code as you see fit. This requires the user to create and place a .csv file into the 'Data' subfolder with the name 'metadata.csv'. **The name of this file is case sensitive and must be named metadata.** Once clicked, a new .csv file will be generated called 'merged_peak_areas.csv' The data stored on the app itself will reflect all these changes, but the original Metabolite Peak Areas file will remain unchanged. The tab 'Reporting' and the subtab 'Data Quality and Variability' require the metadata connected to the peak area results.    
+Once missing values have been replaced and optional normalization has been applied, click **Connect Metadata to Results** to assign a sample ID to each injection/peak position. The sample-ID column is named **PBM Sample ID**.
+
+Place **metadata.csv** in the shared run folder, for example:
+
+```text
+Results/20260420_05/metadata.csv
+```
+
+All dated analyses under `Results/20260420_05/` use this same file. Its **Data file** value must exactly match the nonempty **file.name** value in the peak-area results (for example, `20260420_05`, without `.mz5`). Columns `1`, `2`, etc. contain the sample IDs for each injection. The filename must be exactly **metadata.csv**.
+
+The shared file takes priority. If it is absent, an existing `Data/metadata.csv` inside the selected dated analysis is still supported. Move an existing file to the shared run folder to reuse it across analyses; the app does not move or overwrite metadata automatically.
+
+The joined table is saved as **merged_peak_area.csv** inside the **selected dated analysis folder**. The loaded peak-area table reflects the metadata, while the original **Metabolite Peak Areas.csv** remains unchanged. Reporting and Data Quality & Variability require this metadata connection.
 
 ##### *Control Charts*
 

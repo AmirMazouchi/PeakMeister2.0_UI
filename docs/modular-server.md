@@ -36,7 +36,7 @@ processing starts on **Engine**.
 | Regenerate changed plots | `regenerate_changed_plots()` | Visualization → Plotting → Other → Regenerate Changed Plots |
 | Mark peak interferences | `mark_peak_interferences()` | Visualization → Plotting → Mark Peak Interference |
 | Normalize and replace missing data | `normalize_peak_areas()`, `replace_missing_peak_areas()` | Downstream Processing → left controls → Normalize Data (then Normalize in the dialog) / Replace Missing Data, respectively |
-| Join metadata to sample injections | `connect_peak_area_metadata()` | Downstream Processing → left controls → Connect Metadata to Results; merged table appears in Metadata |
+| Locate shared metadata and join it to sample injections | `metadata_file_paths()`, `connect_peak_area_metadata()` | Downstream Processing → left controls → Connect Metadata to Results; merged table appears in Metadata |
 | Control charts | `build_control_chart()` | Downstream Processing → left controls → Create Control Chart; plots appear in Control Charts |
 | CVs and PCA | `compute_quality_metrics()`, `calculate_cv()`, `perform_pca()`, `build_quality_cv_plot()`, `build_quality_pca_plot()` | Downstream Processing → Data Quality & Variability → Calculate CVs |
 | Batch correction | `load_batch_correction_packages()`, `apply_batch_correction()` | Downstream Processing → Batch Correction → Initialize Packages / Perform Batch Correction, respectively |
@@ -48,6 +48,15 @@ GUI action helpers use their own Shiny session's reactive state. The observers
 remain responsible for reacting to buttons and updating the GUI. Existing saved
 analysis discovery, SQLite helpers, manual integration and baseline functions
 remain in place.
+
+Metadata is shared between dated analyses at `Results/<run>/metadata.csv`.
+`metadata_file_paths()` derives that path from the selected analysis, so switching
+analyses within a run reuses the same metadata while switching runs uses a
+different file. The shared file takes priority over the older
+`<analysis>/Data/metadata.csv` location, which remains a fallback. Older flat
+results layouts keep their existing analysis-local lookup. Missing-file messages
+show the expected location. No metadata file is moved or overwritten automatically;
+merged output remains `<selected analysis>/merged_peak_area.csv`.
 
 The extraction/peak-processing formulas, filters, exported column names, saved-object names,
 folder layout and GUI controls retain their previous behavior. A redundant
@@ -100,6 +109,7 @@ Validation:
 - `Rscript --vanilla tests/modular-server.R`
 - `Rscript --vanilla tests/quality-metrics.R`
 - `Rscript --vanilla tests/action-errors.R`
+- `Rscript --vanilla tests/metadata-location.R`
 - `Rscript --vanilla tests/modular-equivalence.R /path/to/previous/server.R`
 
 The processing tests use synthetic spectra/traces and a trapezoid-integration
@@ -125,6 +135,10 @@ and download callback failures. They verify that the session stays open,
 notifications identify the action, loading waiters are hidden, failed downloads
 are removed, and corrected input can be retried. They also verify silent
 validation, early returns, observer isolation and once behavior.
+
+The metadata-location tests use the actual load/connect observers to check
+shared-file reuse across versions, precedence over local files, switching runs,
+legacy fallback, missing-file messages, and analysis-specific merged exports.
 
 A complete analysis of a real `.mz5` file was not run in this environment;
 MSnbase/mzR and the full scientific dependency set are unavailable here.

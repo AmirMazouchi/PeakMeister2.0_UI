@@ -96,7 +96,7 @@ write.csv(data.frame(WrongHeader = "Run01", `1` = "Patient1", check.names = FALS
 raw <- file.path(work, "fixture.mz5"); writeLines("synthetic raw input", raw)
 signals$errors <- list()
 testServer(function(input, output, session) {
-  for (name in c(guard_names, "connect_peak_area_metadata", "apply_batch_correction", "new_run_timer", "run_new_analysis", "valid_mz5_names")) eval(assignment(name), envir = environment())
+  for (name in c(guard_names, "metadata_file_paths", "connect_peak_area_metadata", "apply_batch_correction", "new_run_timer", "run_new_analysis", "valid_mz5_names")) eval(assignment(name), envir = environment())
   original_report <- report_action_error
   report_action_error <- function(action, error) {
     signals$errors[[length(signals$errors) + 1L]] <- list(action = action, message = conditionMessage(error))
