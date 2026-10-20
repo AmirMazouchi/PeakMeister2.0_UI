@@ -24,8 +24,7 @@ event_ids <- unique(unlist(lapply(registered, function(x) {
   e <- x[[2]]
   if (is.call(e) && identical(e[[1]], as.name("$")) && identical(e[[2]], as.name("input"))) as.character(e[[3]])
 })))
-# This pre-existing legacy button has no handler; its behavior is unchanged.
-stopifnot(identical(setdiff(button_ids, event_ids), "resetplotlydata"))
+stopifnot(!length(setdiff(button_ids, event_ids)))
 
 signals <- new.env(); signals$errors <- list(); signals$messages <- list(); signals$notifications <- list()
 testServer(function(input, output, session) {

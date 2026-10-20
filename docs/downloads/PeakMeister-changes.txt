@@ -9,6 +9,9 @@ workflows that were later replaced are described only in their final form.
 
 ui.R
 
+- Removed Visualization's unused Uploaded .RData file box and Clear uploaded
+  data button. Existing analyses open through Engine's run-folder selection
+  and Visualization's saved-analysis selector.
 - The modular refactor uses the existing ui.R without changing GUI controls.
 - Added separate New analysis and Open existing analysis modes in Engine.
 - New analysis retains real .mz5 uploads, multiple-file selection, and the

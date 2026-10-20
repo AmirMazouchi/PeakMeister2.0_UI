@@ -216,6 +216,8 @@ Selecting a run automatically selects and loads its most recent saved analysis. 
 
 Use **Visualization** in the left sidebar to view the analysis selected in Engine. For an existing analysis, its filename is selected internally and the **Select File** control is hidden. For new analyses with multiple uploaded files, **Select File** remains available to switch between files. Select a plot from **Loaded Plots** to display its electropherogram and peak information.
 
+To switch to another saved data file, return to **Engine → Open existing analysis** and select its run folder. Its latest analysis opens automatically; select a different version in **Visualization** if needed. You can repeat this sequence to change runs and versions. The unused manual `.RData` upload and **Clear uploaded data** controls have been removed.
+
 The saved-analysis dropdown is populated and selected automatically when opening an existing run. It displays the dated folder name (for example, `Results 2026-10-19`); the app retains the full path internally. It remains available for switching between dated analysis versions. Stored data and plots are loaded from the selected analysis folder. Engine's filename table, Search box, and pagination are shown only for new analyses with uploaded files.
 
 There are two subtabs to display the plots in which are titled "Plotting" or "Dual EIE View." The default is the "Plotting" tab.

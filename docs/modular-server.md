@@ -3,6 +3,11 @@
 Branch: `feature/modular-server`, based on `feature/new-or-open-analysis`.
 All application functions remain in `server.R`. The existing `ui.R` is compatible.
 
+Visualization's unused `.RData` upload box and **Clear uploaded data** button
+have been removed. To reopen another data file, select its run folder in
+**Engine → Open existing analysis**, then choose the saved analysis version
+in **Visualization**. This sequence can be repeated to switch runs and versions.
+
 The Initialize button validates the selected uploads and calls
 `run_new_analysis()`. That function prepares the parameters and calls
 `process_mz5_file()` for each uploaded file. The per-file function calls the
