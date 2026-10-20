@@ -1,3 +1,9 @@
+# Modular server refactor: the new-analysis pipeline calls task functions for
+# extraction, smoothing, peak processing, filtering, plotting and result exports.
+# Helpers use explicit inputs/returns; GUI actions use this session's state.
+# Long editing, batch-correction and drug-loading actions are named functions.
+# All functions remain in server.R; use the existing matching ui.R.
+
 # Startup workbook defaults: load both bundled Sample Files workbooks into the
 # parameter tables for each session. Uploads replace the loaded data; source labels
 # identify defaults/replacements. Mass/reference/parameter upload controls share
@@ -667,8 +673,1975 @@ server <- function(input, output, session){
     reset_raw_selection()
   })
 
-  #####3.2 Initialze Run Button - Main Content######
-  #Initialize run button - main engine content 
+  #####3.2 Processing task functions#####
+  # Data functions receive ordinary tables/objects and return their results.
+  # GUI action functions below retain this session's reactive state.
+
+  new_run_timer <- function(path, notify = function(stage, file) NULL) {
+    rows <- data.frame(file = character(), stage = character(), status = character(),
+                       started_at = character(), elapsed_seconds = numeric(),
+                       detail = character(), stringsAsFactors = FALSE)
+    run_start <- proc.time()[["elapsed"]]
+    run_wall <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")
+    active <- NULL
+    finished <- FALSE
+    persist <- function() write.csv(rows, path, row.names = FALSE)
+    record <- function(file, stage, status, wall, elapsed, detail = "") {
+      rows[nrow(rows) + 1L, ] <<- list(file, stage, status, wall, elapsed, detail)
+      persist()
+      message(sprintf("[Timing] %s | %s | %s | %.3f seconds", file, stage, status, elapsed))
+    }
+    close_stage <- function(status = "completed", detail = "") {
+      if (!is.null(active)) {
+        record(active$file, active$stage, status, active$wall,
+               proc.time()[["elapsed"]] - active$start, detail)
+        active <<- NULL
+      }
+    }
+    persist()
+    list(
+      stage = function(stage, file = "") {
+        stopifnot(!finished)
+        close_stage()
+        active <<- list(file = file, stage = stage,
+                        wall = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"),
+                        start = proc.time()[["elapsed"]])
+        message(sprintf("[Timing] Starting %s%s", stage,
+                        if (nzchar(file)) paste0(" | ", file) else ""))
+        notify(stage, file)
+      },
+      end_stage = function() close_stage(),
+      finish = function(status = "completed", detail = "") {
+        if (finished) return(invisible(NULL))
+        close_stage(status, detail)
+        record("", "TOTAL RUN (includes all stages)", status, run_wall,
+               proc.time()[["elapsed"]] - run_start, detail)
+        finished <<- TRUE
+        invisible(rows)
+      }
+    )
+  }
+
+  # Validate names and calculate migration indexes, including manual overrides.
+  prepare_analysis_parameters <- function(mass_df, is_df, parameters_df, user_mti_df) {
+    #Create a vector of metabolite and internal standard names
+    name_vec <- c(is_df$name, mass_df$name)
+
+    #Check for duplicate metabolite and internal standard names
+    if (sum(duplicated(name_vec)) > 0) {
+      stop("Mass List and Parameters contain duplicated metabolite or internal standard names.")
+    }
+
+    #Determine the number of metabolites and internal standards
+    num_of_metabolites <- nrow(mass_df)
+    num_of_is <- nrow(is_df)
+
+    #Get the number of injections
+    num_of_injections <- parameters_df$number.of.injections[1]
+
+
+    #####3.3 Migration Index Calculation#####
+
+    #Summarize user supplied migration time data
+    metabolites_mt_df <- data.frame(name = mass_df$name, mass_df[, c((ncol(mass_df) - num_of_injections + 1):ncol(mass_df))])
+    is_mt_df <- subset(is_df, is_df$class == "Reference")
+    is_mt_df <- data.frame(name = is_mt_df$name, is_mt_df[, c((ncol(is_mt_df) - num_of_injections + 1):ncol(is_mt_df))])
+
+    #Determine IS on the left
+    is_left_vec <- character(num_of_metabolites)
+
+    for (m in 1:nrow(metabolites_mt_df)) {
+      is_temp <- (metabolites_mt_df[m, 2] - (is_mt_df[, 2]))
+      is_temp <- set_names(is_temp, is_mt_df$name)
+      is_temp <- is_temp[which(sign(is_temp) == 1 | sign(is_temp) == 0)] %>%
+        which.min() %>%
+        names()
+
+      if (length(is_temp) == 0) {
+        is_temp <- "none"
+      }
+
+      is_left_vec[m] <- is_temp
+    }
+
+    #Determine IS on the right
+    is_right_vec <- character(num_of_metabolites)
+
+    for (m in 1:nrow(metabolites_mt_df)) {
+      is_temp <- (metabolites_mt_df[m, 2] - (is_mt_df[, 2]))
+      is_temp <- set_names(is_temp, is_mt_df$name)
+      is_temp <- is_temp[which(sign(is_temp) == -1 | sign(is_temp) == 0)] %>%
+        which.max() %>%
+        names()
+
+      if (length(is_temp) == 0) {
+        is_temp <- "none"
+      }
+
+      is_right_vec[m] <- is_temp
+    }
+
+    #Compute migration index
+    mi_df <- matrix(NA, ncol = (num_of_injections + 1), nrow = nrow(metabolites_mt_df)) %>%
+      as.data.frame()
+    mi_df[, 1] <- metabolites_mt_df$name
+
+    summary_vec <- character(nrow(metabolites_mt_df))
+
+    for (m in 1:nrow(metabolites_mt_df)) {
+      for (i in 2:(num_of_injections + 1)) {
+        left <- is_left_vec[m]
+        right <- is_right_vec[m]
+
+        if (left == "none") {
+          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == right), i]
+          summary_vec[m] <- right
+          next
+        }
+
+        if (right == "none") {
+          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == left), i]
+          summary_vec[m] <- left
+          next
+        }
+
+        if (metabolites_mt_df[m, 2] / is_mt_df[which(is_mt_df$name == left), 2] < 1.01) {
+          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == left), i]
+          summary_vec[m] <- left
+          is_right_vec[m] <- "none"
+          next
+        }
+
+        if (metabolites_mt_df[m, 2] / is_mt_df[which(is_mt_df$name == right), 2] > 0.99) {
+          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == right), i]
+          summary_vec[m] <- right
+          is_left_vec[m] <- "none"
+          next
+        }
+
+        mi_df[m, i] <- (metabolites_mt_df[m, i] - is_mt_df[which(is_mt_df$name == left), i]) / 
+          (is_mt_df[which(is_mt_df$name == right), i] - is_mt_df[which(is_mt_df$name == left), i])
+        summary_vec[m] <- "mi"
+      }
+    }
+
+    #Store results in one data frame
+    colnames(mi_df)[2:ncol(mi_df)] <- c(1:num_of_injections)
+    mi_df <- cbind(name = mass_df$name,
+                   left_is = is_left_vec,
+                   right_is = is_right_vec,
+                   description = summary_vec,
+                   mi_df[2:ncol(mi_df)])
+    #####3.4 User Supplied MTIs#####
+
+    user_mti_df <- user_mti_df
+
+    if (parameters_df$Manual.Indexes == "Yes") {
+
+        names <- unique(c(user_mti_df$name, user_mti_df$left_is, user_mti_df$right_is, user_mti_df$description))
+
+        if (all(names %in% c(name_vec, "mi", "none")) == FALSE) {
+          stop("Names detected in User Supplied Migration Indexes.csv not found in Mass List and Parameters.")
+        }
+
+        if (ncol(user_mti_df) != (4 + num_of_injections)) {
+          stop(paste("Make sure User Supplied Migration Indexes.csv contains migration time indexes for all", num_of_injections, "injections."))
+        }
+
+        for (i in 1:nrow(user_mti_df)) {
+          row <- which(mi_df$name == user_mti_df$name[i])
+
+          if (length(row) == 0) {
+            stop(paste("Metabolite", user_mti_df$name[i], "from User Supplied Migration Indexes.csv is not in Mass List and Parameters."))
+          }
+
+          mi_df[row, 2:ncol(mi_df)] <- user_mti_df[i, 2:ncol(user_mti_df)]
+        }
+      }
+
+    list(mass_df = mass_df, is_df = is_df, parameters_df = parameters_df,
+         name_vec = name_vec, num_of_metabolites = num_of_metabolites,
+         num_of_is = num_of_is, num_of_injections = num_of_injections, mi_df = mi_df)
+  }
+
+  # Read one copied raw file and unlock its spectra for calibration.
+  read_mz5_data <- function(temporary_file, total_steps) {
+    #Read copied data file and update progress bar
+    incProgress(1/total_steps, detail = paste("Reading Data File"))
+    print("Reading Data File")
+
+    run_data <- readMSData(
+      file = temporary_file,
+      pdata = NULL,
+      msLevel = 1,
+      verbose = isMSnbaseVerbose(),
+      centroided. = FALSE,
+      smoothed. = FALSE,
+      cache. = 0,
+      mode = "inMemory"
+    )
+
+    print("File Reading Complete")
+
+    #Unlock "assayData" environment
+    env_binding_unlock(run_data@assayData)
+
+    run_data
+  }
+
+  # Apply optional lock-mass calibration; return the run object.
+  calibrate_masses <- function(run_data, parameters_df, total_steps) {
+    calibration_response <- parameters_df$apply.mass.calibration
+
+    #Confirm response is "Yes" or "No". Otherwise, produce an error.
+
+    if(calibration_response != "Yes" & calibration_response != "No"){
+      stop(paste("apply.mass.calibration parameter should be 'Yes' or 'No'. ", "'", calibration_response, "' is not an acceptable input.", sep = ""))
+    }
+
+    #Check if mass calibration should be applied
+
+    if (calibration_response == "No"){
+
+      print("Skipping Mass Calibration")
+
+    }
+
+    if (calibration_response == "Yes"){
+
+      #Update progress bar
+      incProgress(1/total_steps, detail = paste("Performing Mass Calibration"))
+
+      print("Performing Mass Calibration")
+
+      run_data <- local({
+
+        #Define mass window and minimum lock mass counts
+
+        mass_window <- parameters_df$ref.mass.window.ppm[1]
+
+        minimum_counts <- parameters_df$ref.mass.minimum.counts[1]
+
+        #Define a function to calculate 1. experimental m/z of lock masses, 2. the corresponding mass error, and 3. the index of the lock mass
+        #The lock mass value is currently the most intense point in the mass window plus an adjustment to better predict the lock mass value.
+
+        calibration_parameters <- function(spectrum, lock_mass, minimum_counts, mass_window) {
+
+          lock_mass_range <- c((lock_mass - lock_mass * mass_window / 1000000),
+                               (lock_mass + lock_mass * mass_window / 1000000))
+
+          #Find the index of the most intense point in the lock mass window
+
+          max_intensity_index <- spectrum %>%
+            filter(mz >= lock_mass_range[1] & mz <= lock_mass_range[2]) %>%
+            slice_max(intensity) %>%
+            pull(index)
+
+          if(length(max_intensity_index) == 1){
+            if(spectrum$intensity[max_intensity_index] > minimum_counts){
+
+              #Create a data frame with all four points
+              line_points <- data.frame("mz" = c(spectrum$mz[(max_intensity_index - 2):(max_intensity_index - 1)],
+                                                 spectrum$mz[(max_intensity_index + 1):(max_intensity_index + 2)]),
+                                        "intensity" = c(spectrum$intensity[(max_intensity_index - 2):(max_intensity_index - 1)],
+                                                        spectrum$intensity[(max_intensity_index + 1):(max_intensity_index + 2)]))
+
+              #Create a model for all four points
+              model_left <- lm(formula = intensity ~ mz, data = line_points[c(1,2),])
+              model_right <- lm(formula = intensity ~ mz, data = line_points[c(3,4),])
+
+              #Get the coefficients for both models
+              coefficients_left <- c(model_left$coefficients["mz"], model_left$coefficients["(Intercept)"])
+              coefficients_right <- c(model_right$coefficients["mz"], model_right$coefficients["(Intercept)"])
+
+              #Calculate the slope and intercept
+              slope <- coefficients_left[1] - coefficients_right[1]
+              intercept <- coefficients_right[2] - coefficients_left[2]
+
+              #Solve for the experimental_mz
+              experimental_mz <- solve(slope, intercept)
+
+              experimental_mass_diff <- lock_mass - experimental_mz
+
+              return(c(experimental_mz, experimental_mass_diff, max_intensity_index))
+            }
+          }
+        }
+
+        #Loop through each spectrum to build a model and perform the mass calibration
+
+        for (s in 1:end(rtime(run_data))[1]){
+
+          spectrum_name <- ls(run_data@assayData)[s]
+
+          spectrum <- data.frame(index = 1:length(run_data@assayData[[spectrum_name]]@mz),
+                                 mz = run_data@assayData[[spectrum_name]]@mz,
+                                 intensity = run_data@assayData[[spectrum_name]]@intensity)
+
+          #Lower lock mass
+
+          lock_mass <- parameters_df$ref.mass.one[1]
+
+          cal_para_1 <- calibration_parameters(spectrum = spectrum,
+                                               lock_mass = lock_mass,
+                                               minimum_counts = minimum_counts,
+                                               mass_window = mass_window)
+
+          #Upper lock mass
+
+          lock_mass <- parameters_df$ref.mass.two[1]
+
+          cal_para_2 <- calibration_parameters(spectrum = spectrum,
+                                               lock_mass = lock_mass,
+                                               minimum_counts = minimum_counts,
+                                               mass_window = mass_window)
+
+          if (is.null(cal_para_1) | is.null(cal_para_2)){
+            next
+          }
+
+          ######3.6.1 Develop correction model######
+
+          model_data <- data.frame("x" = c(cal_para_1[1], cal_para_2[1]),
+                                   "y" = c(cal_para_1[2], cal_para_2[2]))
+
+          model <- lm(y ~ x, model_data)
+
+          ######3.6.2 Apply correction model######
+
+          correction_vector <- c(model[["coefficients"]][["x"]] * spectrum$mz) + model[["coefficients"]][["(Intercept)"]]
+
+          correction_vector[1:cal_para_1[3]] <- cal_para_1[2]
+
+          correction_vector[cal_para_2[3]:length(correction_vector)] <- cal_para_2[2]
+
+          run_data@assayData[[spectrum_name]]@mz <- run_data@assayData[[spectrum_name]]@mz + correction_vector
+
+        }
+
+        run_data
+
+      })
+    }
+
+
+    print("Mass Calibration Complete")
+
+    run_data
+  }
+
+  # Build extraction windows and sort the spectra used for extraction.
+  prepare_extraction_spectra <- function(run_data, is_df, mass_df, total_steps) {
+    #Update progress bar
+    incProgress(1/total_steps, detail = paste("Extracting Electropherograms"))
+
+    print("Extracting Electropherograms")
+
+    #Define mass error in ppm
+
+    mass_error_vec <- c(is_df$extraction.window.ppm, mass_df$extraction.window.ppm)
+
+    #Create a matrix of minimum and maximum m/z values for each internal standard and metabolite
+    mz_vec <- c(is_df$mz, mass_df$mz)
+    min <- mz_vec - mz_vec * mass_error_vec / 1000000
+    max <- mz_vec + mz_vec * mass_error_vec / 1000000
+    mzr <- matrix(c(min, max), ncol = 2)
+
+    #Process/check for correcting any unsorted MZ values in extracted spectra in the MSnExp obj. No clue why this occurs but it can be corrected.
+    #Extract the spectra from the assayData environment stored in the run_data MSnExp
+    assay_data_env <- assayData(run_data)
+
+    #List all the objects in the assayData environment
+    spectra_names <- ls(assay_data_env)
+
+    #Create synthetic environment to merge with the real assayData environment component in run_data after spectra have been sorted
+    sorted_assay_data_env <- new.env()
+
+    #Loop through each spectrum in run_data and check if m/z values are unsorted AND if m/z values are negative.
+    for (i in spectra_names) {
+      spectrum <- get(i, assay_data_env)
+
+      mz_values <- mz(spectrum)
+      intensity_values <- intensity(spectrum)
+
+      #Find any negative m/z values and replace them.
+      valid_idx <- mz_values >= 0
+      mz_values <- mz_values[valid_idx]
+      intensity_values <- intensity_values[valid_idx]
+
+      if (length(mz_values) == 0) {
+        cat("Spectrum", i, "has no valid MZ values after removing negatives\n")
+        next
+      }
+
+
+      #Check if m/z values are unsorted
+      if (is.unsorted(mz_values)) {
+        cat("Spectrum", i, "has unsorted MZ values\n")
+
+        #Sort the problematic spectrum
+
+        order_idx <- order(mz_values)
+
+        #Create a sorted Spectrum1 object which will then be merged into the original run_data assayData. This allows for correction of the unsorted spectra.
+        sorted_spectrum <- new("Spectrum1",
+                               mz = mz_values[order_idx],
+                               intensity = intensity_values[order_idx],
+                               rt = rtime(spectrum),
+                               tic = sum(intensity_values[order_idx]),
+                               centroided = centroided(spectrum),
+                               fromFile = fromFile(spectrum))
+
+        #Confirm spectra is sorted
+        cat("Sorted Spectrum", i, "\n")
+      } else {
+        #If already sorted, keep the original spectrum
+        sorted_spectrum <- spectrum
+      }
+
+      #Store the sorted spectrum in the new environment
+      assign(i, sorted_spectrum, sorted_assay_data_env)
+    }
+
+    #Directly update the assayData slot of run_data
+    slot(run_data, "assayData") <- sorted_assay_data_env
+
+    list(run_data = run_data, mzr = mzr, mz_vec = mz_vec)
+  }
+
+  # Extract mean-intensity electropherograms for the requested mass windows.
+  extract_electropherograms <- function(run_data, mzr) {
+    #Extract electropherograms
+    electropherograms <- chromatogram(run_data,
+                                      mz = mzr,
+                                      rt = c(0,end(rtime(run_data))),
+                                      aggregationFun = "mean",
+                                      missing = 0,
+                                      msLevel = 1)
+
+    electropherograms
+  }
+
+  # Convert extracted traces to the migration-time/intensity table.
+  build_eie_dataframe <- function(electropherograms, name_vec) {
+    eie_df <- data.frame("mt.seconds" = electropherograms[1]@rtime)
+
+    for (n in 1:length(name_vec)){
+      temp_df <- data.frame(electropherograms[n]@intensity)
+      colnames(temp_df) <- paste(name_vec[n], "intensity", sep = " ")
+      eie_df <- cbind(eie_df,temp_df)
+    }
+
+    print("Extraction Complete")
+
+    eie_df
+  }
+
+  # Optionally smooth the intensity columns; temporary objects stay local.
+  smooth_electropherograms <- function(eie_df, is_df, mass_df, parameters_df, name_vec, total_steps) {
+    smoothing_response <- parameters_df$apply.smoothing
+    if (smoothing_response != "Yes" & smoothing_response != "No") {
+      stop(paste("apply.smoothing parameter should be 'Yes' or 'No'. ", "'", smoothing_response, "' is not an acceptable input.", sep = ""))
+    }
+    if (smoothing_response == "No") {
+      print("Skipping Smoothing")
+    }
+    if (smoothing_response == "Yes") {
+      incProgress(1/total_steps, detail = "Smoothing Electropherograms")
+      print("Smoothing Electropherograms")
+      smoothing_kernel_vec <- c(is_df$smoothing.kernel, mass_df$smoothing.kernel)
+      smoothing_strength_vec <- c(is_df$smoothing.strength, mass_df$smoothing.strength)
+      for (n in 1:length(name_vec)) {
+        Smooth <- with(eie_df,
+          ksmooth(x = mt.seconds, y = eie_df[, n + 1],
+                  kernel = smoothing_kernel_vec[n],
+                  bandwidth = smoothing_strength_vec[n]))
+        eie_df[, n + 1] <- Smooth[["y"]]
+      }
+    }
+    print("Electropherograms Smoothing Complete")
+    eie_df
+  }
+
+  # Detect, integrate and filter the internal-standard peaks.
+  process_internal_standard_peaks <- function(eie_df, is_df, parameters_df, name_vec, num_of_is, num_of_injections, total_steps) {
+    #Update progress bar
+    incProgress(1/total_steps, detail = paste("Performing Peak Picking and Filtering for Internal Standards"))
+
+    print("Performing Peak Picking and Filtering for Internal Standards")
+
+    ######3.9.1 Peak detection######
+
+    is_peaks_df <- local({
+
+      n <- 1
+
+      for (s in 1:num_of_is){
+
+        rle_output <- eie_df[,s+1] %>%
+          diff() %>%
+          sign() %>%
+          rle()
+
+        consecutive_runs <- which(rle_output$lengths > n & rle_output$values == 1)
+        consecutive_runs <- subset(consecutive_runs, (consecutive_runs + 1) %in% (which(rle_output$lengths > n)) == TRUE)
+
+        run_lengths <- cumsum(rle_output$lengths) + 1
+
+        start <- eie_df$mt.seconds[run_lengths[consecutive_runs - 1]]
+        apex <- eie_df$mt.seconds[run_lengths[consecutive_runs]]
+        end <- eie_df$mt.seconds[run_lengths[consecutive_runs + 1]]
+
+        #For FWHM calculations I will also add intensity values here as well
+
+        start_intensity <- eie_df[run_lengths[consecutive_runs - 1], (s+1)]
+        apex_intensity <- eie_df[run_lengths[consecutive_runs], (s+1)]
+        end_intensity <- eie_df[run_lengths[consecutive_runs + 1], (s+1)]
+
+        #Account for peaks that start immediately during the analysis
+
+        if(length(start) != length(apex)){
+          start <- append(start, 0, 0)
+          start_intensity <- append(start_intensity, 0, 0)
+        }
+
+        #Create a data frame containing the start, apex, and end migration times of each peak
+
+        peak_df <- data.frame(start,
+                              apex,
+                              end,
+                              start_intensity,
+                              apex_intensity,
+                              end_intensity)
+
+        ######3.9.2 Migration time filtering######
+
+        #Filter peaks that are outside migration time limits
+
+        peak_df <- subset(peak_df, peak_df$apex >= is_df$min.mt.min[s] * 60 & peak_df$apex <= is_df$max.mt.min[s] * 60)
+
+        ######3.9.3 Integrate peaks######
+
+        peak_area_vector = c(1:nrow(peak_df))
+
+        #If the length of peak_area_vector is less than the number of injections,
+        #print an error and suggest a solution
+
+        if (length(peak_area_vector) < num_of_injections){
+          cat(paste("Warning: ", name_vec[s], " EIE contains insufficient data. If an error occurs try:
+      1. Increasing the extraction.window.ppm parameter
+      2. Adjusting min.mt.min and max.mt.min parameters", sep =""))
+        }
+
+        for (p in 1:nrow(peak_df)){
+
+          peak_area_vector[p] <- AUC(eie_df$mt.seconds,
+                                     eie_df[,s+1],
+                                     method = "trapezoid",
+                                     from = peak_df[p,1],
+                                     to = peak_df[p,3],
+                                     absolutearea = FALSE,
+                                     na.rm = FALSE)
+
+          #Perform baseline correction
+
+          peak_area_vector[p] <- peak_area_vector[p] - (peak_df[p,3] - peak_df[p,1]) * min(peak_df[p,4], peak_df[p,6])
+        }
+
+        peak_df <- cbind(peak_df, peak_area_vector)
+
+        #rename peak_df columns
+
+        colnames(peak_df) <- c(paste(name_vec[s], "start.seconds", sep = "."),
+                               paste(name_vec[s], "apex.seconds", sep = "."),
+                               paste(name_vec[s], "end.seconds", sep = "."),
+                               paste(name_vec[s], "start_intensity", sep = "."),
+                               paste(name_vec[s], "apex_intensity", sep = "."),
+                               paste(name_vec[s], "end_intensity", sep = "."),
+                               paste(name_vec[s], "peak.area", sep = "."))
+
+        #Retain peak_df for future filtering steps
+
+        peak_df_fill <- peak_df
+
+        ######3.9.4 FWHM filtering######
+
+        #Do not not apply the FWHM filter if the number of injections is equal to 1
+
+        if (parameters_df$number.of.injections != 1) {
+
+          #Find the peak intensity at half the peak height
+
+          intensity_fwhm <- peak_df[,4] + (peak_df[,5] - peak_df[,4])/2
+
+          #Find the migration times closest to these intensities within each peak
+
+          fwhm_vec <- vector()
+          single_eie <- eie_df[,c(1,s+1)]
+
+          for(p in 1:nrow(peak_df)){
+
+            single_eie_temp <- subset(single_eie, single_eie$mt.seconds >= peak_df[p,1] & single_eie$mt.seconds <= peak_df[p,2])
+            fwhm_mt_left <- single_eie_temp$mt.seconds[which.min(abs(single_eie_temp[,2] - intensity_fwhm[p]))]
+
+            single_eie_temp <- subset(single_eie, single_eie$mt.seconds <= peak_df[p,3] & single_eie$mt.seconds >= peak_df[p,2])
+            fwhm_mt_right <- single_eie_temp$mt.seconds[which.min(abs(single_eie_temp[,2] - intensity_fwhm[p]))]
+
+            fwhm_vec <- append(fwhm_vec, fwhm_mt_right - fwhm_mt_left)
+
+          }
+
+          peak_df$fwhm <- fwhm_vec
+
+          #Determine the fwhm of the peaks (n = num_of_injections) with the greatest area
+
+          df_temp <- peak_df[order(-peak_df[,8]),]
+          df_temp <- df_temp[1:num_of_injections,]
+
+          fwhm_cutoff <- median(df_temp$fwhm)
+
+          peak_df <- subset(peak_df, peak_df$fwhm <= (fwhm_cutoff * is_df$peak.fwhm.tolerance.multiplier[s]))
+          peak_df <- peak_df[,c(1:7)]
+
+        }
+
+        #subset peak_df so that only the peaks (n = number.of.injections) with the greatest area are kept
+
+        cut_off <- sort(peak_df[,7], decreasing = TRUE)[num_of_injections]
+
+        peak_df <- subset(peak_df, peak_df[,7] >= cut_off)
+
+        ######3.9.5 Peak space filtering######
+
+        #Do not apply peak space filtering if the number of injections is equal to 1
+
+        if(num_of_injections != 1){
+
+          #Determine the upper and lower migration time limits for space between peaks
+
+          median_space <- peak_df[,2] %>%
+            diff() %>%
+            median()
+
+          median_space_tol <- is_df$peak.space.tolerance.percent[s] / 100
+
+          median_space_lower_lim <- median_space - median_space * median_space_tol
+          median_space_upper_lim <- median_space + median_space * median_space_tol
+
+          #Check if peaks migrate within the tolerance limits
+
+          peak_space_tol_check <- between(diff(peak_df[,2]), median_space_lower_lim, median_space_upper_lim)
+
+          if(all(peak_space_tol_check) != TRUE){
+            bad_space <- which(peak_space_tol_check == FALSE)
+          }else{
+            bad_space <- NA
+          }
+
+          ######3.9.6 Scenario 1######
+          #Only one bad space is detected
+
+          if(length(bad_space) == 1 & is.na(bad_space[1]) == FALSE){
+
+            false_peak_diff <- peak_df[num_of_injections, 2] - peak_df[(num_of_injections - 1), 2]
+
+            #This algorithm always assumes the final peak is false - likely due to carryover
+            #It is possible the first peak is false but this seems less likely
+            #Final peak only removed if case 1 does not produce a duplicate
+
+            #Case 1- An interior peak is missing (usually a blank)
+
+            if(bad_space != (num_of_injections - 1)){
+
+              #Since the we know the bad space is not at the end, use the space after the bad space to find the expected apex
+
+              expected_peak_apex <- peak_df[bad_space[1],2] + peak_df[(bad_space[1] + 2),2] - peak_df[(bad_space[1] + 1),2]
+
+            }
+
+            #Case 2 -  Final space is false and less than median - suspect that true final peak was missed
+
+            if(bad_space == (num_of_injections - 1) & false_peak_diff < median_space_upper_lim){
+              expected_peak_apex <- peak_df[(num_of_injections - 1 ),2] + median_space
+            }
+
+            #Case 3 - Final space is false and greater than median - suspect that peak 1 was missed
+
+            if(bad_space == (num_of_injections - 1) & false_peak_diff > median_space_lower_lim){
+              expected_peak_apex <- peak_df[1,2] - median_space
+            }
+
+            peak <- which.min(abs(peak_df_fill[,2] - expected_peak_apex))
+
+            #If the nearest peak is too far from the expected migration time use a place holder
+
+            if (abs(peak_df_fill[peak,2] - expected_peak_apex) > (median_space / 2)){
+
+              nearest_mt <- (eie_df$mt.seconds - expected_peak_apex) %>%
+                abs() %>%
+                which.min(.)
+
+              peaks <- data.frame(eie_df[nearest_mt,1],
+                                  eie_df[nearest_mt,1],
+                                  eie_df[nearest_mt,1],
+                                  eie_df[nearest_mt,s + 1],
+                                  eie_df[nearest_mt,s + 1],
+                                  eie_df[nearest_mt,s + 1],
+                                  0)
+
+              colnames(peaks) <- colnames(peak_df)
+
+              peak_df <- rbind(peak_df, peaks)
+
+              peak_df <- peak_df[order(peak_df[,2]),]
+
+            }else{
+
+              peak_df <- rbind(peak_df, peak_df_fill[peak,])
+
+              peak_df <- peak_df[order(peak_df[,2]),]
+
+            }
+
+            #Remove bad peak
+
+            if (any(duplicated(peak_df[,2]))){
+
+              peak_df <- peak_df[-c(which(duplicated(peak_df[,2]))),]
+
+            }else{
+
+              peak_df <- peak_df[1:(num_of_injections),]
+
+            }
+          }
+
+          ######3.9.7 Scenario 2######
+          #Two or three bad spaces are detected
+
+          if(length(bad_space) == 2 | length(bad_space) == 3){
+
+            peaks_to_check <- c(bad_space, (bad_space + 1)) %>%
+              unique() %>%
+              sort()
+
+            #Outside peaks must be checked last
+
+            peaks_to_check <- c(peaks_to_check[-1], peaks_to_check[1])
+
+            #Loop through each suspect bad peak and remove them iteratively until the number of bad spaces reaches 1
+
+            for (p in 1:length(peaks_to_check)){
+
+              num_bad_space <- peak_df[,2] %>%
+                .[-c(peaks_to_check[p])] %>%
+                diff(.) %>%
+                between (median_space_lower_lim, median_space_upper_lim)
+              num_bad_space <- length(which(num_bad_space == FALSE))
+
+              if (num_bad_space == 1){
+                peak_df <- peak_df[-c(peaks_to_check[p]),]
+                break
+              }
+            }
+
+            #To avoid errors where removing a peak results in 0 bad spaces only fill
+            #in gap if nrow(peak_df) == number of injections - 1
+
+            if(nrow(peak_df) == (num_of_injections - 1)){
+
+              #Find the peak gap and calculate the expected migration time for the missing peak
+
+              gap <- which(between(diff(peak_df[,2]), median_space_lower_lim, median_space_upper_lim) == FALSE)
+
+              expected_peak_apex <- (peak_df[(gap[1] + 1),2] - peak_df[gap[1],2])/2 + peak_df[gap[1],2]
+
+              #Find the nearest peak in the peak_df_fill data frame to the expected migration time
+              #Avoid duplicate peaks by not using exisitng peaks in peak_df
+
+              peak_df_fill <- subset(peak_df_fill, !(peak_df_fill[,2] %in% peak_df[,2]))
+
+              peak <- which.min(abs(peak_df_fill[,2] - expected_peak_apex))
+              peak_df <- rbind(peak_df, peak_df_fill[peak,])
+
+              peak_df <- peak_df[order(peak_df[,2]),]
+
+            }
+          }
+        }
+
+        #Summarize peak_df data in is.peak_df
+
+        if(s == 1){
+          is_peaks_df = peak_df
+        }else{
+          is_peaks_df = cbind(is_peaks_df, peak_df)
+        }
+      }
+
+      is_peaks_df
+
+    })
+
+    print("Peak Picking and Filtering for Internal Standards Complete")
+
+    is_peaks_df
+  }
+
+  # Detect, integrate and align metabolite peaks using the reference peaks/indexes.
+  process_metabolite_peaks <- function(eie_df, mass_df, is_df, is_mt_df, mi_df, name_vec, num_of_is, num_of_injections, total_steps) {
+    #Update progress bar
+    incProgress(1/total_steps, detail = paste("Performing Peak Picking and Filtering for Analytes"))
+
+    print("Performing Peak Picking and Filtering for Analytes")
+
+    ######3.10.1 Peak detection######
+
+    metabolite_peaks_df <- local ({
+
+      for (m in (num_of_is + 1):length(name_vec)){
+
+        peak_df <- data.frame()
+
+        #Determine the start, apex, and end of peaks. Use the user defined value "n" to detect peaks.
+        #If n results in fewer peaks then injection, decrease n by 1 and repeat
+
+        n <- 1
+
+        rle_output <- eie_df[,m + 1] %>%
+          diff() %>%
+          sign() %>%
+          rle()
+
+        consecutive_runs <- which(rle_output$lengths > n & rle_output$values == 1)
+        consecutive_runs <- subset(consecutive_runs, (consecutive_runs + 1) %in% (which(rle_output$lengths > n)) == TRUE)
+
+        run_lengths <- cumsum(rle_output$lengths) + 1
+
+        start <- eie_df$mt.seconds[run_lengths[consecutive_runs - 1]]
+        apex <- eie_df$mt.seconds[run_lengths[consecutive_runs]]
+        end <- eie_df$mt.seconds[run_lengths[consecutive_runs + 1]]
+
+        #I will also add intensity values here as well
+
+        start_intensity <- eie_df[run_lengths[consecutive_runs - 1], (m+1)]
+        apex_intensity <- eie_df[run_lengths[consecutive_runs], (m+1)]
+        end_intensity <- eie_df[run_lengths[consecutive_runs + 1], (m+1)]
+
+        #Account for peaks that start immediately during the analysis
+
+        if(length(start) != length(apex)){
+          start <- append(start, 0, 0)
+          start_intensity <- append(start_intensity, 0, 0)
+        }
+
+        #Create a data frame containing the start, apex, and end migration times of each
+        #peak in addition to required intensities for FWHM calculations
+
+        peak_df <- data.frame(start,
+                              apex,
+                              end,
+                              start_intensity,
+                              apex_intensity,
+                              end_intensity)
+
+        ######3.10.2 Filter peaks by peak width######
+
+        #Define a minimum peak width cut off in seconds. Remove peaks with a width <= cutoff
+
+        min_width_cut_off <- mass_df$minimim.peak.width.seconds[m - num_of_is]
+
+        peak_df <- subset(peak_df, (peak_df$end - peak_df$start) >= min_width_cut_off)
+
+        ######3.10.3 Integrate peaks######
+
+        peak_area_vector = c(1:nrow(peak_df))
+
+        #If the length of peak_area_vector is less than the number of injections,
+        #print an error and suggest a solution
+
+        if (length(peak_area_vector) < num_of_injections){
+          cat(paste("Warning: ", name_vec[m], " EIE contains insufficient data. If an error occurs try:
+      1. Increasing the extraction.window.ppm parameter
+      2. Decreasing the minimim.peak.width.seconds parameter", sep =""))
+        }
+
+        for (p in 1:nrow(peak_df)){
+
+          peak_area_vector[p] <- AUC(eie_df$mt.seconds,
+                                     eie_df[,m+1],
+                                     method = "trapezoid",
+                                     from = peak_df[p,1],
+                                     to = peak_df[p,3],
+                                     absolutearea = FALSE,
+                                     na.rm = FALSE)
+
+          peak_area_vector[p] <- peak_area_vector[p] - (peak_df[p,3] - peak_df[p,1]) * min(peak_df[p,4], peak_df[p,6])
+        }
+
+        peak_df <- cbind(peak_df, peak_area_vector)
+
+        #rename peak_df columns
+
+        colnames(peak_df) <- c(paste(name_vec[m], "start.seconds", sep = "."),
+                               paste(name_vec[m], "apex.seconds", sep = "."),
+                               paste(name_vec[m], "end.seconds", sep = "."),
+                               paste(name_vec[m], "start_intensity", sep = "."),
+                               paste(name_vec[m], "apex_intensity", sep = "."),
+                               paste(name_vec[m], "end_intensity", sep = "."),
+                               paste(name_vec[m], "peak.area", sep = "."))
+
+        ######3.10.4 Filter peaks######
+
+        #Filter peaks based on smallest mt difference
+
+        #Determine the expected migration times of the metabolites
+
+        n <- m - num_of_is
+        left_is <- paste(mi_df$left_is[n], ".apex.seconds", sep ="")
+        right_is <- paste(mi_df$right_is[n], ".apex.seconds", sep ="")
+        rmt_is <- paste(mi_df$description[n], ".apex.seconds", sep ="")
+
+        if(mi_df$description[n] == "mi"){
+
+          mf_vec <- mi_df[n,5:ncol(mi_df)] %>%
+            unlist() %>%
+            unname()
+
+          expected_mt <- mf_vec * (is_mt_df[,which(colnames(is_mt_df) == right_is)] - is_mt_df[,which(colnames(is_mt_df) == left_is)]) + is_mt_df[,which(colnames(is_mt_df) == left_is)]
+
+        }else{
+
+          mf_vec <- mi_df[n,5:ncol(mi_df)] %>%
+            unlist() %>%
+            unname()
+
+          expected_mt <- mf_vec * is_mt_df[,which(colnames(is_mt_df) == rmt_is)]
+
+        }
+
+        #Filter peak_df for peaks within migration time tolerance
+
+        migration_window <- mass_df$migration.window.seconds[m - num_of_is]
+
+        for (i in 1:num_of_injections){
+
+          peaks <- peak_df %>%
+            filter(., peak_df[,2] <= expected_mt[i] + migration_window &
+                     peak_df[,2] >= expected_mt[i] - migration_window)
+
+          #If more than one peak is found choose the nearest one
+
+          if(nrow(peaks) > 1){
+            peaks <- (peak_df[,2] - expected_mt[i]) %>%
+              abs() %>%
+              which.min(.)
+            peaks <- peak_df[peaks,]
+          }
+
+          #If no peak is found, generate a place holder
+
+          if(nrow(peaks) == 0){
+
+            nearest_mt <- (eie_df$mt.seconds - expected_mt[i]) %>%
+              abs() %>%
+              which.min(.)
+
+            peaks <- data.frame(eie_df[nearest_mt,1],
+                                eie_df[nearest_mt,1],
+                                eie_df[nearest_mt,1],
+                                eie_df[nearest_mt,m + 1],
+                                eie_df[nearest_mt,m + 1],
+                                eie_df[nearest_mt,m + 1],
+                                0)
+
+            colnames(peaks) <- colnames(peak_df)
+          }
+
+          if(i == 1){
+            filtered_peaks_df <- peaks
+          }else{
+            filtered_peaks_df <- rbind(filtered_peaks_df, peaks)
+          }
+        }
+
+        ######3.10.5 Filter peaks outside of run time limits######
+
+        #Set a place holder for peaks where the expected migration time > total run time
+
+        total_run_time <- eie_df$mt.seconds[nrow(eie_df)]
+
+        late_peaks <- (expected_mt > total_run_time) %>%
+          which()
+
+        #Find migration times to use as placeholders that do not belong to other identified peaks
+
+        mt <- tail(eie_df$mt.seconds, n = 15)
+
+        mt <- mt[!(mt %in% filtered_peaks_df[,2])]
+
+        for (i in late_peaks){
+          mt_temp <- mt[i]
+          filtered_peaks_df[i,] <- c(mt_temp,
+                                     mt_temp,
+                                     mt_temp,
+                                     eie_df[which(eie_df$mt.seconds == mt_temp) ,m + 1],
+                                     eie_df[which(eie_df$mt.seconds == mt_temp) ,m + 1],
+                                     eie_df[which(eie_df$mt.seconds == mt_temp) ,m + 1],
+                                     0)
+        }
+
+
+        ######3.10.6 Filter duplicated peaks######
+
+        #If the same peak is assigned to multiple injection numbers, reapply rmt filter with more austere rmt tolerances
+        #New rmt tolerance will be the original / count, which starts at 2 and increases by 1 each iteration
+
+        count = 2
+
+        while (any(duplicated(filtered_peaks_df[,2])) & count < 100){
+
+          strict_migration_window <- migration_window/count
+
+          #find rows with duplicated values
+
+          duplicate_location <- filtered_peaks_df[,2] %>%
+            duplicated() %>%
+            which()
+
+          duplicate_rows <- which(filtered_peaks_df[,2] %in% filtered_peaks_df[duplicate_location,2])
+
+          #reapply filtering for these peaks with the more strict rmt tolerance
+
+          for (r in duplicate_rows){
+
+            peaks <- peak_df %>%
+              filter(., peak_df[,2] <= expected_mt[r] + strict_migration_window &
+                       peak_df[,2] >= expected_mt[r] - strict_migration_window)
+
+            #If more than one peak is found choose the nearest one
+
+            if(nrow(peaks) > 1){
+              peaks <- (peak_df[,2] - expected_mt[r]) %>%
+                abs() %>%
+                which.min(.)
+              peaks <- peak_df[peaks,]
+            }
+
+            #If no peak is found, generate a place holder
+
+            if(nrow(peaks) == 0){
+
+              nearest_mt <- (eie_df$mt.seconds - expected_mt[r]) %>%
+                abs() %>%
+                which.min(.)
+
+              peaks <- data.frame(eie_df[nearest_mt,1],
+                                  eie_df[nearest_mt,1],
+                                  eie_df[nearest_mt,1],
+                                  eie_df[nearest_mt,m + 1],
+                                  eie_df[nearest_mt,m + 1],
+                                  eie_df[nearest_mt,m + 1],
+                                  0)
+
+              colnames(peaks) <- colnames(peak_df)
+            }
+
+            filtered_peaks_df[r,] <- peaks
+
+          }
+
+          count = count + 1
+        }
+
+        #If the duplicate peak filter fails (count = 100) then generate a place holder peak_df
+        #and generate a warning that the filter failed. This filter fails when two or more expected migration
+        #times are too close to each other.
+
+        if (count == 100){
+
+          mt.temp <- eie_df$mt.seconds[seq(1, num_of_injections * 10, 10)]
+
+          filtered_peaks_df[,c(1:3)] <- mt.temp
+          filtered_peaks_df[,c(4:7)] <- 0
+
+        }
+
+        ######3.10.7 Filter using peak spaces######
+
+        #Do not apply peak space filtering if the number of injections is equal to 1
+
+        if(num_of_injections != 1){
+
+          #Get peak space tolerance
+
+          space_tol <- mass_df$peak.space.tolerance.percent[m - num_of_is] / 100
+
+          #Make a vector containing all the expected space lengths
+
+          space_vec <- expected_mt %>%
+            diff()
+
+          #Define upper and lower peak space limits
+
+          space_lower_lim <- space_vec - space_vec * space_tol
+          space_upper_lim <- space_vec + space_vec * space_tol
+
+          #Check if peaks migrate within the tolerance limits
+
+          peak_space_tol_check <- between(diff(filtered_peaks_df[,2]), space_lower_lim, space_upper_lim)
+
+          if(all(peak_space_tol_check) != TRUE){
+            bad_space <- which(peak_space_tol_check == FALSE)
+          }else{
+            bad_space <- NA
+          }
+
+          #identify which peaks are potentially incorrectly assigned (bad peaks)
+          #these are peaks before and after each bad space
+
+          bad_peaks <- c(bad_space, bad_space + 1) %>%
+            unique() %>%
+            sort()
+
+          #Define a count that will be used to modify the peak space tolerance
+
+          count = 4
+
+          #Keep unaltered filtered peaks data frame for the event that the peak space algorithm fails
+
+          filtered_peaks_df_retain <- filtered_peaks_df
+
+          #set count limit to determine when the algorithm fails
+
+          count_limit = 100
+
+          #Identify bad peaks, and replace them with peaks meeting peak space criteria
+          #If the number of bad peaks is equal to the number of injections, do not apply this filter
+
+          while(length(bad_peaks) > 0 & length(bad_peaks) < (num_of_injections - 1) & count < count_limit){
+
+            #define remaining peaks which are correctly assigned (good peaks)
+
+            good_peaks <- c(1:num_of_injections) %>%
+              setdiff(., c(bad_peaks))
+
+            #Use the median of the expected peak space times to find peaks
+
+            peak_tolerance <- expected_mt %>%
+              diff() %>%
+              median () / count
+
+            for (b in 1:length(bad_peaks)){
+
+              #find the nearest good peak neighbor for each bad peak
+
+              nearest_good_peak <- (good_peaks - bad_peaks[b]) %>%
+                abs() %>%
+                which.min()
+
+              #calculate the expected migration time
+
+              expected_mt <- filtered_peaks_df[good_peaks[nearest_good_peak], 2] -
+                (good_peaks[nearest_good_peak] - bad_peaks[b]) * median(space_vec)
+
+              #find peaks nearest to the expected migration time within the tolerance
+
+              peaks <- peak_df %>%
+                filter(., peak_df[,2] <= expected_mt + peak_tolerance & peak_df[,2] >= expected_mt - peak_tolerance)
+
+              #if more than one peak is found, select the closest one
+
+              if(nrow(peaks) > 1){
+                peaks <- (peak_df[,2] - expected_mt) %>%
+                  abs() %>%
+                  which.min(.)
+                peaks <- peak_df[peaks,]
+              }
+
+              #if no peaks are found, define a place holder
+
+              if(nrow(peaks) == 0){
+
+                nearest_mt <- (eie_df$mt.seconds - expected_mt) %>%
+                  abs() %>%
+                  which.min(.)
+
+                peaks <- data.frame(eie_df[nearest_mt,1],
+                                    eie_df[nearest_mt,1],
+                                    eie_df[nearest_mt,1],
+                                    eie_df[nearest_mt,m + 1],
+                                    eie_df[nearest_mt,m + 1],
+                                    eie_df[nearest_mt,m + 1],
+                                    0)
+
+                colnames(peaks) <- colnames(peak_df)
+
+                filtered_peaks_df[bad_peaks[b],] <- peaks
+              }
+
+              #if only one peak is found
+
+              filtered_peaks_df[bad_peaks[b],] <- peaks
+
+            }
+
+            count = count + 1
+
+            duplicate_location <- filtered_peaks_df[,2] %>%
+              duplicated() %>%
+              which()
+
+            #bad peaks correspond to any rows that are not unique
+
+            bad_peaks <- which(filtered_peaks_df[,2] %in% filtered_peaks_df[duplicate_location,2])
+
+          }
+
+          #if algorithm failed, revert back to filtered_peaks_df
+
+          if (count == count_limit){
+
+            filtered_peaks_df <- filtered_peaks_df_retain
+
+          }
+        }
+
+        #Summarize filtered.peak_df data in metabolite_peak_df
+
+        if(m == (num_of_is + 1)){
+          metabolite_peaks_df = filtered_peaks_df
+        }else{
+          metabolite_peaks_df = cbind(metabolite_peaks_df, filtered_peaks_df)
+        }
+
+      }
+
+      metabolite_peaks_df
+
+    })
+
+    metabolite_peaks_df
+  }
+
+  # Annotate metabolite peaks below the noise threshold or with no detection.
+  flag_peaks_below_lod <- function(eie_df, metabolite_peaks_df, mass_df, num_of_is, num_of_metabolites, num_of_injections) {
+    #Build a data frame to store comments for each metabolite peak
+
+    comment_df <- matrix(nrow = num_of_injections, ncol = num_of_metabolites, "") %>%
+      as.data.frame
+
+    colnames(comment_df) <- mass_df$name
+
+    #Loop through each metabolite and see if its area is below the LOD threshold
+
+    for (m in 1:num_of_metabolites){
+
+      #Determine the noise of the electropherogram
+      #Fine the noise levels in 60 seconds intervals
+
+      region_start <- seq(1, nrow(eie_df), 60)
+      region_end <- seq(60, nrow(eie_df), 60)
+      length(region_start) <- length(region_end)
+
+      #Generate a vector to store noise data
+
+      noise_vec <- rep(NA, length(region_start))
+
+      #Define a function to calculate noise
+
+      noise_calculation <- function(temp_noise) {
+        mean(temp_noise) + mass_df$snr.threshold[m] * sd(temp_noise)
+      }
+
+      #Calculate the noise in each region
+
+      for (r in 1:length(region_start)){
+        temp_noise <- eie_df[region_start[r]:region_end[r], m + num_of_is + 1]
+        noise_vec[r] <- noise_calculation(temp_noise)
+      }
+
+      #Define the noise as the 20th percentile noise region
+
+      noise <- noise_vec %>%
+        sort()
+
+      noise <- noise[as.integer(length(noise)/5)]
+
+      peak_area_df <- metabolite_peaks_df[,seq(7, ncol(metabolite_peaks_df), 7)]
+
+      comment_df[,m] <- ifelse(peak_area_df[,m] < noise, "<LOD", comment_df[,m])
+
+      ###Annotate injections that are not detected
+
+      comment_df[,m] <- ifelse(peak_area_df[,m] == 0, "NPD", comment_df[,m])
+
+    }
+
+    comment_df
+  }
+
+  # Flag co-migration interference and combine standard/metabolite tables.
+  flag_interfered_peaks <- function(comment_df, is_peaks_df, metabolite_peaks_df, mass_df, is_df, name_vec, num_of_metabolites, num_of_injections) {
+    #Build an interference data frame since some are metabolites and some are internal standards
+
+    interference_df <- cbind(is_peaks_df[,seq(2, ncol(is_peaks_df), 7)],
+                             metabolite_peaks_df[,seq(2, ncol(metabolite_peaks_df), 7)])
+
+    for (m in 1:num_of_metabolites){
+
+      #Skip metabolites with no reported interference
+
+      if(is.na(mass_df$interference[m])){
+        next
+      }
+
+      #Get the names of the interferences from mass_df
+
+      interferences <- strsplit(mass_df$interference[m], ", ") %>%
+        unlist()
+
+      for (k in 1:length(interferences)){
+
+        interference <- paste(interferences[k], ".apex.seconds", sep = "")
+
+        #Check if interference appears as a metabolite or internal standard.
+        #If not, provide a warning
+
+        if(!(interferences[k] %in% name_vec)){
+          print(paste("Error: ", "Interference ", interferences[k], " is not an analyte or internal standard", sep = ""))
+        }
+
+        #Check if a interference window was provided. If not, produce an error.
+
+        if(is.na(mass_df$interference.comigration.threshold.seconds[m])){
+          print(paste("Error: No interference.comigration.threshold.seconds provided for ", mass_df$name[m], sep = ""))
+        }
+
+        #See if there is any overlap between the metabolite peak and its interference
+
+        metabolite_name <- paste(mass_df$name[m], ".apex.seconds", sep = "")
+
+        for (i in 1:num_of_injections){
+          for (j in 1:num_of_injections){
+
+            diff_temp <- (metabolite_peaks_df[i,metabolite_name] - interference_df[j,interference]) %>%
+              abs()
+
+            comment_df[i,mass_df$name[m]] <- ifelse(diff_temp < mass_df$interference.comigration.threshold.seconds[m], "Interfered", comment_df[i,mass_df$name[m]])
+          }
+        }
+      }
+    }
+
+    #Combine internal standard and metabolite data frames for plotting
+
+    peaks_df <- cbind(is_peaks_df, metabolite_peaks_df)
+
+    #update comment data frame account for internal standards
+
+    is_comment_df <- matrix(nrow = num_of_injections, ncol = nrow(is_df), "") %>%
+      as.data.frame()
+
+    colnames(is_comment_df) <- is_df$name
+
+    comment_df <- cbind(is_comment_df, comment_df)
+
+
+    print("Peak Picking and Filtering for Analytes Complete")
+
+    list(peaks_df = peaks_df, comment_df = comment_df)
+  }
+
+  # Build annotations, integration ribbons and axes for every trace.
+  build_plot_data <- function(eie_df, peaks_df, comment_df, name_vec, mz_vec, num_of_injections) {
+    #Make a list to save plots to
+
+    plot_list <- vector("list", length(name_vec))
+    names(plot_list) <- name_vec
+
+    for (n in 1:length(name_vec)){
+
+      ######3.11.1 Create annotation and peak fill data frame######
+
+      peak_mt_df <- peaks_df[,seq(from = 2, to = ncol(peaks_df), by = 7)]
+
+      ann_df <- data.frame("peak.number" = c(1:num_of_injections),
+                           "comment" = comment_df[,n],
+                           "peak.apex.seconds" = peak_mt_df[,n],
+                           "peak.height.counts" = eie_df[which(eie_df$mt.seconds %in% (peak_mt_df[,n])),n+1])
+
+      #Create peak fill data frame
+
+      pf_df <- data.frame("peak.number" = 1,
+                          "mt.seconds" = eie_df[,1],
+                          "intensity" = eie_df[,n+1])
+
+      mt_vec <- vector()
+      start_df <- peaks_df[,seq(from = 1, to = ncol(peaks_df), by = 7)]
+      end_df <- peaks_df[,seq(from = 3, to = ncol(peaks_df), by = 7)]
+
+      for (i in 1:num_of_injections){
+
+        #Create a migration time vector to track where peaks elute
+
+        if(comment_df[i,n] == ""){
+          mt_vec_temp <- eie_df$mt.seconds[between(eie_df$mt.seconds, start_df[i,n], end_df[i,n])]
+          mt_vec <- append(mt_vec, mt_vec_temp)
+
+          #Update peak.number in pf_df
+
+          pf_df$peak.number <- ifelse(pf_df$mt.seconds >= start_df[i,n], i, pf_df$peak.number)
+          pf_df$peak.number <- as.factor(pf_df$peak.number)
+        }else{
+          next
+        }
+      }
+
+      pf_df$intensity <- ifelse(pf_df$mt.seconds %in% mt_vec == TRUE, pf_df$intensity , 0)
+
+      ##Add baseline intensity
+
+      pf_df$baseline <- 0
+
+      for (i in 1:num_of_injections){
+        if(comment_df[i,n] == ""){
+          lower_intensity <- min(c(peaks_df[i, n * 7 - 3], peaks_df[i, n * 7 - 1]))
+          pf_df$baseline <- ifelse(pf_df$mt.seconds >= start_df[i,n] & pf_df$mt.seconds <= end_df[i,n], lower_intensity, pf_df$baseline)
+        }else{
+          next
+        }
+      }
+
+      #Only retain filling data required for plotting
+
+      pf_df <- subset(pf_df, pf_df$intensity != 0)
+
+      #Save variables to a list
+
+      plot_list[[name_vec[n]]] <- list("eie_data" = eie_df[,c(1,(n + 1))], 
+                                       "annotation_data" = ann_df, 
+                                       "integration_data" = pf_df,
+                                       "label_data" = c(name_vec[n],
+                                                        mz_vec[n]),
+                                       "x_axis_data" = c(start_df[1,n],
+                                                         end_df[num_of_injections,n]),
+                                       "y_axis_data" = c(max(ann_df$peak.height.counts), 
+                                                         max(eie_df[,(n + 1)])))
+
+    }
+
+    plot_list
+  }
+
+  # Save PNG plots in the existing Sample or Metabolite folder layout.
+  save_static_plots <- function(plot_list, eie_df, mi_df, parameters_df, name_vec, num_of_is, file_name, file_stem, raw_path) {
+    plot_function <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data){
+
+      extra_space <- ifelse(x_axis_data[1] > 70, 1, 0)
+
+      ggplot(data = eie_data) +
+        geom_line(aes(x = mt.seconds / 60, y = eie_data[,2]), colour = "grey50") +
+        theme_classic() +
+        coord_cartesian(xlim = c(x_axis_data[1] / 60 - extra_space, x_axis_data[2] / 60 + extra_space),
+                        ylim = c(0, 1.5 * y_axis_data[1])) +
+        scale_y_continuous(name = "Ion Counts",
+                           labels = function(x) format(x, scientific = TRUE),
+                           expand = c(0,0),
+                           breaks = scales::pretty_breaks(n = 10)) +
+        scale_x_continuous(name = "Migration Time (Minutes)",
+                           breaks = scales::pretty_breaks(n = 10))+
+        ggtitle(paste(label_data[1], " EIE", " (m/z = ", label_data[2],")",sep = ""),
+                subtitle = paste("Data File: ", raw_path)) +
+        geom_ribbon(data = integration_data,
+                    aes(x = mt.seconds/60, ymax = intensity, ymin = baseline, fill = peak.number),
+                    alpha =0.4) +
+        geom_text(data = annotation_data,
+                  label = annotation_data$peak.number,
+                  size  = font_size_1,
+                  family = "sans",
+                  aes(x = peak.apex.seconds/60,
+                      y = peak.height.counts + 0.1 * y_axis_data[1])) +
+        geom_text(data = annotation_data,
+                  label = annotation_data$comment,
+                  size  = font_size_1,
+                  family = "sans",
+                  aes(x = peak.apex.seconds/60,
+                      y = peak.height.counts + 0.2 * y_axis_data[1])) +
+        theme(legend.position = "none",
+              text = element_text(size = font_size_2, family = "sans"))
+
+    }
+
+    if (parameters_df$plot.format == "Sample"){
+
+
+      #Create sub-folders
+
+      dir.create(file.path(file_name, "Plots", "Analytes"), showWarnings = FALSE)
+      dir.create(file.path(file_name, "Plots", "Internal Standards"), showWarnings = FALSE)
+
+      dir.create(path = paste(file_name, "/Plots/", "Internal Standards", "/", file_stem, sep = ""),
+                 showWarnings = TRUE)
+
+      dir.create(path = paste(file_name, "/Plots/", "Analytes", "/", file_stem, sep = ""),
+                 showWarnings = TRUE)
+
+      ######3.11.5 Save plots as ggplots######
+      #Save Internal Standard Plots
+
+      plotly_plots <- list()
+
+      for (n in 1:num_of_is){
+
+        folder <- "Internal Standards"
+        name <- name_vec[n]
+
+        font_size_1 <- 7
+        font_size_2 <- 25
+
+        ggsave(filename = paste(n, "_", name,".png",sep=""),
+               width = 16,
+               height = 9,
+               plot = plot_function(eie_data = plot_list[[n]][[1]],
+                                    annotation_data = plot_list[[n]][[2]],
+                                    integration_data = plot_list[[n]][[3]],
+                                    label_data = plot_list[[n]][[4]],
+                                    x_axis_data = plot_list[[n]][[5]],
+                                    y_axis_data = plot_list[[n]][[6]]),
+               path = paste(file_name, "/Plots/", folder, "/", file_stem, sep = ""))
+
+      }
+
+      #Save Analyte Plots
+
+      for (n in (num_of_is + 1):length(name_vec)){
+
+        folder <- "Analytes"
+        name <- name_vec[n]
+
+        #Analytes using RMT
+
+        if (mi_df$description[n - num_of_is] != "mi"){
+
+          font_size_1 <- 4
+          font_size_2 <- 12
+
+          is_index <- which(name_vec == mi_df$description[(n - num_of_is)])
+
+          figure <- ggarrange(plot_function(eie_data = plot_list[[n]][[1]],
+                                            annotation_data = plot_list[[n]][[2]],
+                                            integration_data = plot_list[[n]][[3]],
+                                            label_data = plot_list[[n]][[4]],
+                                            x_axis_data = c(min(eie_df$mt.seconds), max(eie_df$mt.seconds)),
+                                            y_axis_data = plot_list[[n]][[6]][2]),
+                              plot_function(eie_data = plot_list[[n]][[1]],
+                                            annotation_data = plot_list[[n]][[2]],
+                                            integration_data = plot_list[[n]][[3]],
+                                            label_data = plot_list[[n]][[4]],
+                                            x_axis_data = plot_list[[n]][[5]],
+                                            y_axis_data = plot_list[[n]][[6]]),
+                              plot_function(eie_data = plot_list[[is_index]][[1]],
+                                            annotation_data = plot_list[[is_index]][[2]],
+                                            integration_data = plot_list[[is_index]][[3]],
+                                            label_data = plot_list[[is_index]][[4]],
+                                            x_axis_data = plot_list[[n]][[5]],
+                                            y_axis_data = plot_list[[is_index]][[6]]),
+                              ncol = 1, nrow = 3)
+
+          ggsave(filename = paste(n, "_", name,".png",sep=""),
+                 width = 16,
+                 height = 9,
+                 plot = figure,
+                 path = paste(file_name, "/Plots/", folder, "/", file_stem, sep = ""))
+        }
+
+        #Analytes using MI
+
+        if (mi_df$description[n - num_of_is] == "mi"){
+
+          font_size_1 <- 4
+          font_size_2 <- 12
+
+          is_index <- which(name_vec == mi_df$description[(n - num_of_is)])
+
+          figure <- ggarrange(plot_function(eie_data = plot_list[[n]][[1]],
+                                            annotation_data = plot_list[[n]][[2]],
+                                            integration_data = plot_list[[n]][[3]],
+                                            label_data = plot_list[[n]][[4]],
+                                            x_axis_data = c(min(eie_df$mt.seconds), max(eie_df$mt.seconds)),
+                                            y_axis_data = plot_list[[n]][[6]][2]),
+                              plot_function(eie_data = plot_list[[n]][[1]],
+                                            annotation_data = plot_list[[n]][[2]],
+                                            integration_data = plot_list[[n]][[3]],
+                                            label_data = plot_list[[n]][[4]],
+                                            x_axis_data = plot_list[[n]][[5]],
+                                            y_axis_data = plot_list[[n]][[6]]),
+                              ncol = 1, nrow = 2)
+
+          ggsave(filename = paste(n, "_", name,".png",sep=""),
+                 width = 16,
+                 height = 9,
+                 plot = figure,
+                 path = paste(file_name, "/Plots/", folder, "/", file_stem, sep = ""))
+        }
+      }
+    }
+
+    if (parameters_df$plot.format == "Metabolite"){
+
+      #Save plots to their respective folders within the "Plots" folder
+
+      #Save Plots
+      for (n in 1:length(name_vec)){
+
+        folder <- name_vec[n]
+
+        font_size_1 <- 7
+        font_size_2 <- 25
+
+        ggsave(filename = paste(file_stem,".png",sep=""),
+               width = 16,
+               height = 9,
+               plot = plot_function(eie_data = plot_list[[n]][[1]],
+                                    annotation_data = plot_list[[n]][[2]],
+                                    integration_data = plot_list[[n]][[3]],
+                                    label_data = plot_list[[n]][[4]],
+                                    x_axis_data = plot_list[[n]][[5]],
+                                    y_axis_data = plot_list[[n]][[6]]),
+               path = paste(file_name, "/Plots/", folder, "/", sep = ""))
+
+      }
+    }
+
+    invisible(NULL)
+  }
+
+  # Build the editable Plotly objects without publishing or saving them.
+  build_interactive_plots <- function(plot_list, mi_df, name_vec, num_of_is, file_stem) {
+    plot_function_plotly <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data, source = "A") {
+      plot_ly(source = source) %>%
+        add_lines(
+          x = ~eie_data[,1] / 60,
+          y = ~eie_data[,2],
+          name = 'Electropherogram',
+          line = list(color = 'grey')
+        ) %>%
+        add_ribbons(
+          x = ~integration_data$mt.seconds / 60,
+          ymin = ~integration_data$baseline,
+          ymax = ~integration_data$intensity,
+          fillcolor = 'rgba(100,100,255,0.4)',
+          line = list(color = 'rgba(100,100,255,0.4)'),
+          name = 'Peak Integration'
+        ) %>%
+        add_text(
+          x = ~annotation_data$peak.apex.seconds / 60,
+          y = ~annotation_data$peak.height.counts + (0.1 * y_axis_data[1]),
+          text = ~annotation_data$peak.number,
+          showlegend = FALSE
+        ) %>%
+        add_text(
+          x = ~annotation_data$peak.apex.seconds / 60,
+          y = ~annotation_data$peak.height.counts + (0.2 * y_axis_data[1]),
+          text = ~annotation_data$comment,
+          showlegend = FALSE
+        ) %>%
+        layout(
+          title = paste(label_data[1], " EIE", " (m/z =", label_data[2], ")"),
+          xaxis = list(title = 'Migration Time (Minutes)'),
+          yaxis = list(title = 'Ion Counts'),
+          template = 'plotly_white',
+          shapes = list(
+            list(
+              type = "line",
+              x0 = 2,  #Initial position of the red line
+              y0 = 0,
+              x1 = 2,
+              y1 = 1,
+              xref = "x",
+              yref = "paper",
+              line = list(color = "Red", width = 2)
+            ),
+            list(
+              type = "line",
+              x0 = 4,  #Initial position of the blue line
+              y0 = 0,
+              x1 = 4,
+              y1 = 1,
+              xref = "x",
+              yref = "paper",
+              line = list(color = "Blue", width = 2)
+            )
+          )
+        ) %>% config(editable = TRUE)
+    }
+
+    plotly_objects <- list()
+    #Save Internal Standard Plots to a list
+    plotly_plots <- lapply(1:num_of_is, function(n) {
+
+      name <- name_vec[n]
+
+      plot <- plot_function_plotly(eie_data = plot_list[[n]][[1]],
+                                   annotation_data = plot_list[[n]][[2]],
+                                   integration_data = plot_list[[n]][[3]],
+                                   label_data = plot_list[[n]][[4]],
+                                   x_axis_data = plot_list[[n]][[5]],
+                                   y_axis_data = plot_list[[n]][[6]])
+      return(plot)
+    })
+
+    names(plotly_plots) <- sapply(1:num_of_is, function(n) {
+      paste0(file_stem, "_", name_vec[n])
+    })
+
+    plotly_objects <- c(plotly_objects, plotly_plots)
+
+    #Save Analyte Plots as Plotly Objects
+    for (n in (num_of_is + 1):length(name_vec)) {
+
+      name <- name_vec[n]
+
+      #Analytes using RMT
+      if (mi_df$description[n - num_of_is] != "mi") {
+
+        is_index <- which(name_vec == mi_df$description[(n - num_of_is)])
+
+        plotly_figure <- plot_function_plotly(
+            eie_data = plot_list[[n]][[1]],
+            annotation_data = plot_list[[n]][[2]],
+            integration_data = plot_list[[n]][[3]],
+            label_data = plot_list[[n]][[4]],
+            x_axis_data = plot_list[[n]][[5]],
+            y_axis_data = plot_list[[n]][[6]])
+
+        #Build plotly object before saving them
+        plotly_figure <- plotly::plotly_build(plotly_figure)
+
+        #Name plots based on the file being processed and the metabolite
+        plot_name <- paste0(file_stem, "_", name_vec[n])
+
+        #Save the plotly object
+        plotly_objects[[plot_name]] <- plotly_figure
+      }
+
+      #Saving Analytes using MI as plotly objects
+      if (mi_df$description[n - num_of_is] == "mi") {
+
+        plotly3 <- plot_function_plotly(
+            eie_data = plot_list[[n]][[1]],
+            annotation_data = plot_list[[n]][[2]],
+            integration_data = plot_list[[n]][[3]],
+            label_data = plot_list[[n]][[4]],
+            x_axis_data = plot_list[[n]][[5]],
+            y_axis_data = plot_list[[n]][[6]])
+
+        #Build plotly object before saving them
+        plotly3 <- plotly::plotly_build(plotly3)
+
+        #Name plots based on the file being processed and the metabolite
+        plot_name <- paste0(file_stem, "_", name_vec[n])
+
+        #Save the plotly object
+        plotly_objects[[plot_name]] <- plotly3
+      }
+    }
+
+    plotly_objects
+  }
+
+  # Build the peak-area and migration-time reports with existing annotations.
+  build_result_tables <- function(peaks_df, comment_df, name_vec, num_of_injections, file_stem) {
+    peak_area_df <- cbind("file.name" = c(file_stem, rep("", num_of_injections - 1)),
+                          "peak.number" = c(1:num_of_injections),
+                          peaks_df[,seq(from = 7, to = ncol(peaks_df), by = 7)])
+    colnames(peak_area_df)[3:(length(name_vec) + 2)] <- name_vec
+
+    #Update values to include <LOD and Interfered
+
+    for (i in 1:num_of_injections){
+      peak_area_df[i,3:ncol(peak_area_df)] <- ifelse(comment_df[i,] == "", peak_area_df[i, 3:ncol(peak_area_df)], comment_df[i,])
+    }
+
+
+
+    ######3.12.2 Generate peak migration time data frame######
+
+    peak_mt_df <- cbind("file.name" = c(file_stem, rep("", num_of_injections - 1)),
+                        "peak.number" = c(1:num_of_injections),
+                        peaks_df[,seq(from = 2, to = ncol(peaks_df), by = 7)] / 60)
+    colnames(peak_mt_df)[3:(length(name_vec) + 2)] <- name_vec
+
+    list(peak_area_df = peak_area_df, peak_mt_df = peak_mt_df)
+  }
+
+  # Save the named RData objects used by Visualization and database migration.
+  save_analysis_snapshot <- function(subfolder_path, plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df) {
+    save(plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df,
+         file = file.path(subfolder_path, "plot_list_data.RData"))
+  }
+
+  # Write the existing SQLite schema; always close this writer connection.
+  save_analysis_database <- function(file_name, file_stem, plot_list, peaks_df, peak_area_df, peak_mt_df, comment_df, mi_df) {
+    #Create SQL database if one doesnt exist and save all data to it for each file.
+    db_path_pipeline <- get_db_path(file_name)
+    pipeline_con <- dbConnect(SQLite(), db_path_pipeline)
+    on.exit(dbDisconnect(pipeline_con), add = TRUE)
+    dbExecute(pipeline_con, "PRAGMA journal_mode = WAL")
+
+    initialize_db(pipeline_con)
+
+    for (tbl in c("annotation_data", "integration_data","plot_axis_data", "peaks_df","peak_area_df","peak_mt_df")){
+      dbExecute(pipeline_con,
+                paste0("DELETE FROM ", tbl, " WHERE file_name = ?"),
+                params = list(file_stem)
+      )
+    }
+    #Write data to SQL database
+    write_file_to_db(
+      con          = pipeline_con,
+      file_name    = file_stem,
+      plot_list    = plot_list,
+      peaks_df     = peaks_df,
+      peak_area_df = peak_area_df,
+      peak_mt_df   = peak_mt_df,
+      comment_df   = comment_df,
+      mi_df        = mi_df
+    )
+
+    print(paste("database write complete for:", file_stem))
+  }
+
+  # Export the per-file reports without changing their names or column formats.
+  export_result_csvs <- function(file_name, peak_area_df, peak_mt_df) {
+    write.csv(peak_area_df, file.path(file_name, "Metabolite Peak Areas.csv"), row.names = FALSE)
+    write.csv(peak_mt_df, file.path(file_name, "Metabolite Migration Times.csv"), row.names = FALSE)
+  }
+
+  # Save the Plotly object list in the existing RData format.
+  save_interactive_plots <- function(file_name, plotly_objects) {
+    save(plotly_objects, file = file.path(file_name, "plotly_objects.RData"))
+  }
+
+  # Run one file through the task functions in the original processing order.
+  process_mz5_file <- function(raw_path, filename, file_name, config, timing) {
+    mass_df <- config$mass_df
+    is_df <- config$is_df
+    parameters_df <- config$parameters_df
+    name_vec <- config$name_vec
+    num_of_is <- config$num_of_is
+    num_of_metabolites <- config$num_of_metabolites
+    num_of_injections <- config$num_of_injections
+    mi_df <- config$mi_df
+    file_stem <- gsub(".mz5", "", filename, fixed = TRUE)
+    subfolder_path <- file.path(file_name, "Data", filename)
+    dir.create(subfolder_path, showWarnings = FALSE, recursive = TRUE)
+    temporary_file <- paste(gsub(".mz5", "", raw_path), "temp.mz5", sep = "_")
+
+    withProgress(message = paste("Processing data file:", filename), value = 0, {
+      total_steps <- 7
+      timing$stage("Copy mz5 file", filename)
+      file.copy(raw_path, to = temporary_file)
+      on.exit(unlink(temporary_file), add = TRUE)
+      timing$stage("Read mz5 into memory", filename)
+      run_data <- read_mz5_data(temporary_file, total_steps)
+      timing$stage("Mass calibration (if enabled)", filename)
+      run_data <- calibrate_masses(run_data, parameters_df, total_steps)
+
+      timing$stage("Prepare extraction windows and spectra", filename)
+      extraction <- prepare_extraction_spectra(run_data, is_df, mass_df, total_steps)
+      timing$stage("Extract electropherograms", filename)
+      electropherograms <- extract_electropherograms(extraction$run_data, extraction$mzr)
+      mz_vec <- extraction$mz_vec
+      timing$stage("Build eie_df", filename)
+      eie_df <- build_eie_dataframe(electropherograms, name_vec)
+      rm(run_data, extraction, electropherograms)
+      timing$stage("Smooth electropherograms (if enabled)", filename)
+      eie_df <- smooth_electropherograms(
+        eie_df, is_df, mass_df, parameters_df, name_vec, total_steps)
+
+      timing$stage("Internal standard peak detection, integration and filtering", filename)
+      is_peaks_df <- process_internal_standard_peaks(
+        eie_df, is_df, parameters_df, name_vec, num_of_is,
+        num_of_injections, total_steps)
+      is_mt_df <- is_peaks_df[, seq(from = 2, to = ncol(is_peaks_df), by = 7)]
+      timing$stage("Metabolite peak detection, integration and filtering", filename)
+      metabolite_peaks_df <- process_metabolite_peaks(
+        eie_df, mass_df, is_df, is_mt_df, mi_df, name_vec, num_of_is,
+        num_of_injections, total_steps)
+      timing$stage("Filter peaks below LOD", filename)
+      comment_df <- flag_peaks_below_lod(
+        eie_df, metabolite_peaks_df, mass_df, num_of_is,
+        num_of_metabolites, num_of_injections)
+      timing$stage("Filter interfered peaks", filename)
+      flagged <- flag_interfered_peaks(
+        comment_df, is_peaks_df, metabolite_peaks_df, mass_df, is_df,
+        name_vec, num_of_metabolites, num_of_injections)
+      peaks_df <- flagged$peaks_df
+      comment_df <- flagged$comment_df
+
+      timing$stage("Generate and save plots", filename)
+      incProgress(1/total_steps, detail = "Plotting & Exporting Electropherograms")
+      plot_list <- build_plot_data(
+        eie_df, peaks_df, comment_df, name_vec, mz_vec, num_of_injections)
+      save_static_plots(plot_list, eie_df, mi_df, parameters_df,
+                        name_vec, num_of_is, file_name, file_stem, raw_path)
+      plotly_objects <- build_interactive_plots(plot_list, mi_df, name_vec, num_of_is, file_stem)
+      plotly_data(plotly_objects)
+
+      timing$stage("Prepare result tables", filename)
+      tables <- build_result_tables(
+        peaks_df, comment_df, name_vec, num_of_injections, file_stem)
+      timing$stage("Save plot_list_data.RData", filename)
+      save_analysis_snapshot(subfolder_path, plot_list, peaks_df, mi_df,
+                             tables$peak_mt_df, tables$peak_area_df, comment_df)
+      timing$stage("Write SQLite results", filename)
+      save_analysis_database(file_name, file_stem, plot_list, peaks_df,
+                             tables$peak_area_df, tables$peak_mt_df, comment_df, mi_df)
+      timing$stage("Remove temporary mz5 file", filename)
+      file.remove(temporary_file)
+      timing$stage("Export CSV reports", filename)
+      export_result_csvs(file_name, tables$peak_area_df, tables$peak_mt_df)
+      timing$stage("Save plotly_objects.RData", filename)
+      save_interactive_plots(file_name, plotly_objects)
+      timing$finish()
+    })
+  }
+
+  # Coordinate the uploaded files and preserve per-file timing/error reports.
+  run_new_analysis <- function(files, mass_df, is_df, parameters_df, user_mti_df) {
+    file_name <- create_results_folder(files$FileName[1])
+    start_timer <- function(folder) {
+      new_run_timer(file.path(folder, "run_timings.csv"), notify = function(stage, file) {
+        if (nzchar(file)) shiny::setProgress(detail = stage)
+      })
+    }
+    timing <- start_timer(file_name)
+    tryCatch({
+      timing$stage("Validate parameters and calculate migration indexes")
+      config <- prepare_analysis_parameters(mass_df, is_df, parameters_df, user_mti_df)
+      prepare_results_folder(file_name, mass_df, is_df, parameters_df, config$mi_df)
+      for (d in seq_len(nrow(files))) {
+        if (d > 1L) {
+          file_name <- create_results_folder(files$FileName[d])
+          timing <- start_timer(file_name)
+          timing$stage("Prepare output folders")
+          prepare_results_folder(file_name, mass_df, is_df, parameters_df, config$mi_df)
+        }
+        process_mz5_file(files$FilePath[d], files$FileName[d], file_name, config, timing)
+      }
+      timing$finish()
+    }, error = function(e) {
+      timing$finish("failed", conditionMessage(e))
+      stop(e)
+    }, interrupt = function(e) {
+      timing$finish("interrupted", "Run interrupted")
+      stop(e)
+    })
+  }
+
+  #####3.3 Initialize Run: validate the selection, then call the workflow#####
   observeEvent(input$initialize, {
     if (analysis_mode() != "new") {
       shiny::showNotification("Choose New analysis to process raw files.", type = "error")
@@ -680,1961 +2653,10 @@ server <- function(input, output, session){
       shiny::showNotification("Upload real .mz5 files for a new analysis. Saved-analysis selections cannot be processed.", type = "error")
       return(NULL)
     }
-    
-    # Prepare the first file's output; subsequent files get their own folders.
-    file_name <- create_results_folder(files$FileName[1])
 
-    # Stage-level timings use elapsed time, including file I/O and database waits.
-    # The CSV is refreshed at every stage boundary so completed stages survive errors.
-    new_run_timer <- function(path, notify = function(stage, file) NULL) {
-      rows <- data.frame(file = character(), stage = character(), status = character(),
-                         started_at = character(), elapsed_seconds = numeric(),
-                         detail = character(), stringsAsFactors = FALSE)
-      run_start <- proc.time()[["elapsed"]]
-      run_wall <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")
-      active <- NULL
-      finished <- FALSE
-      persist <- function() write.csv(rows, path, row.names = FALSE)
-      record <- function(file, stage, status, wall, elapsed, detail = "") {
-        rows[nrow(rows) + 1L, ] <<- list(file, stage, status, wall, elapsed, detail)
-        persist()
-        message(sprintf("[Timing] %s | %s | %s | %.3f seconds", file, stage, status, elapsed))
-      }
-      close_stage <- function(status = "completed", detail = "") {
-        if (!is.null(active)) {
-          record(active$file, active$stage, status, active$wall,
-                 proc.time()[["elapsed"]] - active$start, detail)
-          active <<- NULL
-        }
-      }
-      persist()
-      list(
-        stage = function(stage, file = "") {
-          stopifnot(!finished)
-          close_stage()
-          active <<- list(file = file, stage = stage,
-                          wall = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"),
-                          start = proc.time()[["elapsed"]])
-          message(sprintf("[Timing] Starting %s%s", stage,
-                          if (nzchar(file)) paste0(" | ", file) else ""))
-          notify(stage, file)
-        },
-        end_stage = function() close_stage(),
-        finish = function(status = "completed", detail = "") {
-          if (finished) return(invisible(NULL))
-          close_stage(status, detail)
-          record("", "TOTAL RUN (includes all stages)", status, run_wall,
-                 proc.time()[["elapsed"]] - run_start, detail)
-          finished <<- TRUE
-          invisible(rows)
-        }
-      )
-    }
-    timing <- new_run_timer(file.path(file_name, "run_timings.csv"),
-      notify = function(stage, file) {
-        if (nzchar(file)) shiny::setProgress(detail = stage)
-      })
-    tryCatch({
-    timing$stage("Validate parameters and calculate migration indexes")
+    run_new_analysis(files, massData(), refMassListData(), parametersData(), userMTI())
+  })
 
-    #Create a vector of metabolite and internal standard names
-    name_vec <- c(refMassListData()$name, massData()$name)
-    
-    #Check for duplicate metabolite and internal standard names
-    if (sum(duplicated(name_vec)) > 0) {
-      stop("Mass List and Parameters contain duplicated metabolite or internal standard names.")
-    }
-    
-    #Determine the number of metabolites and internal standards
-    num_of_metabolites <- nrow(massData())
-    num_of_is <- nrow(refMassListData())
-    
-    #Get the number of injections
-    num_of_injections <- parametersData()$number.of.injections[1]
-    
-    prepare_results_folder(file_name, massData(), refMassListData(), parametersData())
-
-    #####3.3 Migration Index Calculation#####
-    
-    #Summarize user supplied migration time data
-    metabolites_mt_df <- data.frame(name = massData()$name, massData()[, c((ncol(massData()) - num_of_injections + 1):ncol(massData()))])
-    is_mt_df <- subset(refMassListData(), refMassListData()$class == "Reference")
-    is_mt_df <- data.frame(name = is_mt_df$name, is_mt_df[, c((ncol(is_mt_df) - num_of_injections + 1):ncol(is_mt_df))])
-    
-    #Determine IS on the left
-    is_left_vec <- character(num_of_metabolites)
-    
-    for (m in 1:nrow(metabolites_mt_df)) {
-      is_temp <- (metabolites_mt_df[m, 2] - (is_mt_df[, 2]))
-      is_temp <- set_names(is_temp, is_mt_df$name)
-      is_temp <- is_temp[which(sign(is_temp) == 1 | sign(is_temp) == 0)] %>%
-        which.min() %>%
-        names()
-      
-      if (length(is_temp) == 0) {
-        is_temp <- "none"
-      }
-      
-      is_left_vec[m] <- is_temp
-    }
-    
-    #Determine IS on the right
-    is_right_vec <- character(num_of_metabolites)
-    
-    for (m in 1:nrow(metabolites_mt_df)) {
-      is_temp <- (metabolites_mt_df[m, 2] - (is_mt_df[, 2]))
-      is_temp <- set_names(is_temp, is_mt_df$name)
-      is_temp <- is_temp[which(sign(is_temp) == -1 | sign(is_temp) == 0)] %>%
-        which.max() %>%
-        names()
-      
-      if (length(is_temp) == 0) {
-        is_temp <- "none"
-      }
-      
-      is_right_vec[m] <- is_temp
-    }
-    
-    #Compute migration index
-    mi_df <- matrix(NA, ncol = (num_of_injections + 1), nrow = nrow(metabolites_mt_df)) %>%
-      as.data.frame()
-    mi_df[, 1] <- metabolites_mt_df$name
-    
-    summary_vec <- character(nrow(metabolites_mt_df))
-    
-    for (m in 1:nrow(metabolites_mt_df)) {
-      for (i in 2:(num_of_injections + 1)) {
-        left <- is_left_vec[m]
-        right <- is_right_vec[m]
-        
-        if (left == "none") {
-          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == right), i]
-          summary_vec[m] <- right
-          next
-        }
-        
-        if (right == "none") {
-          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == left), i]
-          summary_vec[m] <- left
-          next
-        }
-        
-        if (metabolites_mt_df[m, 2] / is_mt_df[which(is_mt_df$name == left), 2] < 1.01) {
-          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == left), i]
-          summary_vec[m] <- left
-          is_right_vec[m] <- "none"
-          next
-        }
-        
-        if (metabolites_mt_df[m, 2] / is_mt_df[which(is_mt_df$name == right), 2] > 0.99) {
-          mi_df[m, i] <- metabolites_mt_df[m, i] / is_mt_df[which(is_mt_df$name == right), i]
-          summary_vec[m] <- right
-          is_left_vec[m] <- "none"
-          next
-        }
-        
-        mi_df[m, i] <- (metabolites_mt_df[m, i] - is_mt_df[which(is_mt_df$name == left), i]) / 
-          (is_mt_df[which(is_mt_df$name == right), i] - is_mt_df[which(is_mt_df$name == left), i])
-        summary_vec[m] <- "mi"
-      }
-    }
-    
-    #Store results in one data frame
-    colnames(mi_df)[2:ncol(mi_df)] <- c(1:num_of_injections)
-    mi_df <- cbind(name = massData()$name,
-                   left_is = is_left_vec,
-                   right_is = is_right_vec,
-                   description = summary_vec,
-                   mi_df[2:ncol(mi_df)])
-    #####3.4 User Supplied MTIs#####
-    
-    user_mti_df <- userMTI()
-    
-    if (parametersData()$Manual.Indexes == "Yes") {
-        
-        names <- unique(c(user_mti_df$name, user_mti_df$left_is, user_mti_df$right_is, user_mti_df$description))
-        
-        if (all(names %in% c(name_vec, "mi", "none")) == FALSE) {
-          stop("Names detected in User Supplied Migration Indexes.csv not found in Mass List and Parameters.")
-        }
-        
-        if (ncol(user_mti_df) != (4 + num_of_injections)) {
-          stop(paste("Make sure User Supplied Migration Indexes.csv contains migration time indexes for all", num_of_injections, "injections."))
-        }
-        
-        for (i in 1:nrow(user_mti_df)) {
-          row <- which(mi_df$name == user_mti_df$name[i])
-          
-          if (length(row) == 0) {
-            stop(paste("Metabolite", user_mti_df$name[i], "from User Supplied Migration Indexes.csv is not in Mass List and Parameters."))
-          }
-          
-          mi_df[row, 2:ncol(mi_df)] <- user_mti_df[i, 2:ncol(user_mti_df)]
-        }
-      }
-    
-    #Write the migration index summary to a CSV file
-    write.csv(mi_df, 
-              file.path(file_name, "Migration Index Summary.csv"), 
-              row.names = FALSE)
-    
-    #####3.5 Data File Analysis#####
-    #Create vectors for data file directories and name
-    data_files <- uploadedmz5()$FilePath
-    data_file_names <- uploadedmz5()$FileName  
-    plotly_objects <- list()
-    
-    
-    #Define the function to save plotly_objects to .RDA file
-    save_plotly_objects <- function(file_name) {
-      save(plotly_objects, file = file.path(file_name, "plotly_objects.RData"))
-    }
-    
-    
-    
-    for (d in seq_along(data_files)){
-      if (d > 1L) {
-        file_name <- create_results_folder(data_file_names[d])
-        timing <- new_run_timer(file.path(file_name, "run_timings.csv"),
-          notify = function(stage, file) {
-            if (nzchar(file)) shiny::setProgress(detail = stage)
-          })
-        timing$stage("Prepare output folders")
-        prepare_results_folder(file_name, massData(), refMassListData(), parametersData(), mi_df)
-      }
-      # Each folder contains only this file's reports and plot objects.
-      plotly_objects <- list()
-      #Initialize progress bar
-      withProgress(message = paste("Processing data file:", data_file_names[d]), value = 0,{ total_steps <- 7
- 
-      
-      print(paste(d, ". ", "Analyzing Data File: ", data_file_names[d], sep = ""))
-      
-      #Create a subfolder for the current file inside the Data folder
-      subfolder_path <- file.path(file_name, "Data", data_file_names[d])
-      dir.create(path = subfolder_path, showWarnings = FALSE, recursive = TRUE)
-      
-      
-      timing$stage("Copy mz5 file", data_file_names[d])
-      #Make a copy of the data file as data will be written directly to this file during mass calibration
-      file <- gsub(".mz5", "", data_files[d])
-      file.copy(data_files[d], to = paste(file, "temp.mz5", sep = "_"))
-      
-      timing$stage("Read mz5 into memory", data_file_names[d])
-      #Read copied data file and update progress bar
-      incProgress(1/total_steps, detail = paste("Reading Data File"))
-      print("Reading Data File")
-      
-      run_data <- readMSData(
-        file = paste(file, "temp.mz5", sep = "_"),
-        pdata = NULL,
-        msLevel = 1,
-        verbose = isMSnbaseVerbose(),
-        centroided. = FALSE,
-        smoothed. = FALSE,
-        cache. = 0,
-        mode = "inMemory"
-      )
-      
-      print("File Reading Complete")
-      
-      #Unlock "assayData" environment 
-      env_binding_unlock(run_data@assayData)
-      
-      timing$stage("Mass calibration (if enabled)", data_file_names[d])
-      #####3.6 Perform Mass Calibration#####
-      
-      #This is a stupid line but not sure way around it currently
-      mass_df <- massData()
-      is_df <- refMassListData()
-      parameters_df <- parametersData()
-      
-
-      calibration_response <- parameters_df$apply.mass.calibration
-      
-      #Confirm response is "Yes" or "No". Otherwise, produce an error.
-      
-      if(calibration_response != "Yes" & calibration_response != "No"){
-        stop(paste("apply.mass.calibration parameter should be 'Yes' or 'No'. ", "'", calibration_response, "' is not an acceptable input.", sep = ""))
-      }
-      
-      #Check if mass calibration should be applied
-      
-      if (calibration_response == "No"){
-        
-        print("Skipping Mass Calibration")
-        
-      }
-      
-      if (calibration_response == "Yes"){
-        
-        #Update progress bar
-        incProgress(1/total_steps, detail = paste("Performing Mass Calibration"))
-        
-        print("Performing Mass Calibration")
-        
-        run_data <- local({
-          
-          #Define mass window and minimum lock mass counts
-          
-          mass_window <- parameters_df$ref.mass.window.ppm[1]
-          
-          minimum_counts <- parameters_df$ref.mass.minimum.counts[1]
-          
-          #Define a function to calculate 1. experimental m/z of lock masses, 2. the corresponding mass error, and 3. the index of the lock mass
-          #The lock mass value is currently the most intense point in the mass window plus an adjustment to better predict the lock mass value.
-          
-          calibration_parameters <- function(spectrum, lock_mass, minimum_counts, mass_window) {
-            
-            lock_mass_range <- c((lock_mass - lock_mass * mass_window / 1000000), 
-                                 (lock_mass + lock_mass * mass_window / 1000000))
-            
-            #Find the index of the most intense point in the lock mass window
-            
-            max_intensity_index <- spectrum %>%
-              filter(mz >= lock_mass_range[1] & mz <= lock_mass_range[2]) %>%
-              slice_max(intensity) %>%
-              pull(index)
-            
-            if(length(max_intensity_index) == 1){
-              if(spectrum$intensity[max_intensity_index] > minimum_counts){
-                
-                #Create a data frame with all four points
-                line_points <- data.frame("mz" = c(spectrum$mz[(max_intensity_index - 2):(max_intensity_index - 1)], 
-                                                   spectrum$mz[(max_intensity_index + 1):(max_intensity_index + 2)]),
-                                          "intensity" = c(spectrum$intensity[(max_intensity_index - 2):(max_intensity_index - 1)], 
-                                                          spectrum$intensity[(max_intensity_index + 1):(max_intensity_index + 2)]))
-                
-                #Create a model for all four points
-                model_left <- lm(formula = intensity ~ mz, data = line_points[c(1,2),])
-                model_right <- lm(formula = intensity ~ mz, data = line_points[c(3,4),])
-                
-                #Get the coefficients for both models
-                coefficients_left <- c(model_left$coefficients["mz"], model_left$coefficients["(Intercept)"])
-                coefficients_right <- c(model_right$coefficients["mz"], model_right$coefficients["(Intercept)"])
-                
-                #Calculate the slope and intercept
-                slope <- coefficients_left[1] - coefficients_right[1]
-                intercept <- coefficients_right[2] - coefficients_left[2]
-                
-                #Solve for the experimental_mz
-                experimental_mz <- solve(slope, intercept)
-                
-                experimental_mass_diff <- lock_mass - experimental_mz
-                
-                return(c(experimental_mz, experimental_mass_diff, max_intensity_index))
-              }
-            }
-          }
-          
-          #Loop through each spectrum to build a model and perform the mass calibration
-          
-          for (s in 1:end(rtime(run_data))[1]){
-            
-            spectrum_name <- ls(run_data@assayData)[s]
-            
-            spectrum <- data.frame(index = 1:length(run_data@assayData[[spectrum_name]]@mz),
-                                   mz = run_data@assayData[[spectrum_name]]@mz,
-                                   intensity = run_data@assayData[[spectrum_name]]@intensity)
-            
-            #Lower lock mass
-            
-            lock_mass <- parameters_df$ref.mass.one[1]
-            
-            cal_para_1 <- calibration_parameters(spectrum = spectrum,
-                                                 lock_mass = lock_mass,
-                                                 minimum_counts = minimum_counts,
-                                                 mass_window = mass_window)
-            
-            #Upper lock mass
-            
-            lock_mass <- parameters_df$ref.mass.two[1]
-            
-            cal_para_2 <- calibration_parameters(spectrum = spectrum,
-                                                 lock_mass = lock_mass,
-                                                 minimum_counts = minimum_counts,
-                                                 mass_window = mass_window)
-            
-            if (is.null(cal_para_1) | is.null(cal_para_2)){
-              next
-            }
-            
-            ######3.6.1 Develop correction model######
-            
-            model_data <- data.frame("x" = c(cal_para_1[1], cal_para_2[1]),
-                                     "y" = c(cal_para_1[2], cal_para_2[2]))
-            
-            model <- lm(y ~ x, model_data)
-            
-            ######3.6.2 Apply correction model######
-            
-            correction_vector <- c(model[["coefficients"]][["x"]] * spectrum$mz) + model[["coefficients"]][["(Intercept)"]]
-            
-            correction_vector[1:cal_para_1[3]] <- cal_para_1[2]
-            
-            correction_vector[cal_para_2[3]:length(correction_vector)] <- cal_para_2[2]
-            
-            run_data@assayData[[spectrum_name]]@mz <- run_data@assayData[[spectrum_name]]@mz + correction_vector
-            
-          }
-          
-          run_data
-          
-        })
-      }
-      
-      
-      print("Mass Calibration Complete")
-      
-      timing$stage("Prepare extraction windows and spectra", data_file_names[d])
-     #####3.7 Extract Electropherograms#####
-      
-      #Update progress bar
-      incProgress(1/total_steps, detail = paste("Extracting Electropherograms"))
-      
-      print("Extracting Electropherograms")
-      
-      #Define mass error in ppm
-      
-      mass_error_vec <- c(is_df$extraction.window.ppm, mass_df$extraction.window.ppm)
-      
-      #Create a matrix of minimum and maximum m/z values for each internal standard and metabolite
-      mz_vec <- c(is_df$mz, mass_df$mz)
-      min <- mz_vec - mz_vec * mass_error_vec / 1000000
-      max <- mz_vec + mz_vec * mass_error_vec / 1000000
-      mzr <- matrix(c(min, max), ncol = 2)
-      
-      #Process/check for correcting any unsorted MZ values in extracted spectra in the MSnExp obj. No clue why this occurs but it can be corrected.
-      #Extract the spectra from the assayData environment stored in the run_data MSnExp
-      assay_data_env <- assayData(run_data)
-      
-      #List all the objects in the assayData environment
-      spectra_names <- ls(assay_data_env)
-      
-      #Create synthetic environment to merge with the real assayData environment component in run_data after spectra have been sorted
-      sorted_assay_data_env <- new.env()
-      
-      #Loop through each spectrum in run_data and check if m/z values are unsorted AND if m/z values are negative. 
-      for (i in spectra_names) {
-        spectrum <- get(i, assay_data_env) 
-        
-        mz_values <- mz(spectrum)
-        intensity_values <- intensity(spectrum)
-        
-        #Find any negative m/z values and replace them.
-        valid_idx <- mz_values >= 0
-        mz_values <- mz_values[valid_idx]
-        intensity_values <- intensity_values[valid_idx]
-        
-        if (length(mz_values) == 0) {
-          cat("Spectrum", i, "has no valid MZ values after removing negatives\n")
-          next
-        }
-        
-        
-        #Check if m/z values are unsorted
-        if (is.unsorted(mz_values)) {
-          cat("Spectrum", i, "has unsorted MZ values\n")
-          
-          #Sort the problematic spectrum
-          
-          order_idx <- order(mz_values)
-          
-          #Create a sorted Spectrum1 object which will then be merged into the original run_data assayData. This allows for correction of the unsorted spectra.
-          sorted_spectrum <- new("Spectrum1",
-                                 mz = mz_values[order_idx],
-                                 intensity = intensity_values[order_idx],
-                                 rt = rtime(spectrum),
-                                 tic = sum(intensity_values[order_idx]), 
-                                 centroided = centroided(spectrum),
-                                 fromFile = fromFile(spectrum))
-          
-          #Confirm spectra is sorted
-          cat("Sorted Spectrum", i, "\n")  
-        } else {
-          #If already sorted, keep the original spectrum
-          sorted_spectrum <- spectrum  
-        }
-        
-        #Store the sorted spectrum in the new environment
-        assign(i, sorted_spectrum, sorted_assay_data_env)
-      }
-     
-     #Directly update the assayData slot of run_data
-     slot(run_data, "assayData") <- sorted_assay_data_env
-      
-      timing$stage("Extract electropherograms", data_file_names[d])
-      #Extract electropherograms
-      electropherograms <- chromatogram(run_data,
-                                        mz = mzr,
-                                        rt = c(0,end(rtime(run_data))),
-                                        aggregationFun = "mean",
-                                        missing = 0,
-                                        msLevel = 1)
-      
-      timing$stage("Build eie_df", data_file_names[d])
-      eie_df <- data.frame("mt.seconds" = electropherograms[1]@rtime)
-      
-      for (n in 1:length(name_vec)){
-        temp_df <- data.frame(electropherograms[n]@intensity)
-        colnames(temp_df) <- paste(name_vec[n], "intensity", sep = " ")
-        eie_df <- cbind(eie_df,temp_df)
-      }
-      
-      print("Extraction Complete")
-      
-      timing$stage("Smooth electropherograms (if enabled)", data_file_names[d])
-      #####3.8 Smooth Intensity Vectors#####
-      
-      #Check if mass calibration should be applied
-      
-      smoothing_response <- parameters_df$apply.smoothing
-      
-      #Confirm response is "Yes" or "No". Otherwise, produce an error.
-      
-      if(smoothing_response != "Yes" & smoothing_response != "No"){
-        stop(paste("apply.smoothing parameter should be 'Yes' or 'No'. ", "'", smoothing_response, "' is not an acceptable input.", sep = ""))
-      }
-      
-      if (smoothing_response == "No"){
-        
-        print("Skipping Mass Calibration")
-        
-      }
-      
-      if (smoothing_response == "Yes"){
-        
-        #Update progress bar
-        incProgress(1/total_steps, detail = paste("Smoothing Electropherograms"))
-        
-        print("Smoothing Electropherograms")
-        
-        
-        smoothing_kernel_vec <- c(is_df$smoothing.kernel, mass_df$smoothing.kernel)
-        smoothing_strength_vec <- c(is_df$smoothing.strength, mass_df$smoothing.strength)
-        
-        for (n in 1:length(name_vec)){ 
-          Smooth <- with(eie_df, 
-                         ksmooth(x = mt.seconds, 
-                                 y = eie_df[,n + 1], 
-                                 kernel = smoothing_kernel_vec[n], 
-                                 bandwidth = smoothing_strength_vec[n]))
-          eie_df[,n + 1] <- Smooth[["y"]]
-        }
-        
-        #Clean-up global environment
-        
-        rm(list = c("electropherograms", "mzr", "Smooth", "temp_df", "max", "min", 
-                    "n", "mass_error_vec", "run_data", "smoothing_strength_vec","smoothing_kernel_vec","assay_data_env","spectra_names","sorted_assay_data_env"))
-      }
-      
-      renderText("Electropherograms Smoothing Complete")
-      print("Electropherograms Smoothing Complete")
-      
-      timing$stage("Internal standard peak detection, integration and filtering", data_file_names[d])
-      #####3.9 Internal Standard Peak Detection, Integration, and Filtering#####
-      
-      #Update progress bar
-      incProgress(1/total_steps, detail = paste("Performing Peak Picking and Filtering for Internal Standards"))
-      
-      print("Performing Peak Picking and Filtering for Internal Standards")
-      
-      ######3.9.1 Peak detection######
-      
-      is_peaks_df <- local({
-        
-        n <- 1
-        
-        for (s in 1:num_of_is){
-          
-          rle_output <- eie_df[,s+1] %>%
-            diff() %>%
-            sign() %>%
-            rle()
-          
-          consecutive_runs <- which(rle_output$lengths > n & rle_output$values == 1)
-          consecutive_runs <- subset(consecutive_runs, (consecutive_runs + 1) %in% (which(rle_output$lengths > n)) == TRUE)
-          
-          run_lengths <- cumsum(rle_output$lengths) + 1
-          
-          start <- eie_df$mt.seconds[run_lengths[consecutive_runs - 1]]
-          apex <- eie_df$mt.seconds[run_lengths[consecutive_runs]]
-          end <- eie_df$mt.seconds[run_lengths[consecutive_runs + 1]]
-          
-          #For FWHM calculations I will also add intensity values here as well
-          
-          start_intensity <- eie_df[run_lengths[consecutive_runs - 1], (s+1)]
-          apex_intensity <- eie_df[run_lengths[consecutive_runs], (s+1)]
-          end_intensity <- eie_df[run_lengths[consecutive_runs + 1], (s+1)]
-          
-          #Account for peaks that start immediately during the analysis
-          
-          if(length(start) != length(apex)){
-            start <- append(start, 0, 0)
-            start_intensity <- append(start_intensity, 0, 0)
-          }
-          
-          #Create a data frame containing the start, apex, and end migration times of each peak
-          
-          peak_df <- data.frame(start,
-                                apex,
-                                end,
-                                start_intensity,
-                                apex_intensity,
-                                end_intensity)
-          
-          ######3.9.2 Migration time filtering######
-          
-          #Filter peaks that are outside migration time limits
-          
-          peak_df <- subset(peak_df, peak_df$apex >= is_df$min.mt.min[s] * 60 & peak_df$apex <= is_df$max.mt.min[s] * 60)
-          
-          ######3.9.3 Integrate peaks######
-          
-          peak_area_vector = c(1:nrow(peak_df))
-          
-          #If the length of peak_area_vector is less than the number of injections, 
-          #print an error and suggest a solution
-          
-          if (length(peak_area_vector) < num_of_injections){
-            cat(paste("Warning: ", name_vec[s], " EIE contains insufficient data. If an error occurs try:
-        1. Increasing the extraction.window.ppm parameter 
-        2. Adjusting min.mt.min and max.mt.min parameters", sep =""))
-          }
-          
-          for (p in 1:nrow(peak_df)){
-            
-            peak_area_vector[p] <- AUC(eie_df$mt.seconds,
-                                       eie_df[,s+1],
-                                       method = "trapezoid",
-                                       from = peak_df[p,1],
-                                       to = peak_df[p,3],
-                                       absolutearea = FALSE,
-                                       na.rm = FALSE)
-            
-            #Perform baseline correction
-            
-            peak_area_vector[p] <- peak_area_vector[p] - (peak_df[p,3] - peak_df[p,1]) * min(peak_df[p,4], peak_df[p,6])
-          }
-          
-          peak_df <- cbind(peak_df, peak_area_vector)
-          
-          #rename peak_df columns
-          
-          colnames(peak_df) <- c(paste(name_vec[s], "start.seconds", sep = "."),
-                                 paste(name_vec[s], "apex.seconds", sep = "."),
-                                 paste(name_vec[s], "end.seconds", sep = "."),
-                                 paste(name_vec[s], "start_intensity", sep = "."),
-                                 paste(name_vec[s], "apex_intensity", sep = "."),
-                                 paste(name_vec[s], "end_intensity", sep = "."),
-                                 paste(name_vec[s], "peak.area", sep = "."))
-          
-          #Retain peak_df for future filtering steps
-          
-          peak_df_fill <- peak_df
-          
-          ######3.9.4 FWHM filtering######
-          
-          #Do not not apply the FWHM filter if the number of injections is equal to 1
-          
-          if (parameters_df$number.of.injections != 1) {
-            
-            #Find the peak intensity at half the peak height
-            
-            intensity_fwhm <- peak_df[,4] + (peak_df[,5] - peak_df[,4])/2 
-            
-            #Find the migration times closest to these intensities within each peak
-            
-            fwhm_vec <- vector()
-            single_eie <- eie_df[,c(1,s+1)]
-            
-            for(p in 1:nrow(peak_df)){
-              
-              single_eie_temp <- subset(single_eie, single_eie$mt.seconds >= peak_df[p,1] & single_eie$mt.seconds <= peak_df[p,2])
-              fwhm_mt_left <- single_eie_temp$mt.seconds[which.min(abs(single_eie_temp[,2] - intensity_fwhm[p]))]
-              
-              single_eie_temp <- subset(single_eie, single_eie$mt.seconds <= peak_df[p,3] & single_eie$mt.seconds >= peak_df[p,2])
-              fwhm_mt_right <- single_eie_temp$mt.seconds[which.min(abs(single_eie_temp[,2] - intensity_fwhm[p]))]
-              
-              fwhm_vec <- append(fwhm_vec, fwhm_mt_right - fwhm_mt_left)
-              
-            }
-            
-            peak_df$fwhm <- fwhm_vec
-            
-            #Determine the fwhm of the peaks (n = num_of_injections) with the greatest area
-            
-            df_temp <- peak_df[order(-peak_df[,8]),]
-            df_temp <- df_temp[1:num_of_injections,]
-            
-            fwhm_cutoff <- median(df_temp$fwhm)
-            
-            peak_df <- subset(peak_df, peak_df$fwhm <= (fwhm_cutoff * is_df$peak.fwhm.tolerance.multiplier[s]))
-            peak_df <- peak_df[,c(1:7)]
-            
-          }
-          
-          #subset peak_df so that only the peaks (n = number.of.injections) with the greatest area are kept
-          
-          cut_off <- sort(peak_df[,7], decreasing = TRUE)[num_of_injections]
-          
-          peak_df <- subset(peak_df, peak_df[,7] >= cut_off)
-          
-          ######3.9.5 Peak space filtering######
-          
-          #Do not apply peak space filtering if the number of injections is equal to 1
-          
-          if(num_of_injections != 1){
-            
-            #Determine the upper and lower migration time limits for space between peaks
-            
-            median_space <- peak_df[,2] %>%
-              diff() %>%
-              median()
-            
-            median_space_tol <- is_df$peak.space.tolerance.percent[s] / 100
-            
-            median_space_lower_lim <- median_space - median_space * median_space_tol
-            median_space_upper_lim <- median_space + median_space * median_space_tol
-            
-            #Check if peaks migrate within the tolerance limits
-            
-            peak_space_tol_check <- between(diff(peak_df[,2]), median_space_lower_lim, median_space_upper_lim)
-            
-            if(all(peak_space_tol_check) != TRUE){
-              bad_space <- which(peak_space_tol_check == FALSE)
-            }else{
-              bad_space <- NA
-            }
-            
-            ######3.9.6 Scenario 1######
-            #Only one bad space is detected
-            
-            if(length(bad_space) == 1 & is.na(bad_space[1]) == FALSE){
-              
-              false_peak_diff <- peak_df[num_of_injections, 2] - peak_df[(num_of_injections - 1), 2]
-              
-              #This algorithm always assumes the final peak is false - likely due to carryover
-              #It is possible the first peak is false but this seems less likely
-              #Final peak only removed if case 1 does not produce a duplicate
-              
-              #Case 1- An interior peak is missing (usually a blank)
-              
-              if(bad_space != (num_of_injections - 1)){
-                
-                #Since the we know the bad space is not at the end, use the space after the bad space to find the expected apex
-                
-                expected_peak_apex <- peak_df[bad_space[1],2] + peak_df[(bad_space[1] + 2),2] - peak_df[(bad_space[1] + 1),2]
-                
-              }
-              
-              #Case 2 -  Final space is false and less than median - suspect that true final peak was missed
-              
-              if(bad_space == (num_of_injections - 1) & false_peak_diff < median_space_upper_lim){
-                expected_peak_apex <- peak_df[(num_of_injections - 1 ),2] + median_space
-              }
-              
-              #Case 3 - Final space is false and greater than median - suspect that peak 1 was missed
-              
-              if(bad_space == (num_of_injections - 1) & false_peak_diff > median_space_lower_lim){
-                expected_peak_apex <- peak_df[1,2] - median_space
-              }
-              
-              peak <- which.min(abs(peak_df_fill[,2] - expected_peak_apex))
-              
-              #If the nearest peak is too far from the expected migration time use a place holder
-              
-              if (abs(peak_df_fill[peak,2] - expected_peak_apex) > (median_space / 2)){
-                
-                nearest_mt <- (eie_df$mt.seconds - expected_peak_apex) %>%
-                  abs() %>%
-                  which.min(.)
-                
-                peaks <- data.frame(eie_df[nearest_mt,1],
-                                    eie_df[nearest_mt,1],
-                                    eie_df[nearest_mt,1],
-                                    eie_df[nearest_mt,s + 1],
-                                    eie_df[nearest_mt,s + 1],
-                                    eie_df[nearest_mt,s + 1],
-                                    0)
-                
-                colnames(peaks) <- colnames(peak_df)
-                
-                peak_df <- rbind(peak_df, peaks)
-                
-                peak_df <- peak_df[order(peak_df[,2]),]
-                
-              }else{
-                
-                peak_df <- rbind(peak_df, peak_df_fill[peak,])
-                
-                peak_df <- peak_df[order(peak_df[,2]),]
-                
-              }
-              
-              #Remove bad peak
-              
-              if (any(duplicated(peak_df[,2]))){
-                
-                peak_df <- peak_df[-c(which(duplicated(peak_df[,2]))),]
-                
-              }else{
-                
-                peak_df <- peak_df[1:(num_of_injections),]
-                
-              }
-            }
-            
-            ######3.9.7 Scenario 2######
-            #Two or three bad spaces are detected 
-            
-            if(length(bad_space) == 2 | length(bad_space) == 3){
-              
-              peaks_to_check <- c(bad_space, (bad_space + 1)) %>%
-                unique() %>%
-                sort()
-              
-              #Outside peaks must be checked last
-              
-              peaks_to_check <- c(peaks_to_check[-1], peaks_to_check[1])
-              
-              #Loop through each suspect bad peak and remove them iteratively until the number of bad spaces reaches 1
-              
-              for (p in 1:length(peaks_to_check)){
-                
-                num_bad_space <- peak_df[,2] %>%
-                  .[-c(peaks_to_check[p])] %>%
-                  diff(.) %>%
-                  between (median_space_lower_lim, median_space_upper_lim) 
-                num_bad_space <- length(which(num_bad_space == FALSE))
-                
-                if (num_bad_space == 1){
-                  peak_df <- peak_df[-c(peaks_to_check[p]),]
-                  break
-                }
-              }
-              
-              #To avoid errors where removing a peak results in 0 bad spaces only fill
-              #in gap if nrow(peak_df) == number of injections - 1
-              
-              if(nrow(peak_df) == (num_of_injections - 1)){
-                
-                #Find the peak gap and calculate the expected migration time for the missing peak
-                
-                gap <- which(between(diff(peak_df[,2]), median_space_lower_lim, median_space_upper_lim) == FALSE)
-                
-                expected_peak_apex <- (peak_df[(gap[1] + 1),2] - peak_df[gap[1],2])/2 + peak_df[gap[1],2]
-                
-                #Find the nearest peak in the peak_df_fill data frame to the expected migration time
-                #Avoid duplicate peaks by not using exisitng peaks in peak_df
-                
-                peak_df_fill <- subset(peak_df_fill, !(peak_df_fill[,2] %in% peak_df[,2]))
-                
-                peak <- which.min(abs(peak_df_fill[,2] - expected_peak_apex))
-                peak_df <- rbind(peak_df, peak_df_fill[peak,])
-                
-                peak_df <- peak_df[order(peak_df[,2]),]
-                
-              }
-            }
-          }
-          
-          #Summarize peak_df data in is.peak_df
-          
-          if(s == 1){
-            is_peaks_df = peak_df
-          }else{
-            is_peaks_df = cbind(is_peaks_df, peak_df)  
-          }
-        }
-        
-        is_peaks_df
-        
-      })
-      
-      #Make a data frame containing the apex migration times of the internal standards
-      #to be used to filter metabolite peaks
-      
-      is_mt_df <- is_peaks_df[,seq(from = 2,
-                                   to = ncol(is_peaks_df),
-                                   by = 7)]
-      
-      print("Peak Picking and Filtering for Internal Standards Complete")
-      
-      timing$stage("Metabolite peak detection, integration and filtering", data_file_names[d])
-      #####3.10 Metabolite  Peak Detection, Integration, and Filtering#####
-      
-      #Update progress bar
-      incProgress(1/total_steps, detail = paste("Performing Peak Picking and Filtering for Analytes"))
-      
-      print("Performing Peak Picking and Filtering for Analytes")
-      
-      ######3.10.1 Peak detection######
-      
-      metabolite_peaks_df <- local ({
-        
-        for (m in (num_of_is + 1):length(name_vec)){
-          
-          peak_df <- data.frame()
-          
-          #Determine the start, apex, and end of peaks. Use the user defined value "n" to detect peaks.
-          #If n results in fewer peaks then injection, decrease n by 1 and repeat
-          
-          n <- 1
-          
-          rle_output <- eie_df[,m + 1] %>%
-            diff() %>%
-            sign() %>%
-            rle()
-          
-          consecutive_runs <- which(rle_output$lengths > n & rle_output$values == 1)
-          consecutive_runs <- subset(consecutive_runs, (consecutive_runs + 1) %in% (which(rle_output$lengths > n)) == TRUE)
-          
-          run_lengths <- cumsum(rle_output$lengths) + 1
-          
-          start <- eie_df$mt.seconds[run_lengths[consecutive_runs - 1]]
-          apex <- eie_df$mt.seconds[run_lengths[consecutive_runs]]
-          end <- eie_df$mt.seconds[run_lengths[consecutive_runs + 1]]
-          
-          #I will also add intensity values here as well
-          
-          start_intensity <- eie_df[run_lengths[consecutive_runs - 1], (m+1)]
-          apex_intensity <- eie_df[run_lengths[consecutive_runs], (m+1)]
-          end_intensity <- eie_df[run_lengths[consecutive_runs + 1], (m+1)]
-          
-          #Account for peaks that start immediately during the analysis
-          
-          if(length(start) != length(apex)){
-            start <- append(start, 0, 0)
-            start_intensity <- append(start_intensity, 0, 0)
-          }
-          
-          #Create a data frame containing the start, apex, and end migration times of each 
-          #peak in addition to required intensities for FWHM calculations
-          
-          peak_df <- data.frame(start,
-                                apex,
-                                end,
-                                start_intensity,
-                                apex_intensity,
-                                end_intensity)
-          
-          ######3.10.2 Filter peaks by peak width######
-          
-          #Define a minimum peak width cut off in seconds. Remove peaks with a width <= cutoff
-          
-          min_width_cut_off <- mass_df$minimim.peak.width.seconds[m - num_of_is]
-          
-          peak_df <- subset(peak_df, (peak_df$end - peak_df$start) >= min_width_cut_off)
-          
-          ######3.10.3 Integrate peaks######
-          
-          peak_area_vector = c(1:nrow(peak_df))
-          
-          #If the length of peak_area_vector is less than the number of injections, 
-          #print an error and suggest a solution
-          
-          if (length(peak_area_vector) < num_of_injections){
-            cat(paste("Warning: ", name_vec[m], " EIE contains insufficient data. If an error occurs try:
-        1. Increasing the extraction.window.ppm parameter 
-        2. Decreasing the minimim.peak.width.seconds parameter", sep =""))
-          }
-          
-          for (p in 1:nrow(peak_df)){
-            
-            peak_area_vector[p] <- AUC(eie_df$mt.seconds,
-                                       eie_df[,m+1],
-                                       method = "trapezoid",
-                                       from = peak_df[p,1],
-                                       to = peak_df[p,3],
-                                       absolutearea = FALSE,
-                                       na.rm = FALSE)
-            
-            peak_area_vector[p] <- peak_area_vector[p] - (peak_df[p,3] - peak_df[p,1]) * min(peak_df[p,4], peak_df[p,6])
-          }
-          
-          peak_df <- cbind(peak_df, peak_area_vector)
-          
-          #rename peak_df columns
-          
-          colnames(peak_df) <- c(paste(name_vec[m], "start.seconds", sep = "."),
-                                 paste(name_vec[m], "apex.seconds", sep = "."),
-                                 paste(name_vec[m], "end.seconds", sep = "."),
-                                 paste(name_vec[m], "start_intensity", sep = "."),
-                                 paste(name_vec[m], "apex_intensity", sep = "."),
-                                 paste(name_vec[m], "end_intensity", sep = "."),
-                                 paste(name_vec[m], "peak.area", sep = "."))
-          
-          ######3.10.4 Filter peaks######
-          
-          #Filter peaks based on smallest mt difference 
-          
-          #Determine the expected migration times of the metabolites
-          
-          n <- m - num_of_is
-          left_is <- paste(mi_df$left_is[n], ".apex.seconds", sep ="")
-          right_is <- paste(mi_df$right_is[n], ".apex.seconds", sep ="")
-          rmt_is <- paste(mi_df$description[n], ".apex.seconds", sep ="")
-          
-          if(mi_df$description[n] == "mi"){
-            
-            mf_vec <- mi_df[n,5:ncol(mi_df)] %>%
-              unlist() %>%
-              unname()
-            
-            expected_mt <- mf_vec * (is_mt_df[,which(colnames(is_mt_df) == right_is)] - is_mt_df[,which(colnames(is_mt_df) == left_is)]) + is_mt_df[,which(colnames(is_mt_df) == left_is)]
-            
-          }else{
-            
-            mf_vec <- mi_df[n,5:ncol(mi_df)] %>%
-              unlist() %>%
-              unname()
-            
-            expected_mt <- mf_vec * is_mt_df[,which(colnames(is_mt_df) == rmt_is)] 
-            
-          }
-          
-          #Filter peak_df for peaks within migration time tolerance
-          
-          migration_window <- mass_df$migration.window.seconds[m - num_of_is]
-          
-          for (i in 1:num_of_injections){
-            
-            peaks <- peak_df %>%
-              filter(., peak_df[,2] <= expected_mt[i] + migration_window & 
-                       peak_df[,2] >= expected_mt[i] - migration_window)
-            
-            #If more than one peak is found choose the nearest one
-            
-            if(nrow(peaks) > 1){
-              peaks <- (peak_df[,2] - expected_mt[i]) %>%
-                abs() %>%
-                which.min(.)
-              peaks <- peak_df[peaks,]
-            }
-            
-            #If no peak is found, generate a place holder
-            
-            if(nrow(peaks) == 0){
-              
-              nearest_mt <- (eie_df$mt.seconds - expected_mt[i]) %>%
-                abs() %>%
-                which.min(.)
-              
-              peaks <- data.frame(eie_df[nearest_mt,1],
-                                  eie_df[nearest_mt,1],
-                                  eie_df[nearest_mt,1],
-                                  eie_df[nearest_mt,m + 1],
-                                  eie_df[nearest_mt,m + 1],
-                                  eie_df[nearest_mt,m + 1],
-                                  0)
-              
-              colnames(peaks) <- colnames(peak_df)
-            }
-            
-            if(i == 1){
-              filtered_peaks_df <- peaks
-            }else{
-              filtered_peaks_df <- rbind(filtered_peaks_df, peaks)
-            }
-          }
-          
-          ######3.10.5 Filter peaks outside of run time limits######
-          
-          #Set a place holder for peaks where the expected migration time > total run time
-          
-          total_run_time <- eie_df$mt.seconds[nrow(eie_df)]
-          
-          late_peaks <- (expected_mt > total_run_time) %>%
-            which()
-          
-          #Find migration times to use as placeholders that do not belong to other identified peaks
-          
-          mt <- tail(eie_df$mt.seconds, n = 15)
-          
-          mt <- mt[!(mt %in% filtered_peaks_df[,2])]
-          
-          for (i in late_peaks){
-            mt_temp <- mt[i]
-            filtered_peaks_df[i,] <- c(mt_temp,
-                                       mt_temp,
-                                       mt_temp,
-                                       eie_df[which(eie_df$mt.seconds == mt_temp) ,m + 1],
-                                       eie_df[which(eie_df$mt.seconds == mt_temp) ,m + 1],
-                                       eie_df[which(eie_df$mt.seconds == mt_temp) ,m + 1],
-                                       0)
-          }
-          
-          
-          ######3.10.6 Filter duplicated peaks######
-          
-          #If the same peak is assigned to multiple injection numbers, reapply rmt filter with more austere rmt tolerances
-          #New rmt tolerance will be the original / count, which starts at 2 and increases by 1 each iteration
-          
-          count = 2
-          
-          while (any(duplicated(filtered_peaks_df[,2])) & count < 100){
-            
-            strict_migration_window <- migration_window/count
-            
-            #find rows with duplicated values 
-            
-            duplicate_location <- filtered_peaks_df[,2] %>%
-              duplicated() %>%
-              which()
-            
-            duplicate_rows <- which(filtered_peaks_df[,2] %in% filtered_peaks_df[duplicate_location,2])
-            
-            #reapply filtering for these peaks with the more strict rmt tolerance
-            
-            for (r in duplicate_rows){
-              
-              peaks <- peak_df %>%
-                filter(., peak_df[,2] <= expected_mt[r] + strict_migration_window & 
-                         peak_df[,2] >= expected_mt[r] - strict_migration_window)
-              
-              #If more than one peak is found choose the nearest one
-              
-              if(nrow(peaks) > 1){
-                peaks <- (peak_df[,2] - expected_mt[r]) %>%
-                  abs() %>%
-                  which.min(.)
-                peaks <- peak_df[peaks,]
-              }
-              
-              #If no peak is found, generate a place holder
-              
-              if(nrow(peaks) == 0){
-                
-                nearest_mt <- (eie_df$mt.seconds - expected_mt[r]) %>%
-                  abs() %>%
-                  which.min(.)
-                
-                peaks <- data.frame(eie_df[nearest_mt,1],
-                                    eie_df[nearest_mt,1],
-                                    eie_df[nearest_mt,1],
-                                    eie_df[nearest_mt,m + 1],
-                                    eie_df[nearest_mt,m + 1],
-                                    eie_df[nearest_mt,m + 1],
-                                    0)
-                
-                colnames(peaks) <- colnames(peak_df)
-              }
-              
-              filtered_peaks_df[r,] <- peaks
-              
-            }
-            
-            count = count + 1
-          }
-          
-          #If the duplicate peak filter fails (count = 100) then generate a place holder peak_df
-          #and generate a warning that the filter failed. This filter fails when two or more expected migration 
-          #times are too close to each other.
-          
-          if (count == 100){
-            
-            mt.temp <- eie_df$mt.seconds[seq(1, num_of_injections * 10, 10)]
-            
-            filtered_peaks_df[,c(1:3)] <- mt.temp
-            filtered_peaks_df[,c(4:7)] <- 0
-            
-          }
-          
-          ######3.10.7 Filter using peak spaces######
-          
-          #Do not apply peak space filtering if the number of injections is equal to 1
-          
-          if(num_of_injections != 1){
-            
-            #Get peak space tolerance
-            
-            space_tol <- mass_df$peak.space.tolerance.percent[m - num_of_is] / 100
-            
-            #Make a vector containing all the expected space lengths
-            
-            space_vec <- expected_mt %>%
-              diff()
-            
-            #Define upper and lower peak space limits
-            
-            space_lower_lim <- space_vec - space_vec * space_tol
-            space_upper_lim <- space_vec + space_vec * space_tol
-            
-            #Check if peaks migrate within the tolerance limits
-            
-            peak_space_tol_check <- between(diff(filtered_peaks_df[,2]), space_lower_lim, space_upper_lim)
-            
-            if(all(peak_space_tol_check) != TRUE){
-              bad_space <- which(peak_space_tol_check == FALSE)
-            }else{
-              bad_space <- NA
-            }
-            
-            #identify which peaks are potentially incorrectly assigned (bad peaks)
-            #these are peaks before and after each bad space
-            
-            bad_peaks <- c(bad_space, bad_space + 1) %>%
-              unique() %>%
-              sort()
-            
-            #Define a count that will be used to modify the peak space tolerance
-            
-            count = 4
-            
-            #Keep unaltered filtered peaks data frame for the event that the peak space algorithm fails
-            
-            filtered_peaks_df_retain <- filtered_peaks_df
-            
-            #set count limit to determine when the algorithm fails
-            
-            count_limit = 100
-            
-            #Identify bad peaks, and replace them with peaks meeting peak space criteria
-            #If the number of bad peaks is equal to the number of injections, do not apply this filter
-            
-            while(length(bad_peaks) > 0 & length(bad_peaks) < (num_of_injections - 1) & count < count_limit){
-              
-              #define remaining peaks which are correctly assigned (good peaks)
-              
-              good_peaks <- c(1:num_of_injections) %>%
-                setdiff(., c(bad_peaks))
-              
-              #Use the median of the expected peak space times to find peaks
-              
-              peak_tolerance <- expected_mt %>%
-                diff() %>%
-                median () / count
-              
-              for (b in 1:length(bad_peaks)){
-                
-                #find the nearest good peak neighbor for each bad peak
-                
-                nearest_good_peak <- (good_peaks - bad_peaks[b]) %>%
-                  abs() %>%
-                  which.min()
-                
-                #calculate the expected migration time 
-                
-                expected_mt <- filtered_peaks_df[good_peaks[nearest_good_peak], 2] - 
-                  (good_peaks[nearest_good_peak] - bad_peaks[b]) * median(space_vec)
-                
-                #find peaks nearest to the expected migration time within the tolerance
-                
-                peaks <- peak_df %>%
-                  filter(., peak_df[,2] <= expected_mt + peak_tolerance & peak_df[,2] >= expected_mt - peak_tolerance)
-                
-                #if more than one peak is found, select the closest one
-                
-                if(nrow(peaks) > 1){
-                  peaks <- (peak_df[,2] - expected_mt) %>%
-                    abs() %>%
-                    which.min(.)
-                  peaks <- peak_df[peaks,]
-                }
-                
-                #if no peaks are found, define a place holder
-                
-                if(nrow(peaks) == 0){
-                  
-                  nearest_mt <- (eie_df$mt.seconds - expected_mt) %>%
-                    abs() %>%
-                    which.min(.)
-                  
-                  peaks <- data.frame(eie_df[nearest_mt,1],
-                                      eie_df[nearest_mt,1],
-                                      eie_df[nearest_mt,1],
-                                      eie_df[nearest_mt,m + 1],
-                                      eie_df[nearest_mt,m + 1],
-                                      eie_df[nearest_mt,m + 1],
-                                      0)
-                  
-                  colnames(peaks) <- colnames(peak_df)
-                  
-                  filtered_peaks_df[bad_peaks[b],] <- peaks
-                }
-                
-                #if only one peak is found
-                
-                filtered_peaks_df[bad_peaks[b],] <- peaks
-                
-              }
-              
-              count = count + 1
-              
-              duplicate_location <- filtered_peaks_df[,2] %>%
-                duplicated() %>%
-                which()
-              
-              #bad peaks correspond to any rows that are not unique
-              
-              bad_peaks <- which(filtered_peaks_df[,2] %in% filtered_peaks_df[duplicate_location,2])
-              
-            }
-            
-            #if algorithm failed, revert back to filtered_peaks_df
-            
-            if (count == count_limit){
-              
-              filtered_peaks_df <- filtered_peaks_df_retain
-              
-            }
-          }
-          
-          #Summarize filtered.peak_df data in metabolite_peak_df
-          
-          if(m == (num_of_is + 1)){
-            metabolite_peaks_df = filtered_peaks_df
-          }else{
-            metabolite_peaks_df = cbind(metabolite_peaks_df, filtered_peaks_df)  
-          }
-          
-        }
-        
-        metabolite_peaks_df
-        
-      })
-      
-      timing$stage("Filter peaks below LOD", data_file_names[d])
-      ######3.10.8 Filter peaks below LOD######
-      
-      #Build a data frame to store comments for each metabolite peak
-      
-      comment_df <- matrix(nrow = num_of_injections, ncol = num_of_metabolites, "") %>%
-        as.data.frame
-      
-      colnames(comment_df) <- mass_df$name
-      
-      #Loop through each metabolite and see if its area is below the LOD threshold
-      
-      for (m in 1:num_of_metabolites){
-        
-        #Determine the noise of the electropherogram
-        #Fine the noise levels in 60 seconds intervals
-        
-        region_start <- seq(1, nrow(eie_df), 60)
-        region_end <- seq(60, nrow(eie_df), 60)
-        length(region_start) <- length(region_end)
-        
-        #Generate a vector to store noise data
-        
-        noise_vec <- rep(NA, length(region_start))
-        
-        #Define a function to calculate noise
-        
-        noise_calculation <- function(temp_noise) {
-          mean(temp_noise) + mass_df$snr.threshold[m] * sd(temp_noise)
-        }
-        
-        #Calculate the noise in each region
-        
-        for (r in 1:length(region_start)){
-          temp_noise <- eie_df[region_start[r]:region_end[r], m + num_of_is + 1]
-          noise_vec[r] <- noise_calculation(temp_noise)
-        }
-        
-        #Define the noise as the 20th percentile noise region
-        
-        noise <- noise_vec %>%
-          sort()
-        
-        noise <- noise[as.integer(length(noise)/5)]
-        
-        peak_area_df <- metabolite_peaks_df[,seq(7, ncol(metabolite_peaks_df), 7)]
-        
-        comment_df[,m] <- ifelse(peak_area_df[,m] < noise, "<LOD", comment_df[,m])
-        
-        ###Annotate injections that are not detected
-        
-        comment_df[,m] <- ifelse(peak_area_df[,m] == 0, "NPD", comment_df[,m])
-        
-      }
-      
-      timing$stage("Filter interfered peaks", data_file_names[d])
-      ######3.10.9 Filter interfered peaks######
-      
-      #Build an interference data frame since some are metabolites and some are internal standards
-      
-      interference_df <- cbind(is_peaks_df[,seq(2, ncol(is_peaks_df), 7)],
-                               metabolite_peaks_df[,seq(2, ncol(metabolite_peaks_df), 7)])
-      
-      for (m in 1:num_of_metabolites){
-        
-        #Skip metabolites with no reported interference
-        
-        if(is.na(mass_df$interference[m])){
-          next
-        }
-        
-        #Get the names of the interferences from mass_df
-        
-        interferences <- strsplit(mass_df$interference[m], ", ") %>%
-          unlist()
-        
-        for (k in 1:length(interferences)){
-          
-          interference <- paste(interferences[k], ".apex.seconds", sep = "")
-          
-          #Check if interference appears as a metabolite or internal standard.
-          #If not, provide a warning
-          
-          if(!(interferences[k] %in% name_vec)){
-            print(paste("Error: ", "Interference ", interferences[k], " is not an analyte or internal standard", sep = ""))
-          }
-          
-          #Check if a interference window was provided. If not, produce an error.
-          
-          if(is.na(mass_df$interference.comigration.threshold.seconds[m])){
-            print(paste("Error: No interference.comigration.threshold.seconds provided for ", mass_df$name[m], sep = ""))
-          }
-          
-          #See if there is any overlap between the metabolite peak and its interference 
-          
-          metabolite_name <- paste(mass_df$name[m], ".apex.seconds", sep = "")
-          
-          for (i in 1:num_of_injections){
-            for (j in 1:num_of_injections){
-              
-              diff_temp <- (metabolite_peaks_df[i,metabolite_name] - interference_df[j,interference]) %>%
-                abs() 
-              
-              comment_df[i,mass_df$name[m]] <- ifelse(diff_temp < mass_df$interference.comigration.threshold.seconds[m], "Interfered", comment_df[i,mass_df$name[m]])
-            }
-          }
-        }
-      }
-       
-      #Combine internal standard and metabolite data frames for plotting
-      
-      peaks_df <- cbind(is_peaks_df, metabolite_peaks_df)
-      
-      #update comment data frame account for internal standards
-      
-      is_comment_df <- matrix(nrow = num_of_injections, ncol = nrow(is_df), "") %>%
-        as.data.frame()
-      
-      colnames(is_comment_df) <- is_df$name
-      
-      comment_df <- cbind(is_comment_df, comment_df)
-      
-
-      print("Peak Picking and Filtering for Analytes Complete")
-      
-      timing$stage("Generate and save plots", data_file_names[d])
-      #####3.11 Plotting#####
-      #Update progress bar
-      incProgress(1/total_steps, detail = paste("Plotting & Exporting Electropherograms"))
-      print("Plotting Electropherograms")
-      
-      #Make a list to save plots to
-      
-      plot_list <- vector("list", length(name_vec))
-      names(plot_list) <- name_vec
-      
-      for (n in 1:length(name_vec)){
-        
-        ######3.11.1 Create annotation and peak fill data frame######
-        
-        peak_mt_df <- peaks_df[,seq(from = 2, to = ncol(peaks_df), by = 7)]
-        
-        ann_df <- data.frame("peak.number" = c(1:num_of_injections),
-                             "comment" = comment_df[,n],
-                             "peak.apex.seconds" = peak_mt_df[,n],
-                             "peak.height.counts" = eie_df[which(eie_df$mt.seconds %in% (peak_mt_df[,n])),n+1])
-        
-        #Create peak fill data frame
-        
-        pf_df <- data.frame("peak.number" = 1,
-                            "mt.seconds" = eie_df[,1],
-                            "intensity" = eie_df[,n+1])
-        
-        mt_vec <- vector()
-        start_df <- peaks_df[,seq(from = 1, to = ncol(peaks_df), by = 7)]
-        end_df <- peaks_df[,seq(from = 3, to = ncol(peaks_df), by = 7)]
-        
-        for (i in 1:num_of_injections){
-          
-          #Create a migration time vector to track where peaks elute
-          
-          if(comment_df[i,n] == ""){
-            mt_vec_temp <- eie_df$mt.seconds[between(eie_df$mt.seconds, start_df[i,n], end_df[i,n])]
-            mt_vec <- append(mt_vec, mt_vec_temp)
-            
-            #Update peak.number in pf_df
-            
-            pf_df$peak.number <- ifelse(pf_df$mt.seconds >= start_df[i,n], i, pf_df$peak.number)
-            pf_df$peak.number <- as.factor(pf_df$peak.number)
-          }else{
-            next
-          }
-        }
-        
-        pf_df$intensity <- ifelse(pf_df$mt.seconds %in% mt_vec == TRUE, pf_df$intensity , 0)
-        
-        ##Add baseline intensity
-        
-        pf_df$baseline <- 0
-        
-        for (i in 1:num_of_injections){
-          if(comment_df[i,n] == ""){
-            lower_intensity <- min(c(peaks_df[i, n * 7 - 3], peaks_df[i, n * 7 - 1]))
-            pf_df$baseline <- ifelse(pf_df$mt.seconds >= start_df[i,n] & pf_df$mt.seconds <= end_df[i,n], lower_intensity, pf_df$baseline)
-          }else{
-            next
-          }
-        }
-        
-        #Only retain filling data required for plotting
-        
-        pf_df <- subset(pf_df, pf_df$intensity != 0)
-        
-        #Save variables to a list
-        
-        plot_list[[name_vec[n]]] <- list("eie_data" = eie_df[,c(1,(n + 1))], 
-                                         "annotation_data" = ann_df, 
-                                         "integration_data" = pf_df,
-                                         "label_data" = c(name_vec[n],
-                                                          mz_vec[n]),
-                                         "x_axis_data" = c(start_df[1,n],
-                                                           end_df[num_of_injections,n]),
-                                         "y_axis_data" = c(max(ann_df$peak.height.counts), 
-                                                           max(eie_df[,(n + 1)])))
-        
-      }
-
-      
-      ######3.11.2 Create plot function for ggplots######
-      plot_function <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data){
-        
-        extra_space <- ifelse(x_axis_data[1] > 70, 1, 0)
-        
-        ggplot(data = eie_data) +
-          geom_line(aes(x = mt.seconds / 60, y = eie_data[,2]), colour = "grey50") +
-          theme_classic() +
-          coord_cartesian(xlim = c(x_axis_data[1] / 60 - extra_space, x_axis_data[2] / 60 + extra_space),
-                          ylim = c(0, 1.5 * y_axis_data[1])) +
-          scale_y_continuous(name = "Ion Counts",
-                             labels = function(x) format(x, scientific = TRUE),
-                             expand = c(0,0),
-                             breaks = scales::pretty_breaks(n = 10)) +
-          scale_x_continuous(name = "Migration Time (Minutes)",
-                             breaks = scales::pretty_breaks(n = 10))+
-          ggtitle(paste(label_data[1], " EIE", " (m/z = ", label_data[2],")",sep = ""),
-                  subtitle = paste("Data File: ", data_files[d])) +
-          geom_ribbon(data = integration_data,
-                      aes(x = mt.seconds/60, ymax = intensity, ymin = baseline, fill = peak.number),
-                      alpha =0.4) +
-          geom_text(data = annotation_data,
-                    label = annotation_data$peak.number,
-                    size  = font_size_1,
-                    family = "sans",
-                    aes(x = peak.apex.seconds/60,
-                        y = peak.height.counts + 0.1 * y_axis_data[1])) +
-          geom_text(data = annotation_data,
-                    label = annotation_data$comment,
-                    size  = font_size_1,
-                    family = "sans",
-                    aes(x = peak.apex.seconds/60,
-                        y = peak.height.counts + 0.2 * y_axis_data[1])) +
-          theme(legend.position = "none",
-                text = element_text(size = font_size_2, family = "sans"))
-        
-      }
-      
-      ######3.11.3 Create Plot Function for making plotly plots######
-      plot_function_plotly <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data, source = "A") {
-        plot_ly(source = source) %>%
-          add_lines(
-            x = ~eie_data[,1] / 60,
-            y = ~eie_data[,2],
-            name = 'Electropherogram',
-            line = list(color = 'grey')
-          ) %>%
-          add_ribbons(
-            x = ~integration_data$mt.seconds / 60,
-            ymin = ~integration_data$baseline,
-            ymax = ~integration_data$intensity,
-            fillcolor = 'rgba(100,100,255,0.4)',
-            line = list(color = 'rgba(100,100,255,0.4)'),
-            name = 'Peak Integration'
-          ) %>%
-          add_text(
-            x = ~annotation_data$peak.apex.seconds / 60,
-            y = ~annotation_data$peak.height.counts + (0.1 * y_axis_data[1]),
-            text = ~annotation_data$peak.number,
-            showlegend = FALSE
-          ) %>%
-          add_text(
-            x = ~annotation_data$peak.apex.seconds / 60,
-            y = ~annotation_data$peak.height.counts + (0.2 * y_axis_data[1]),
-            text = ~annotation_data$comment,
-            showlegend = FALSE
-          ) %>%
-          layout(
-            title = paste(label_data[1], " EIE", " (m/z =", label_data[2], ")"),
-            xaxis = list(title = 'Migration Time (Minutes)'),
-            yaxis = list(title = 'Ion Counts'),
-            template = 'plotly_white',
-            shapes = list(
-              list(
-                type = "line",
-                x0 = 2,  #Initial position of the red line
-                y0 = 0,
-                x1 = 2,
-                y1 = 1,
-                xref = "x",
-                yref = "paper",
-                line = list(color = "Red", width = 2)
-              ),
-              list(
-                type = "line",
-                x0 = 4,  #Initial position of the blue line
-                y0 = 0,
-                x1 = 4,
-                y1 = 1,
-                xref = "x",
-                yref = "paper",
-                line = list(color = "Blue", width = 2)
-              )
-            )
-          ) %>% config(editable = TRUE)
-      }
-      
-      ######3.11.4 Initialize Saving Locations and Folders######
-      
-      if (parameters_df$plot.format == "Sample"){
-        
-        data_files_name <- list.files(path = "mzML Files")
-        data_files_name <- gsub(".mz5", "", data_file_names, fixed = TRUE)
-        
-        #Create sub-folders
-        
-        dir.create(file.path(file_name, "Plots", "Analytes"), showWarnings = FALSE)
-        dir.create(file.path(file_name, "Plots", "Internal Standards"), showWarnings = FALSE)
-        
-        dir.create(path = paste(file_name, "/Plots/", "Internal Standards", "/", data_files_name[d], sep = ""),
-                   showWarnings = TRUE)
-        
-        dir.create(path = paste(file_name, "/Plots/", "Analytes", "/", data_files_name[d], sep = ""),
-                   showWarnings = TRUE)
-        
-        ######3.11.5 Save plots as ggplots######
-        #Save Internal Standard Plots
-        
-        plotly_plots <- list()
-        
-        for (n in 1:num_of_is){
-          
-          folder <- "Internal Standards"
-          name <- name_vec[n]
-          
-          font_size_1 <- 7
-          font_size_2 <- 25
-          
-          ggsave(filename = paste(n, "_", name,".png",sep=""),
-                 width = 16,
-                 height = 9,
-                 plot = plot_function(eie_data = plot_list[[n]][[1]], 
-                                      annotation_data = plot_list[[n]][[2]], 
-                                      integration_data = plot_list[[n]][[3]],
-                                      label_data = plot_list[[n]][[4]],
-                                      x_axis_data = plot_list[[n]][[5]],
-                                      y_axis_data = plot_list[[n]][[6]]),
-                 path = paste(file_name, "/Plots/", folder, "/", data_files_name[d], sep = ""))
-          
-        }
-        
-        #Save Analyte Plots
-        
-        for (n in (num_of_is + 1):length(name_vec)){
-          
-          folder <- "Analytes"
-          name <- name_vec[n]
-          
-          #Analytes using RMT
-          
-          if (mi_df$description[n - num_of_is] != "mi"){
-            
-            font_size_1 <- 4
-            font_size_2 <- 12
-            
-            is_index <- which(name_vec == mi_df$description[(n - num_of_is)])
-            
-            figure <- ggarrange(plot_function(eie_data = plot_list[[n]][[1]], 
-                                              annotation_data = plot_list[[n]][[2]], 
-                                              integration_data = plot_list[[n]][[3]],
-                                              label_data = plot_list[[n]][[4]],
-                                              x_axis_data = c(min(eie_df$mt.seconds), max(eie_df$mt.seconds)),
-                                              y_axis_data = plot_list[[n]][[6]][2]), 
-                                plot_function(eie_data = plot_list[[n]][[1]], 
-                                              annotation_data = plot_list[[n]][[2]], 
-                                              integration_data = plot_list[[n]][[3]],
-                                              label_data = plot_list[[n]][[4]],
-                                              x_axis_data = plot_list[[n]][[5]],
-                                              y_axis_data = plot_list[[n]][[6]]), 
-                                plot_function(eie_data = plot_list[[is_index]][[1]], 
-                                              annotation_data = plot_list[[is_index]][[2]], 
-                                              integration_data = plot_list[[is_index]][[3]],
-                                              label_data = plot_list[[is_index]][[4]],
-                                              x_axis_data = plot_list[[n]][[5]],
-                                              y_axis_data = plot_list[[is_index]][[6]]),
-                                ncol = 1, nrow = 3)
-            
-            ggsave(filename = paste(n, "_", name,".png",sep=""),
-                   width = 16,
-                   height = 9,
-                   plot = figure,
-                   path = paste(file_name, "/Plots/", folder, "/", data_files_name[d], sep = ""))
-          }
-          
-          #Analytes using MI
-          
-          if (mi_df$description[n - num_of_is] == "mi"){
-            
-            font_size_1 <- 4
-            font_size_2 <- 12
-            
-            is_index <- which(name_vec == mi_df$description[(n - num_of_is)])
-            
-            figure <- ggarrange(plot_function(eie_data = plot_list[[n]][[1]], 
-                                              annotation_data = plot_list[[n]][[2]], 
-                                              integration_data = plot_list[[n]][[3]],
-                                              label_data = plot_list[[n]][[4]],
-                                              x_axis_data = c(min(eie_df$mt.seconds), max(eie_df$mt.seconds)),
-                                              y_axis_data = plot_list[[n]][[6]][2]), 
-                                plot_function(eie_data = plot_list[[n]][[1]], 
-                                              annotation_data = plot_list[[n]][[2]], 
-                                              integration_data = plot_list[[n]][[3]],
-                                              label_data = plot_list[[n]][[4]],
-                                              x_axis_data = plot_list[[n]][[5]],
-                                              y_axis_data = plot_list[[n]][[6]]),
-                                ncol = 1, nrow = 2)
-            
-            ggsave(filename = paste(n, "_", name,".png",sep=""),
-                   width = 16,
-                   height = 9,
-                   plot = figure,
-                   path = paste(file_name, "/Plots/", folder, "/", data_files_name[d], sep = ""))
-          }
-        }
-      }
-      
-      if (parameters_df$plot.format == "Metabolite"){
-        
-        #Save plots to their respective folders within the "Plots" folder
-        data_files_name <- list.files(path = "mzML Files")
-        data_files_name <- gsub(".mz5", "", data_file_names, fixed = TRUE)
-        
-        #Save Plots
-        for (n in 1:length(name_vec)){
-          
-          folder <- name_vec[n]
-          
-          font_size_1 <- 7
-          font_size_2 <- 25
-          
-          ggsave(filename = paste(data_files_name[d],".png",sep=""),
-                 width = 16,
-                 height = 9,
-                 plot = plot_function(eie_data = plot_list[[n]][[1]], 
-                                      annotation_data = plot_list[[n]][[2]], 
-                                      integration_data = plot_list[[n]][[3]],
-                                      label_data = plot_list[[n]][[4]],
-                                      x_axis_data = plot_list[[n]][[5]],
-                                      y_axis_data = plot_list[[n]][[6]]),
-                 path = paste(file_name, "/Plots/", folder, "/", sep = ""))
-          
-        }
-      }
-      
-      ######3.11.6 Save plots as editable plotly plots######
-      plot_list[[name_vec[n]]] <- list("eie_data" = eie_df[,c(1,(n + 1))], 
-                                       "annotation_data" = ann_df, 
-                                       "integration_data" = pf_df,
-                                       "label_data" = c(name_vec[n],
-                                                        mz_vec[n]),
-                                       "x_axis_data" = c(start_df[1,n],
-                                                         end_df[num_of_injections,n]),
-                                       "y_axis_data" = c(max(ann_df$peak.height.counts), 
-                                                         max(eie_df[,(n + 1)])))
-      
-      
-      #Save Internal Standard Plots to a list
-      plotly_plots <- lapply(1:num_of_is, function(n) {
-        
-        name <- name_vec[n]
-        
-        plot <- plot_function_plotly(eie_data = plot_list[[n]][[1]], 
-                                     annotation_data = plot_list[[n]][[2]], 
-                                     integration_data = plot_list[[n]][[3]],
-                                     label_data = plot_list[[n]][[4]],
-                                     x_axis_data = plot_list[[n]][[5]],
-                                     y_axis_data = plot_list[[n]][[6]])
-        return(plot)
-      })
-      
-      names(plotly_plots) <- sapply(1:num_of_is, function(n) {
-        paste0(data_files_name[d], "_", name_vec[n])
-      })
-
-      plotly_objects <- c(plotly_objects, plotly_plots)  
-      
-      #Save Analyte Plots as Plotly Objects 
-      for (n in (num_of_is + 1):length(name_vec)) {
-        
-        name <- name_vec[n]
-        
-        #Analytes using RMT
-        if (mi_df$description[n - num_of_is] != "mi") {
-          
-          is_index <- which(name_vec == mi_df$description[(n - num_of_is)])
-          
-          plotly_figure <- plot_function_plotly(
-              eie_data = plot_list[[n]][[1]],
-              annotation_data = plot_list[[n]][[2]],
-              integration_data = plot_list[[n]][[3]],
-              label_data = plot_list[[n]][[4]],
-              x_axis_data = plot_list[[n]][[5]],
-              y_axis_data = plot_list[[n]][[6]])
-          
-          #Build plotly object before saving them
-          plotly_figure <- plotly::plotly_build(plotly_figure)
-          
-          #Name plots based on the file being processed and the metabolite
-          plot_name <- paste0(data_files_name[d], "_", name_vec[n])
-          
-          #Save the plotly object
-          plotly_objects[[plot_name]] <- plotly_figure
-        }
-        
-        #Saving Analytes using MI as plotly objects
-        if (mi_df$description[n - num_of_is] == "mi") {
-          
-          plotly3 <- plot_function_plotly(
-              eie_data = plot_list[[n]][[1]],
-              annotation_data = plot_list[[n]][[2]],
-              integration_data = plot_list[[n]][[3]],
-              label_data = plot_list[[n]][[4]],
-              x_axis_data = plot_list[[n]][[5]],
-              y_axis_data = plot_list[[n]][[6]])
-          
-          #Build plotly object before saving them
-          plotly3 <- plotly::plotly_build(plotly3)
-          
-          #Name plots based on the file being processed and the metabolite
-          plot_name <- paste0(data_files_name[d], "_", name_vec[n])
-          
-          #Save the plotly object
-          plotly_objects[[plot_name]] <- plotly3
-        }
-      }
-      
-      #Save plotly_objects to reactive varibale plotly_data
-      plotly_data(plotly_objects)
-      
-      #Clear workspace
-      rm(list = c())
-      
-      print("Plotting Complete")
-      
-      
-      timing$stage("Prepare result tables", data_file_names[d])
-      #####3.12 Export Data#####
-      
-      ######3.12.1 Generate peak area data frame######
-      
-      peak_area_df <- cbind("file.name" = c(data_files_name[d], rep("", num_of_injections - 1)),
-                            "peak.number" = c(1:num_of_injections),
-                            peaks_df[,seq(from = 7, to = ncol(peaks_df), by = 7)])
-      colnames(peak_area_df)[3:(length(name_vec) + 2)] <- name_vec
-      
-      #Update values to include <LOD and Interfered
-      
-      for (i in 1:num_of_injections){
-        peak_area_df[i,3:ncol(peak_area_df)] <- ifelse(comment_df[i,] == "", peak_area_df[i, 3:ncol(peak_area_df)], comment_df[i,])
-      }
-      
-      peak_area_report <- peak_area_df
-      
-      
-      ######3.12.2 Generate peak migration time data frame######
-      
-      peak_mt_df <- cbind("file.name" = c(data_files_name[d], rep("", num_of_injections - 1)),
-                          "peak.number" = c(1:num_of_injections),
-                          peaks_df[,seq(from = 2, to = ncol(peaks_df), by = 7)] / 60)
-      colnames(peak_mt_df)[3:(length(name_vec) + 2)] <- name_vec
-      
-      peak_mt_report <- peak_mt_df
-      
-      timing$stage("Save plot_list_data.RData", data_file_names[d])
-      #Save the entire plot_list to a .RData file in the subfolder as well as peaks_df
-      save(plot_list, peaks_df, mi_df, peak_mt_df,peak_area_df, comment_df, file = file.path(subfolder_path, "plot_list_data.RData"))
-      
-      timing$stage("Write SQLite results", data_file_names[d])
-      #Create SQL database if one doesnt exist and save all data to it for each file.
-      db_path_pipeline <- get_db_path(file_name)
-      pipeline_con <- dbConnect(SQLite(), db_path_pipeline)
-      dbExecute(pipeline_con, "PRAGMA journal_mode = WAL")
-      
-      initialize_db(pipeline_con)
-      
-      for (tbl in c("annotation_data", "integration_data","plot_axis_data", "peaks_df","peak_area_df","peak_mt_df")){
-        dbExecute(pipeline_con,
-                  paste0("DELETE FROM ", tbl, " WHERE file_name = ?"),
-                  params = list(data_files_name[d])
-        )
-      }
-      #Write data to SQL database
-      write_file_to_db(
-        con          = pipeline_con,
-        file_name    = data_files_name[d],
-        plot_list    = plot_list,
-        peaks_df     = peaks_df,
-        peak_area_df = peak_area_df,
-        peak_mt_df   = peak_mt_df,
-        comment_df   = comment_df,
-        mi_df        = mi_df
-      )
-      
-      dbDisconnect(pipeline_con)
-      print(paste("database write complete for:", data_files_name[d]))
-      
-      
-      timing$stage("Remove temporary mz5 file", data_file_names[d])
-      #Delete temporary mz5 file
-      file.remove(paste(file, "temp.mz5", sep = "_"))
-  
-      print(paste("Completed Analysis of Data File: ", data_file_names[d], sep = ""))
-      print("")
-      
-      timing$stage("Export CSV reports", data_file_names[d])
-      ######3.12.3 Export data######
-      write.csv(peak_area_report,
-                file = paste(file_name, "/", "Metabolite Peak Areas.csv", sep = ""),
-                row.names = FALSE)
-      
-      write.csv(peak_mt_report,
-                file = paste(file_name, "/", "Metabolite Migration Times.csv", sep = ""),
-                row.names = FALSE)
-      
-      timing$stage("Save plotly_objects.RData", data_file_names[d])
-      #Save plotly_objects to .RDA file
-      save_plotly_objects(file_name)
-      timing$finish()
-      })
-    }#End of loop
-    
-    timing$finish()
-    }, error = function(e) {
-      timing$finish("failed", conditionMessage(e))
-      stop(e)
-    }, interrupt = function(e) {
-      timing$finish("interrupted", "Run interrupted")
-      stop(e)
-    })
-  })#End of main button
-  
-  
   ####4. Visualization tab####
   
   #####4.1 Define reactive expressions and specific required functions#####
@@ -3960,9 +3982,10 @@ server <- function(input, output, session){
   })
   
   ######4.4.2 Server logic for deleting peaks in plots######
-  observeEvent(input$delete_peak, {
+  # Session action called by the delete_peak button.
+  delete_selected_peaks <- function() {
     req(input$peak_info_table_rows_selected)
-    
+
     #Store the current state before making changes
     previous_metadata$comment_df <- run_metadata$comment_df
     previous_metadata$plot_list <- run_metadata$plot_list
@@ -3970,72 +3993,72 @@ server <- function(input, output, session){
     previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
     previous_metadata$peak_area_df <- run_metadata$peak_area_df
     previous_metadata$mi_df <- run_metadata$mi_df
-    
+
     selected_rows <- input$peak_info_table_rows_selected
-    
+
     #Extract the current annotation_data
     selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
     base_file_name <- sub("\\.mz5$", "", input$file_selector)
     plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
     plot_list <- plot_list_data_values$plot_list
-    
+
     #Mark the plot as edited so only plots that have been edited can be regenerated later
     modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-    
+
     if (plotname %in% names(plot_list)) {
       annotation_data <- plot_list[[plotname]]$annotation_data
       integration_data <- plot_list[[plotname]]$integration_data
-      
+
       #Loop through each selected row
       for (selected_row in selected_rows) {
         #Get the peak number from the selected row to allow matching accross various acccesible data streams
         peak_number <- annotation_data$peak.number[selected_row]
-        
+
         #Update the comment column for the selected peak
         annotation_data$comment[selected_row] <- "NPD"
-        
+
         #Update comment_df so peak areas can be recauculated/reintegrated later on
         if (plotname %in% colnames(plot_list_data_values$comment_df)) {
           plot_list_data_values$comment_df[peak_number, plotname] <- "NPD"
         }
-        
+
         if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
           plot_list_data_values$peak_area_df[peak_number, plotname] <- "NPD"
         }
-        
+
         #Remove all integration_data associated with the relevant peak number so regenerated plots will update with the deleted peaks once regenerated
         integration_data <- integration_data[integration_data$peak.number != peak_number, ]
       }
-      
+
       #Update the plot_list with the modified annotation_data
       plot_list[[plotname]]$annotation_data <- annotation_data
       plot_list[[plotname]]$integration_data <- integration_data
-      
+
       #Update the reactive plot_list_data
       plot_list_data_values$plot_list <- plot_list
     }
-    
+
     #Save changes 
     save_plot_data(plotname)
-    
+
     #Reload the updated data
     subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
     reload_plot_data(subfolder_path)
-    
+
     #Update reactive values directly
     plot_list_data_values$plot_list <- plot_list
     plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-    
-    
+
+
     #Update the peak_info_table
     output$peak_info_table <- DT::renderDataTable({
       req(input$plot_table_rows_selected)
       selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-      
+
       base_file_name <- sub("\\.mz5$", "", input$file_selector)
       plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
       plot_list <- plot_list_data_values$plot_list
-      
+
       #Ensure the plotname exists in the plot_list
       if (plotname %in% names(plot_list)) {
         annotation_data <- plot_list[[plotname]]$annotation_data
@@ -4044,13 +4067,18 @@ server <- function(input, output, session){
         data.frame()
       }
     }, options = list(pageLength = 13), selection = 'multiple')
-})
+  }
+
+  observeEvent(input$delete_peak, {
+    delete_selected_peaks()
+  })
   
 
   ######4.4.3 Button for deleting all but the first and last peaks######
-  observeEvent(input$deletemiddlepeaks, {
+  # Session action called by the deletemiddlepeaks button.
+  delete_middle_peaks <- function() {
     req(input$plot_table_rows_selected)
-    
+
     #Store the current state before making changes
     previous_metadata$comment_df <- run_metadata$comment_df
     previous_metadata$plot_list <- run_metadata$plot_list
@@ -4058,66 +4086,66 @@ server <- function(input, output, session){
     previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
     previous_metadata$peak_area_df <- run_metadata$peak_area_df
     previous_metadata$mi_df <- run_metadata$mi_df
-    
+
     #Extract the current plot name
     selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
     base_file_name <- sub("\\.mz5$", "", input$file_selector)
     plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
     plot_list <- plot_list_data_values$plot_list
-    
+
     #Mark the plot as edited so only plots that have been edited can be regenerated later
     modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-    
+
     if (plotname %in% names(plot_list)) {
       annotation_data <- plot_list[[plotname]]$annotation_data
       integration_data <- plot_list[[plotname]]$integration_data
-      
+
       #Identify the first and last peak numbers
       first_peak <- annotation_data$peak.number[1]
       last_peak <- annotation_data$peak.number[nrow(annotation_data)]
-      
+
       #Update the comment column for all peaks except the first and last
       annotation_data$comment[-c(1, nrow(annotation_data))] <- "NPD"
-      
+
       #Update comment_df so peak areas can be recalculated/reintegrated later on
       if (plotname %in% colnames(plot_list_data_values$comment_df)) {
         plot_list_data_values$comment_df[-c(first_peak, last_peak), plotname] <- "NPD"
       }
-      
+
       if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
         plot_list_data_values$peak_area_df[-c(first_peak, last_peak), plotname] <- "NPD"
       }
-      
+
       #Remove all integration_data associated with peaks except the first and last
       integration_data <- integration_data[integration_data$peak.number %in% c(first_peak, last_peak), ]
-      
+
       #Update the plot_list with the modified annotation_data
       plot_list[[plotname]]$annotation_data <- annotation_data
       plot_list[[plotname]]$integration_data <- integration_data
-      
+
       #Update the reactive plot_list_data
       plot_list_data_values$plot_list <- plot_list
-      
+
       #Save changes
       save_plot_data(plotname)
-      
+
       #Reload the updated data
       subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
       reload_plot_data(subfolder_path)
-      
+
       #Update reactive values directly
       plot_list_data_values$plot_list <- plot_list
       plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-      
+
       #Update the peak_info_table
       output$peak_info_table <- DT::renderDataTable({
         req(input$plot_table_rows_selected)
         selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-        
+
         base_file_name <- sub("\\.mz5$", "", input$file_selector)
         plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
         plot_list <- plot_list_data_values$plot_list
-        
+
         #Ensure the plotname exists in the plot_list
         if (plotname %in% names(plot_list)) {
           annotation_data <- plot_list[[plotname]]$annotation_data
@@ -4127,12 +4155,17 @@ server <- function(input, output, session){
         }
       }, options = list(pageLength = 13), selection = 'multiple')
     }
+  }
+
+  observeEvent(input$deletemiddlepeaks, {
+    delete_middle_peaks()
   })
   
   ######4.4.4 Button for deleting ALL peaks in a plot######
-  observeEvent(input$deleteallpeaks, {
+  # Session action called by the deleteallpeaks button.
+  delete_all_peaks <- function() {
     req(input$plot_table_rows_selected)
-    
+
     #Store the current state before making changes
     previous_metadata$comment_df <- run_metadata$comment_df
     previous_metadata$plot_list <- run_metadata$plot_list
@@ -4140,62 +4173,62 @@ server <- function(input, output, session){
     previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
     previous_metadata$peak_area_df <- run_metadata$peak_area_df
     previous_metadata$mi_df <- run_metadata$mi_df
-    
+
     #Extract the current plot name
     selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
     base_file_name <- sub("\\.mz5$", "", input$file_selector)
     plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
     plot_list <- plot_list_data_values$plot_list
-    
+
     #Mark the plot as edited so only plots that have been edited can be regenerated later
     modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-    
+
     if (plotname %in% names(plot_list)) {
       annotation_data <- plot_list[[plotname]]$annotation_data
       integration_data <- plot_list[[plotname]]$integration_data
-      
+
       #Update the comment column for all peaks
       annotation_data$comment <- "NPD"
-      
+
       #Update comment_df so peak areas can be recalculated/reintegrated later on
       if (plotname %in% colnames(plot_list_data_values$comment_df)) {
         plot_list_data_values$comment_df[, plotname] <- "NPD"
       }
-      
+
       if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
         plot_list_data_values$peak_area_df[, plotname] <- "NPD"
       }
-      
+
       #Remove all integration_data
       integration_data <- integration_data[0, ]
-      
+
       #Update the plot_list with the modified annotation_data
       plot_list[[plotname]]$annotation_data <- annotation_data
       plot_list[[plotname]]$integration_data <- integration_data
-      
+
       #Update the reactive plot_list_data
       plot_list_data_values$plot_list <- plot_list
-      
+
       #Save changes
       save_plot_data(plotname)
-      
+
       #Reload the updated data
       subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
       reload_plot_data(subfolder_path)
-      
+
       #Update reactive values directly
       plot_list_data_values$plot_list <- plot_list
       plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-      
+
       #Update the peak_info_table
       output$peak_info_table <- DT::renderDataTable({
         req(input$plot_table_rows_selected)
         selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-        
+
         base_file_name <- sub("\\.mz5$", "", input$file_selector)
         plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
         plot_list <- plot_list_data_values$plot_list
-        
+
         #Ensure the plotname exists in the plot_list
         if (plotname %in% names(plot_list)) {
           annotation_data <- plot_list[[plotname]]$annotation_data
@@ -4205,11 +4238,16 @@ server <- function(input, output, session){
         }
       }, options = list(pageLength = 13), selection = 'multiple')
     }
+  }
+
+  observeEvent(input$deleteallpeaks, {
+    delete_all_peaks()
   })
   
      
   #####4.5 Undo peak deletion#####
-  observeEvent(input$undo, {
+  # Session action called by the undo button.
+  undo_peak_deletion <- function() {
     #Revert to the previous state
     run_metadata$comment_df <- previous_metadata$comment_df
     run_metadata$plot_list <- previous_metadata$plot_list
@@ -4225,7 +4263,7 @@ server <- function(input, output, session){
     plot_list_data_values$peak_mt_df <- run_metadata$peak_mt_df
     plot_list_data_values$peak_area_df <- run_metadata$peak_area_df
     plot_list_data_values$mi_df <- run_metadata$mi_df
-    
+
     #Extract objects from run_metadata
     plot_list <- run_metadata$plot_list
     comment_df <- run_metadata$comment_df
@@ -4233,11 +4271,11 @@ server <- function(input, output, session){
     peak_mt_df <- run_metadata$peak_mt_df
     peak_area_df <- run_metadata$peak_area_df
     mi_df <- run_metadata$mi_df
-    
+
     #Save the reverted state back to the file
     subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
     save(plot_list, comment_df, mi_df,  peaks_df, peak_mt_df, peak_area_df, mi_df, file = file.path(subfolder_path, "plot_list_data.RData"))
-    
+
     #Update the UI to reflect the reverted state
     output$peak_info_table <- DT::renderDataTable({
       req(input$plot_table_rows_selected)
@@ -4245,7 +4283,7 @@ server <- function(input, output, session){
       base_file_name <- sub("\\.mz5$", "", run_metadata$file_name)
       plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
       plot_list <- run_metadata$plot_list
-      
+
       if (plotname %in% names(plot_list)) {
         annotation_data <- plot_list[[plotname]]$annotation_data
         annotation_data
@@ -4253,6 +4291,10 @@ server <- function(input, output, session){
         data.frame()  
       }
     }, options = list(pageLength = 13), selection = 'multiple')
+  }
+
+  observeEvent(input$undo, {
+    undo_peak_deletion()
   })
   
   #####4.6 Regenerate plots#####
@@ -4686,52 +4728,56 @@ server <- function(input, output, session){
    })
 
   #Action button for regenerating plots
-  observeEvent(input$regenerateplots, {
-    
+  # Session action called by the regenerateplots button.
+  regenerate_changed_plots <- function() {
     #remove modal
-    removeModal()
-    
-    #Initialize waiter loading screen
-    initial_message <- sample(loading_messages, 1)
-    waiter_show(
-      html = tagList(
-        spin_flower(),
-        h4(id = "loading-message", initial_message, style = "color:black;")
-      ),
-      color = "rgba(210,210,210,0.7)"
-    )
-    
-    #Java script for switching between different loading messages
-    js_script <- sprintf("
-    setTimeout(function() {
-      var messages = %s;
-      function updateMessage() {
-        var elem = document.getElementById('loading-message');
-        if (elem) {
-          var newMessage = messages[Math.floor(Math.random() * messages.length)];
-          elem.innerText = newMessage;
+      removeModal()
+
+      #Initialize waiter loading screen
+      initial_message <- sample(loading_messages, 1)
+      waiter_show(
+        html = tagList(
+          spin_flower(),
+          h4(id = "loading-message", initial_message, style = "color:black;")
+        ),
+        color = "rgba(210,210,210,0.7)"
+      )
+
+      #Java script for switching between different loading messages
+      js_script <- sprintf("
+      setTimeout(function() {
+        var messages = %s;
+        function updateMessage() {
+          var elem = document.getElementById('loading-message');
+          if (elem) {
+            var newMessage = messages[Math.floor(Math.random() * messages.length)];
+            elem.innerText = newMessage;
+          }
         }
+        setInterval(updateMessage, 4000); // Update every 5 seconds
+      }, 2000);
+    ", jsonlite::toJSON(loading_messages, auto_unbox = TRUE))
+      runjs(js_script)
+
+      #Apply plotting and area functions
+      regenerate_metabolite_peak_areas()
+      print("Finished applying peak area function")
+
+      #Check if required data is populated before running regenerate_ggplot
+      if (nrow(massData()) == 0 || nrow(refMassListData()) == 0 || nrow(parametersData()) == 0) {
+        showNotification("Upload Mass List and Parameters Information!", type = "error")
+      } else {
+        regenerate_ggplot()
+        showNotification("Successfully regenerated plots and updated metadata", type = "message")
       }
-      setInterval(updateMessage, 4000); // Update every 5 seconds
-    }, 2000);
-  ", jsonlite::toJSON(loading_messages, auto_unbox = TRUE))
-    runjs(js_script)
-    
-    #Apply plotting and area functions
-    regenerate_metabolite_peak_areas()
-    print("Finished applying peak area function")
-    
-    #Check if required data is populated before running regenerate_ggplot
-    if (nrow(massData()) == 0 || nrow(refMassListData()) == 0 || nrow(parametersData()) == 0) {
-      showNotification("Upload Mass List and Parameters Information!", type = "error")
-    } else {
-      regenerate_ggplot()
-      showNotification("Successfully regenerated plots and updated metadata", type = "message")
-    }
-    
-    #Reset modified peaks table 
-    modified_peak_plots$names <- character(0)
-    waiter_hide()
+
+      #Reset modified peaks table
+      modified_peak_plots$names <- character(0)
+      waiter_hide()
+  }
+
+  observeEvent(input$regenerateplots, {
+    regenerate_changed_plots()
   })
   
   #Table to list modified plots that will be regenerated
@@ -5351,9 +5397,10 @@ server <- function(input, output, session){
     })    
   
   #####4.9 Marking Interferences#####
-  observeEvent(input$interferences, {
+  # Session action called by the interferences button.
+  mark_peak_interferences <- function() {
     req(input$peak_info_table_rows_selected)
-    
+
     #Store the current state before making changes
     previous_metadata$comment_df <- run_metadata$comment_df
     previous_metadata$plot_list <- run_metadata$plot_list
@@ -5361,67 +5408,67 @@ server <- function(input, output, session){
     previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
     previous_metadata$peak_area_df <- run_metadata$peak_area_df
     previous_metadata$mi_df <- run_metadata$mi_df
-    
+
     selected_rows <- input$peak_info_table_rows_selected
-    
+
     #Extract the current annotation_data
     selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
     base_file_name <- sub("\\.mz5$", "", input$file_selector)
     plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
     plot_list <- plot_list_data_values$plot_list
-    
+
     #Mark the plot as edited so only plots that have been edited can be regenerated later
     modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-    
+
     if (plotname %in% names(plot_list)) {
       annotation_data <- plot_list[[plotname]]$annotation_data
       integration_data <- plot_list[[plotname]]$integration_data
-      
+
       #Loop through each selected row
       for (selected_row in selected_rows) {
         #Get the peak number from the selected row to allow matching accross various acccesible data streams
         peak_number <- annotation_data$peak.number[selected_row]
-        
+
         #Update the comment column for the selected peak
         annotation_data$comment[selected_row] <- "Interferred"
-        
+
         #Update comment_df so peak areas can be recauculated/reintegrated later on
         if (plotname %in% colnames(plot_list_data_values$comment_df)) {
           plot_list_data_values$comment_df[peak_number, plotname] <- "Interferred"
         }
-        
+
         #Remove all integration_data associated with the relevant peak number so regenerated plots will update with the interferred peaks once regenerated
         integration_data <- integration_data[integration_data$peak.number != peak_number, ]
       }
-      
+
       #Update the plot_list with the modified annotation_data
       plot_list[[plotname]]$annotation_data <- annotation_data
       plot_list[[plotname]]$integration_data <- integration_data
-      
+
       #Update the reactive plot_list_data
       plot_list_data_values$plot_list <- plot_list
     }
 
     save_plot_data(plotname)
-    
+
     #Reload the updated data
     subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
     reload_plot_data(subfolder_path)
-    
+
     #Update reactive values directly
     plot_list_data_values$plot_list <- plot_list
     plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-    
-    
+
+
     #Update the peak_info_table
     output$peak_info_table <- DT::renderDataTable({
       req(input$plot_table_rows_selected)
       selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-      
+
       base_file_name <- sub("\\.mz5$", "", input$file_selector)
       plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
       plot_list <- plot_list_data_values$plot_list
-      
+
       #Ensure the plotname exists in the plot_list
       if (plotname %in% names(plot_list)) {
         annotation_data <- plot_list[[plotname]]$annotation_data
@@ -5430,6 +5477,10 @@ server <- function(input, output, session){
         data.frame()
       }
     }, options = list(pageLength = 13), selection = 'multiple')
+  }
+
+  observeEvent(input$interferences, {
+    mark_peak_interferences()
   })
   
 ####5. Downstream Processing ####   
@@ -5566,6 +5617,26 @@ server <- function(input, output, session){
   })
   
   
+  # Normalize the selected columns using one reference metabolite.
+  normalize_peak_areas <- function(data, normalize_by, name_vec) {
+    if (!(normalize_by %in% name_vec)) {
+      showNotification("Selected normalization metabolite not found in data columns.", type = "error")
+      return(data)}
+
+    #Convert non-numeric values to NA and ensure all columns are now numeric
+    data <- data %>%
+      mutate(across(all_of(name_vec), ~ suppressWarnings(ifelse(grepl("^[0-9.]+$", .), as.numeric(.), NA_real_))))
+    if (all(is.na(data[[normalize_by]]))) {
+      showNotification("Normalization column does not contain any numeric values.", type = "error")
+      return(data)}
+
+    #Normalize each row by the corresponding area for the metabolite you are using to normalize.
+    data <- data %>%
+      rowwise() %>%
+      mutate(across(all_of(name_vec), ~ ifelse(!is.na(.data[[normalize_by]]) & !is.na(.), . / .data[[normalize_by]], .)))
+    return(data)
+  }
+
   #####5.3 Normalize to Creatine, F-Phe, or Cl-Tyr#####
   #Show modal for normalization options
   observeEvent(input$normalize, {
@@ -5595,28 +5666,10 @@ server <- function(input, output, session){
       return()
     }
     
-    #Function for normalizing peak areas
-    normalize_peak_areas <- function(data, normalize_by) {
-      if (!(normalize_by %in% name_vec)) {
-        showNotification("Selected normalization metabolite not found in data columns.", type = "error")
-        return(data)}
-      
-      #Convert non-numeric values to NA and ensure all columns are now numeric
-      data <- data %>%
-        mutate(across(all_of(name_vec), ~ suppressWarnings(ifelse(grepl("^[0-9.]+$", .), as.numeric(.), NA_real_))))
-      if (all(is.na(data[[normalize_by]]))) {
-        showNotification("Normalization column does not contain any numeric values.", type = "error")
-        return(data)}
-      
-      #Normalize each row by the corresponding area for the metabolite you are using to normalize.
-      data <- data %>%
-        rowwise() %>%
-        mutate(across(all_of(name_vec), ~ ifelse(!is.na(.data[[normalize_by]]) & !is.na(.), . / .data[[normalize_by]], .)))
-      return(data)
-    }
+
     
     #Apply function to data
-    normalized_data <- normalize_peak_areas(area, input$normalize_by)
+    normalized_data <- normalize_peak_areas(area, input$normalize_by, name_vec)
     
     #Update reactive data
     peak_areas_data(normalized_data)
@@ -5627,6 +5680,26 @@ server <- function(input, output, session){
   })
   
   
+  # Apply the chosen existing missing-value replacement rule.
+  replace_missing_peak_areas <- function(data, name_vec, method) {
+    #Convert non-numeric values to NA
+    data <- data %>%
+      mutate(across(all_of(name_vec), ~ suppressWarnings(ifelse(grepl("^[0-9.]+$", .), as.numeric(.), NA_real_))))
+
+    #Replace missing values with the minimum/five
+    if (method == "Minimum Values/5") {
+      for (col in name_vec) {
+        min_value <- min(data[[col]], na.rm = TRUE) / 5
+        data[[col]][is.na(data[[col]])] <- min_value}
+    }
+
+    #Replace missing values values with 0
+    else if (method == "Missing values = 0") {
+      data[is.na(data)] <- 0}
+
+    data
+  }
+
   #####5.4 Replacing missing values in data#####
   observeEvent(input$missing_data, {
     
@@ -5641,21 +5714,8 @@ server <- function(input, output, session){
       return()
     }
     
-    #Convert non-numeric values to NA
-    data <- data %>%
-      mutate(across(all_of(name_vec), ~ suppressWarnings(ifelse(grepl("^[0-9.]+$", .), as.numeric(.), NA_real_))))
-    
-    #Replace missing values with the minimum/five
-    if (input$missing_data_method == "Minimum Values/5") {
-      for (col in name_vec) {
-        min_value <- min(data[[col]], na.rm = TRUE) / 5
-        data[[col]][is.na(data[[col]])] <- min_value}
-    } 
-    
-    #Replace missing values values with 0
-    else if (input$missing_data_method == "Missing values = 0") {
-      data[is.na(data)] <- 0}
-    
+    data <- replace_missing_peak_areas(data, name_vec, input$missing_data_method)
+
     #Update reactive data
     peak_areas_data(data)
     
@@ -5665,6 +5725,38 @@ server <- function(input, output, session){
   })
   
   
+  # Assign sample IDs by data-file name and injection/peak number.
+  connect_peak_area_metadata <- function(area, metadata) {
+    #identify peak columns in metadata file. Designed to by dynamic with changing peak numbers
+    peak_columns <- grep("^[0-9]+$", names(metadata), value = TRUE)
+
+    #Remove empty columns (just in case) and transform data to long format
+    metadata <- metadata[, colSums(is.na(metadata)) < nrow(metadata)]
+    metadata_long <- metadata %>%
+      pivot_longer(cols = all_of(peak_columns), names_to = "peak.number", values_to = "PBM Sample ID") %>%
+      select(`Data file`, peak.number, `PBM Sample ID`)
+
+    #Filter metadata file to connect filenames in actual results with the samples IDs for each file & peak
+    filter_data_by_file_name <- function(data, file_name) {
+      start_row <- which(data$file.name == file_name)
+      next_file_row <- which(data$file.name != "" & data$file.name != file_name & seq_along(data$file.name) > start_row)[1]
+      end_row <- ifelse(is.na(next_file_row), nrow(data), next_file_row - 1)
+      data[start_row:end_row, ]}
+
+    merged_data <- do.call(rbind, lapply(unique(area$file.name[area$file.name != ""]), function(file_name) {
+      filtered_area <- filter_data_by_file_name(area, file_name)
+      filtered_metadata <- metadata_long[metadata_long$`Data file` == file_name, ]
+      merged <- merge(filtered_area, filtered_metadata, by.x = "peak.number", by.y = "peak.number", all.x = TRUE)
+      merged <- merged %>% select(-`Data file`) %>% relocate(`PBM Sample ID`, .after = file.name)
+      return(merged)
+    }))
+
+    #Trim any leading or trailing whitespace (found in some of the metadata files for unknown resason)
+    merged_data$`PBM Sample ID` <- trimws(merged_data$`PBM Sample ID`, whitespace = "[\\h\\v]")
+
+    merged_data
+  }
+
   #####5.5 Connect Peak Position with Metadata#####
   
   #Observe action button for connecting metadata
@@ -5696,33 +5788,8 @@ server <- function(input, output, session){
       return()
     }
     
-    #identify peak columns in metadata file. Designed to by dynamic with changing peak numbers
-    peak_columns <- grep("^[0-9]+$", names(metadata), value = TRUE)
-    
-    #Remove empty columns (just in case) and transform data to long format
-    metadata <- metadata[, colSums(is.na(metadata)) < nrow(metadata)]
-    metadata_long <- metadata %>%
-      pivot_longer(cols = all_of(peak_columns), names_to = "peak.number", values_to = "PBM Sample ID") %>%
-      select(`Data file`, peak.number, `PBM Sample ID`)
-    
-    #Filter metadata file to connect filenames in actual results with the samples IDs for each file & peak
-    filter_data_by_file_name <- function(data, file_name) {
-      start_row <- which(data$file.name == file_name)
-      next_file_row <- which(data$file.name != "" & data$file.name != file_name & seq_along(data$file.name) > start_row)[1]
-      end_row <- ifelse(is.na(next_file_row), nrow(data), next_file_row - 1)
-      data[start_row:end_row, ]}
-    
-    merged_data <- do.call(rbind, lapply(unique(area$file.name[area$file.name != ""]), function(file_name) {
-      filtered_area <- filter_data_by_file_name(area, file_name)
-      filtered_metadata <- metadata_long[metadata_long$`Data file` == file_name, ]
-      merged <- merge(filtered_area, filtered_metadata, by.x = "peak.number", by.y = "peak.number", all.x = TRUE)
-      merged <- merged %>% select(-`Data file`) %>% relocate(`PBM Sample ID`, .after = file.name)
-      return(merged)
-    }))
-    
-    #Trim any leading or trailing whitespace (found in some of the metadata files for unknown resason)
-    merged_data$`PBM Sample ID` <- trimws(merged_data$`PBM Sample ID`, whitespace = "[\\h\\v]")
-    
+    merged_data <- connect_peak_area_metadata(area, metadata)
+
     #Add merged data to reactive data file and save it to a .CSV
     peak_areas_data(merged_data)
     
@@ -5731,6 +5798,20 @@ server <- function(input, output, session){
   })
   
   
+  # Plot peak areas, their mean and the three-standard-deviation limits.
+  build_control_chart <- function(areas, selected_metabolite, data_label) {
+    plot_ly() %>%
+      add_trace(x = seq_along(areas), y = areas, type = 'scatter', mode = 'lines+markers', name = 'Metabolite Peak Area') %>%
+      add_lines(x = seq_along(areas), y = mean(areas), line = list(color = 'blue'), name = 'Mean') %>%
+      add_lines(x = seq_along(areas), y = mean(areas) + 3 * sd(areas), line = list(color = 'black', dash = 'dash'), name = 'Upper Control Limit') %>%
+      add_lines(x = seq_along(areas), y = mean(areas) - 3 * sd(areas), line = list(color = 'black', dash = 'dash'), name = 'Lower Control Limit') %>%
+      layout(title = paste("Control Chart for", selected_metabolite, data_label),
+             xaxis = list(title = "Sample", showgrid =FALSE, dtick = 5),
+             yaxis = list(title = "Peak Area", showgrid =FALSE),
+             legend = list(orientation = 'h', x = 0.5, xanchor = 'center', y = -0.2),
+             font = list(family = "sans-serif"))
+  }
+
   #####5.6 Control Charts#####
   #Update the selectInput choices based on the reactive value
   observe({
@@ -5757,16 +5838,7 @@ server <- function(input, output, session){
     
     #Generate control chart
     output$control_chart_raw <- renderPlotly({
-      plot_ly() %>%
-        add_trace(x = seq_along(raw_metabolite_areas), y = raw_metabolite_areas, type = 'scatter', mode = 'lines+markers', name = 'Metabolite Peak Area') %>%
-        add_lines(x = seq_along(raw_metabolite_areas), y = mean(raw_metabolite_areas), line = list(color = 'blue'), name = 'Mean') %>%
-        add_lines(x = seq_along(raw_metabolite_areas), y = mean(raw_metabolite_areas) + 3 * sd(raw_metabolite_areas), line = list(color = 'black', dash = 'dash'), name = 'Upper Control Limit') %>%
-        add_lines(x = seq_along(raw_metabolite_areas), y = mean(raw_metabolite_areas) - 3 * sd(raw_metabolite_areas), line = list(color = 'black', dash = 'dash'), name = 'Lower Control Limit') %>%
-        layout(title = paste("Control Chart for", selected_metabolite, "(Raw Data)"),
-               xaxis = list(title = "Sample", showgrid =FALSE, dtick = 5),
-               yaxis = list(title = "Peak Area", showgrid =FALSE),
-               legend = list(orientation = 'h', x = 0.5, xanchor = 'center', y = -0.2), 
-               font = list(family = "sans-serif"))
+      build_control_chart(raw_metabolite_areas, selected_metabolite, "(Raw Data)")
     })
     showNotification("Control Chart Generated", type = "message")
   })
@@ -5783,16 +5855,7 @@ server <- function(input, output, session){
     
     #Generate control chart
     output$control_chart_processed <- renderPlotly({
-      plot_ly() %>%
-        add_trace(x = seq_along(metabolite_data), y = metabolite_data, type = 'scatter', mode = 'lines+markers', name = 'Metabolite Peak Area') %>%
-        add_lines(x = seq_along(metabolite_data), y = mean(metabolite_data), line = list(color = 'blue'), name = 'Mean') %>%
-        add_lines(x = seq_along(metabolite_data), y = mean(metabolite_data) + 3 * sd(metabolite_data), line = list(color = 'black', dash = 'dash'), name = 'Upper Control Limit') %>%
-        add_lines(x = seq_along(metabolite_data), y = mean(metabolite_data) - 3 * sd(metabolite_data), line = list(color = 'black', dash = 'dash'), name = 'Lower Control Limit') %>%
-        layout(title = paste("Control Chart for", selected_metabolite, "(Processed Data)"),
-               xaxis = list(title = "Sample", showgrid =FALSE, dtick = 5),
-               yaxis = list(title = "Peak Area", showgrid =FALSE),
-               legend = list(orientation = 'h', x = 0.5, xanchor = 'center', y = -0.2),
-               font = list(family = "sans-serif"))
+      build_control_chart(metabolite_data, selected_metabolite, "(Processed Data)")
     })
   })
   
@@ -5868,27 +5931,26 @@ server <- function(input, output, session){
   
   ######5.7.3 Function for extracting QC and non-QC catagories from user input######
   #Separate QCs and other samples based on user input
-  average_cv <- reactive({
-    data <- peak_areas_data()
-    
+  # Split QC/sample groups, calculate CVs and prepare the PCA result.
+  compute_quality_metrics <- function(data, category_input, exclude_ids) {
     #Ensure column name exists
     if (!"PBM Sample ID" %in% colnames(data)) {
       showNotification("Column 'PBM Sample ID' not found in data. Please connect metadata to results", type = "error")
       return()
     }
-    
+
     #Extract user specified dynamic categories
-    user_categories <- strsplit(input$category_input, ",")[[1]]
+    user_categories <- strsplit(category_input, ",")[[1]]
     user_categories <- sapply(user_categories, function(x) {
       kv <- strsplit(x, "=")[[1]]
       setNames(trimws(gsub("'", "", kv[2])), trimws(kv[1]))
     }, USE.NAMES = FALSE)
-    
+
     #Exclude specific sample IDs from CV analysis.
-    exclude_ids <- strsplit(input$exclude_ids, ",")[[1]]
+    exclude_ids <- strsplit(exclude_ids, ",")[[1]]
     exclude_ids <- trimws(exclude_ids)
     data <- data %>% filter(!`PBM Sample ID` %in% exclude_ids)
-    
+
     qc_samples <- data %>% filter(grepl(user_categories[["QC"]], `PBM Sample ID`, ignore.case = TRUE))
     non_qc_samples <- data %>% filter(!grepl(user_categories[["QC"]], `PBM Sample ID`, ignore.case = TRUE))
     #Deal with cases where columns contain all missing or all infinite samples. Occurs when there is ZERO detection of a metabolite in ANY sample which makes the data either all NAs or ALL infinite. Occurs rarely but will crash app if not handled correctly.
@@ -5899,40 +5961,44 @@ server <- function(input, output, session){
       showNotification(paste("Excluding columns with all missing or infinite values in QC samples:", paste(excluded_qc_cols, collapse = ", ")), type = "warning", duration = 6)
       qc_samples <- qc_samples[, -qc_exclusions - 3] 
     }
-    
+
     non_qc_exclusions <- which(apply(non_qc_samples[, 4:ncol(non_qc_samples)], 2, function(x) all(is.na(x)) || all(is.infinite(x))))
     if (length(non_qc_exclusions) > 0) {
       excluded_non_qc_cols <- colnames(non_qc_samples)[non_qc_exclusions + 3] 
       showNotification(paste("Excluding columns with all missing or infinite values in non-QC samples:", paste(excluded_non_qc_cols, collapse = ", ")), type = "warning", duration = 6)
       non_qc_samples <- non_qc_samples[, -non_qc_exclusions - 3] 
     }
-    
+
     #Ensure the remaining columns have the same number of rows
     common_cols <- intersect(colnames(qc_samples), colnames(non_qc_samples))
     qc_samples <- qc_samples[, common_cols]
     non_qc_samples <- non_qc_samples[, common_cols]
-    
+
     #Check for any remaining missing or infinite values in samples
     if (any(sapply(qc_samples[, 4:ncol(qc_samples)], is.na)) || any(sapply(qc_samples[, 4:ncol(qc_samples)], is.infinite))) {
       showNotification("QC samples still contain missing or infinite values. Filter failed. Please manually edit data.", type = "error")
       return(NULL)
     }
-    
+
     if (any(sapply(non_qc_samples[, 4:ncol(non_qc_samples)], is.na)) || any(sapply(non_qc_samples[, 4:ncol(non_qc_samples)], is.infinite))) {
       showNotification("Non-QC samples still contain missing or infinite values. Filter failed. Please manually edit data.", type = "error")
       return(NULL)
     }
-    
+
     showNotification("Filtering successful.", type = "message")
-    
+
     #Calculate CVs for QC and non-QC samples
     qc_cv <- calculate_cv(qc_samples[, 4:ncol(qc_samples)])
     non_qc_cv <- calculate_cv(non_qc_samples[, 4:ncol(non_qc_samples)])
-    
+
     #Combine QC and non-QC samples for PCA and store values
     combined_data <- rbind(qc_samples, non_qc_samples)
     pca_result <- perform_pca(combined_data[, 4:ncol(combined_data)])
     list(qc_cv = mean(qc_cv), non_qc_cv = mean(non_qc_cv), non_qc_cv_values = non_qc_cv, pca_result = pca_result, qc_samples = qc_samples, non_qc_samples = non_qc_samples, qc_cv_values = qc_cv)
+  }
+
+  average_cv <- reactive({
+    compute_quality_metrics(peak_areas_data(), input$category_input, input$exclude_ids)
   })
   
   
@@ -6047,27 +6113,32 @@ server <- function(input, output, session){
   
   #####5.9 Integrated Batch Correction#####
   ######5.9.1 Initialize Environment######
-  observeEvent(input$load_batchcorr_packages,{
+  # Session action called by the load_batchcorr_packages button.
+  load_batch_correction_packages <- function() {
     #Note: I am aware that installing packages when the ShinyApp is already running is not ideal. However, for some reason, to install the package RcppArmadillo, which is a dependency of ChemometricsWithR and BatchCorrMetabolomics which we need to run the Batch Correction, R requires a C++ compiler of C++14. The only way I was able to achieve this was by finding the file Makevars.win located where R is stored on your computer and adding the line: CXX_STD=CXX14. Since the app crashes without this, I didnt want to include this as a requirement on setup... Also, BatchCorr wont be done with every run so why load it before?
-    
+
     showNotification("Don't forget to type Yes/No or Y/N in R console to install packages", type = "warning")
-    
+
     #Install packages
     if (!requireNamespace("RcppArmadillo", quietly = TRUE)) {
       install.packages("RcppArmadillo")}
     library(RcppArmadillo)
-    
+
     #Install ChemometricWithR. If you just try to have R download this when installing BatchCorrMetabolomics, it fails. Hence the separation
     if (!requireNamespace("ChemometricsWithR", quietly = TRUE)) {
       remotes::install_github("rwehrens/ChemometricsWithR")}
     library(ChemometricsWithR)
-    
+
     #Install BatchCorrMetabolomics after installing troublesome and required dependencies 
     if (!requireNamespace("BatchCorrMetabolomics", quietly = TRUE)) {
       remotes::install_github("rwehrens/BatchCorrMetabolomics")}
     library(BatchCorrMetabolomics)
-    
+
     showNotification("Environemnt Initialized", type = "message")
+  }
+
+  observeEvent(input$load_batchcorr_packages,{
+    load_batch_correction_packages()
   })
   
   #Load Batch Corr Order
@@ -6078,38 +6149,38 @@ server <- function(input, output, session){
   
   
   ######5.9.2 Perform Batch Correction######
-  observeEvent(input$batch_corr,{
-  
+  # Session action called by the batch_corr button.
+  apply_batch_correction <- function() {
     #Load data.
     Rawdata <- peak_areas_data()
     batch_metadata <- batch_order()
-  
+
     #Perform log10 transform on raw data before correction
     data_BatchCorr <- Rawdata
-    
+
     #Define which columns are your metabolites
     metCols <- 4:ncol(data_BatchCorr)
-    
+
     #Apply log10 in place
     data_BatchCorr[ , metCols] <- log10(data_BatchCorr[ , metCols])
-    
+
     #Create variables necessary for batch correction with initial conditions
     minBatchOccurrence.Ave <- 2
     minBatchOccurrence.Line <- 2
     conditions <- c("")           #Replace missing variables with not available
     experiments <- c(t(outer(c("Q", "S"), conditions, paste, sep = "")))
-  
+
     methods <- rep("lm", length(experiments))
     methods[grep("c", experiments)] <- "tobit"
     LOD <- as.numeric(as.character(min(data_BatchCorr[ , metCols][!is.na(data_BatchCorr[ , metCols])])))
     imputeValues  <- rep(NA, length(experiments))
-    
+
     refSamples <- list(
       "Q" = which(batch_metadata$SCode == "ref"),
       "S" = which(batch_metadata$SCode != "ref")
     )
     strategies <- rep(c("Q", "S"), each = length(conditions))
-    
+
     #Perform batch correction ONLY on numeric metabolite columns
     print("Test 1")
     BatchCorrResults <- lapply(seq(along = experiments), function(ii)
@@ -6122,28 +6193,76 @@ server <- function(input, output, session){
             imputeVal = imputeValues[ii])
     )
     print("Test 2")
-    
+
     #Naming list items with the type of correction
     names(BatchCorrResults) <- experiments
-    
+
     #Anti-log of corrected results
     BatchCorrResultsAntilog <- BatchCorrResults
     BatchCorrResultsAntilog$Q <- 10^(BatchCorrResultsAntilog$Q)
     BatchCorrResultsAntilog$S <- 10^(BatchCorrResultsAntilog$S)
-    
+
     #Write corrected results to CSV files
     write.csv(BatchCorrResults,        file = "BatchCorrResults.csv")
     write.csv(BatchCorrResultsAntilog, file = "BatchCorrResultsAntilog.csv")
-    
+  }
+
+  observeEvent(input$batch_corr,{
+    apply_batch_correction()
   })
   
   ####6. Reporting####
   #Create reactive variable for storing the Matrix to display it.
   MetaboloMatrix <- reactiveVal(NULL)
   
+  # Transpose the sample matrix and assign the configured CLASS labels.
+  build_metaboanalyst_matrix <- function(data, category_input) {
+    #Remove unnecessary columns, transpose the data, and acquire sampleIDs 
+    data <- data[, !names(data) %in% c("peak.number", "file.name")]
+    transposed_data <- t(data)
+    transposed_df <- as.data.frame(transposed_data)
+    sampleIDs <- transposed_df["PBM Sample ID", ]
+
+    #Parse user-specified categories
+    user_categories <- strsplit(category_input, ",")[[1]]
+    user_categories <- sapply(user_categories, function(x) {
+      kv <- strsplit(x, "=")[[1]]
+      setNames(trimws(gsub("'", "", kv[2])), trimws(kv[1]))
+    }, USE.NAMES = FALSE)
+
+    #Create CLASS row based on dynamic criteria specified by text input. Allows for dynamic categorizers
+    class_row <- sapply(1:ncol(transposed_df), function(i) {
+      entry <- sampleIDs[i]
+
+      #Check if entry is numeric and if a numeric category is specified
+      if ("Numeric" %in% names(user_categories) && suppressWarnings(!is.na(as.numeric(entry)))) {
+        return(user_categories[["Numeric"]])
+      }
+
+      #Check user-specified categories from text input
+      for (pattern in names(user_categories)) {
+        if (pattern != "Numeric" && grepl(pattern, entry, ignore.case = TRUE)) {
+          return(user_categories[[pattern]])
+        }
+      }
+
+      #If a class assignment is missing, assign a blank value to it.
+      return("")
+    })
+
+    #Add class row to transposed data.
+    transposed_df <- rbind(class_row, transposed_df)
+    rownames(transposed_df)[1] <- "CLASS"
+
+    #fix order so CLASS is second row
+    transposed_df <- transposed_df[c("PBM Sample ID", "CLASS", rownames(transposed_df)[!rownames(transposed_df) %in% c("PBM Sample ID", "CLASS")]),]
+
+    transposed_df
+  }
+
   #####6.1 Generating Data Matrix for MetaboAnalyst#####
   observeEvent(input$generate_matrix, {
-    
+
     #Initialize environment
     data <- peak_areas_data()
     if (is.null(data) || nrow(data) == 0) {
@@ -6151,46 +6270,8 @@ server <- function(input, output, session){
       return(NULL)}
     results_path <- main_folder2()
     
-    #Remove unnecessary columns, transpose the data, and acquire sampleIDs 
-    data <- data[, !names(data) %in% c("peak.number", "file.name")]
-    transposed_data <- t(data)
-    transposed_df <- as.data.frame(transposed_data)
-    sampleIDs <- transposed_df["PBM Sample ID", ]
-    
-    #Parse user-specified categories
-    user_categories <- strsplit(input$category_input, ",")[[1]]
-    user_categories <- sapply(user_categories, function(x) {
-      kv <- strsplit(x, "=")[[1]]
-      setNames(trimws(gsub("'", "", kv[2])), trimws(kv[1]))
-    }, USE.NAMES = FALSE)
-    
-    #Create CLASS row based on dynamic criteria specified by text input. Allows for dynamic categorizers
-    class_row <- sapply(1:ncol(transposed_df), function(i) {
-      entry <- sampleIDs[i]
-      
-      #Check if entry is numeric and if a numeric category is specified
-      if ("Numeric" %in% names(user_categories) && suppressWarnings(!is.na(as.numeric(entry)))) {
-        return(user_categories[["Numeric"]])
-      }
-      
-      #Check user-specified categories from text input
-      for (pattern in names(user_categories)) {
-        if (pattern != "Numeric" && grepl(pattern, entry, ignore.case = TRUE)) {
-          return(user_categories[[pattern]])
-        }
-      }
-      
-      #If a class assignment is missing, assign a blank value to it.
-      return("")
-    })
-    
-    #Add class row to transposed data.
-    transposed_df <- rbind(class_row, transposed_df)
-    rownames(transposed_df)[1] <- "CLASS"
-    
-    #fix order so CLASS is second row
-    transposed_df <- transposed_df[c("PBM Sample ID", "CLASS", rownames(transposed_df)[!rownames(transposed_df) %in% c("PBM Sample ID", "CLASS")]),]
-    
+    transposed_df <- build_metaboanalyst_matrix(data, input$category_input)
+
     #Save Data
     MetaboloMatrix(transposed_df)
     tryCatch({
@@ -6233,18 +6314,19 @@ server <- function(input, output, session){
   
 
   #Load drug data 
-  observeEvent(input$drug_databases, {
-                 #Load TWOSIDES database
+  # Session action called by the drug_databases button.
+  load_drug_databases <- function() {
+    #Load TWOSIDES database
     twosides_db(parseTWOSIDES("Drug_Data/TWOSIDES.csv.gz"))
     print("Loaded TWOSIDES")
-    
+
     print("Checking for Drug Databank")
-    
+
     #Check for .rds DrugBank file
     #If present, load into reactive value
     if (file.exists("Drug_Data/drugbank_db.rds")){
       drugbank_db(readRDS("Drug_Data/drugbank_db.rds"))
-      
+
       print(".RDS found. Data loaded")
     } else{
       print("Data not found, parse?")
@@ -6259,58 +6341,67 @@ server <- function(input, output, session){
         )
       ))
     }
+  }
+
+  observeEvent(input$drug_databases, {
+    load_drug_databases()
   })
   
-  observeEvent(input$confirm_parse_drugbank,{
+  # Session action called by the confirm_parse_drugbank button.
+  parse_and_save_drugbank <- function() {
     removeModal()
-    
-    #Initialize waiter loading screen
-    initial_message <- sample(loading_messages, 1)
-    waiter_show(
-      html = tagList(
-        spin_flower(),
-        h4(id = "loading-message", initial_message, style = "color:black;")
-      ),
-      color = "rgba(210,210,210,0.7)"
-    )
-    
-    #Java script for switching between different loading messages
-    js_script <- sprintf("
-    setTimeout(function() {
-      var messages = %s;
-      function updateMessage() {
-        var elem = document.getElementById('loading-message');
-        if (elem) {
-          var newMessage = messages[Math.floor(Math.random() * messages.length)];
-          elem.innerText = newMessage;
+
+      #Initialize waiter loading screen
+      initial_message <- sample(loading_messages, 1)
+      waiter_show(
+        html = tagList(
+          spin_flower(),
+          h4(id = "loading-message", initial_message, style = "color:black;")
+        ),
+        color = "rgba(210,210,210,0.7)"
+      )
+
+      #Java script for switching between different loading messages
+      js_script <- sprintf("
+      setTimeout(function() {
+        var messages = %s;
+        function updateMessage() {
+          var elem = document.getElementById('loading-message');
+          if (elem) {
+            var newMessage = messages[Math.floor(Math.random() * messages.length)];
+            elem.innerText = newMessage;
+          }
         }
-      }
-      setInterval(updateMessage, 4000); // Update every 5 seconds
-    }, 2000);
-  ", jsonlite::toJSON(loading_messages, auto_unbox = TRUE))
-    runjs(js_script)
-    
-    #Exclude drugabnk catagories we dont need
-    exclude <- c("manufacturers", "prices", "atc_codes", "international_brands", 
-                 "mixtures", "packagers", "calculated_properties", "pdb_entries","patents","external_links", "atc_codes","sequences","external_identifiers","pdb_entries","ahfs_codes","snp_adverse_reactions", "snp_effects")
-    
-    #parse drugbank
-    drugbank <- parseDrugBank(
-      db_path = "Drug_Data/full database.xml",
-      drug_options = setdiff(drug_node_options(), exclude),
-      parse_salts = FALSE,
-      parse_products = FALSE,
-      references_options = NULL,
-      cett_options = c("targets", "enzymes", "transporters")
-    )
-    
-    #Save file
-    saveRDS(drugbank, "Drug_Data/drugbank_db.rds")
-    drugbank_db(drugbank)
-    
-    #hide waiter and confirm
-    waiter_hide()
-    showNotification("DrugBank loaded and saved successfully!", type = "message")
+        setInterval(updateMessage, 4000); // Update every 5 seconds
+      }, 2000);
+    ", jsonlite::toJSON(loading_messages, auto_unbox = TRUE))
+      runjs(js_script)
+
+      #Exclude drugabnk catagories we dont need
+      exclude <- c("manufacturers", "prices", "atc_codes", "international_brands",
+                   "mixtures", "packagers", "calculated_properties", "pdb_entries","patents","external_links", "atc_codes","sequences","external_identifiers","pdb_entries","ahfs_codes","snp_adverse_reactions", "snp_effects")
+
+      #parse drugbank
+      drugbank <- parseDrugBank(
+        db_path = "Drug_Data/full database.xml",
+        drug_options = setdiff(drug_node_options(), exclude),
+        parse_salts = FALSE,
+        parse_products = FALSE,
+        references_options = NULL,
+        cett_options = c("targets", "enzymes", "transporters")
+      )
+
+      #Save file
+      saveRDS(drugbank, "Drug_Data/drugbank_db.rds")
+      drugbank_db(drugbank)
+
+      #hide waiter and confirm
+      waiter_hide()
+      showNotification("DrugBank loaded and saved successfully!", type = "message")
+  }
+
+  observeEvent(input$confirm_parse_drugbank,{
+    parse_and_save_drugbank()
   })
   
     

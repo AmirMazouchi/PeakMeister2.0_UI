@@ -1,13 +1,15 @@
 PeakMeister - application change summary
 Repository: AmirMazouchi/PeakMeister2.0_UI
-Branch: feature/new-or-open-analysis
-Application snapshot: 627aee645c4d7501f691a7d3c63e470d246752b7
+Branch: feature/modular-server
+Based on application snapshot: 627aee645c4d7501f691a7d3c63e470d246752b7
+Includes the modular server refactor described below.
 
 This describes the current changes to the original application. Intermediate
 workflows that were later replaced are described only in their final form.
 
 ui.R
 
+- The modular refactor uses the existing ui.R without changing GUI controls.
 - Added separate New analysis and Open existing analysis modes in Engine.
 - New analysis retains real .mz5 uploads, multiple-file selection, and the
   optional automatic start after uploading.
@@ -34,6 +36,26 @@ ui.R
 
 server.R
 
+- Replaced the long Initialize Run body with a call to run_new_analysis(),
+  which prepares inputs and calls process_mz5_file() for each uploaded file.
+- Separated reading, mass calibration, extraction preparation, trace extraction,
+  eie_df construction, smoothing, internal-standard processing, metabolite
+  processing, LOD flags, interference flags, plotting, and result exports into
+  named functions with explicit inputs and returned results.
+- Kept all helper functions inside server.R; no additional application R files
+  are needed. Added a comment at the top explaining this refactor.
+- Turned the larger delete, undo, regenerate, interference, batch-correction,
+  and drug-database button actions into named session functions.
+- Extracted functions for normalization, replacing missing values, joining
+  metadata, control charts, quality metrics, and MetaboAnalyst matrix creation.
+- Preserved calculation formulas, result formats, folder layout and timing
+  stages. Removed the redundant assignment of already-built last-plot data.
+- Ensure temporary raw copies and pipeline SQLite connections close on errors.
+- Added docs/modular-server.md with the task/function map and validation notes.
+- Added synthetic processing and before/after comparison tests. These checked
+  two-file CSV/RData/SQLite output, Plotly traces/layouts, timing stages, error
+  cleanup and downstream transformations. A complete real mz5 run was not
+  performed because the full scientific dependencies are unavailable here.
 - Added stage timing for Initialize Run, including reading .mz5 files,
   calibration, extraction, smoothing, peak processing, plotting, SQLite
   writes, and report exports.
