@@ -1,3 +1,5 @@
+# Clear/reselect fix: run and analysis dropdowns start with an explicit empty
+# option so Shiny reports cleared selections and allows choosing the same run again.
 # Startup/display fix: Engine uses a normal layout container because it has no
 # sub-tabs. Real tab sets elsewhere retain their existing panels and controls.
 # Open existing analysis selects a run folder under Results; no raw mz5 selection
@@ -332,7 +334,8 @@ ui <- dashboardPage(
                    ),
                    conditionalPanel("input.analysis_mode === 'existing'",
                      tags$h4("Open existing analysis"),
-                     selectInput("existing_run", "Select run folder in Results:", choices = NULL),
+                     selectInput("existing_run", "Select run folder in Results:",
+                                 choices = c("Select a run" = "")),
                      helpText("Choose a saved run. The original .mz5 file is not needed."),
                      textOutput("existing_selection_summary"),
                      actionButton("open_existing_analysis", "Show Saved Results in Visualization"),
@@ -385,7 +388,8 @@ ui <- dashboardPage(
                        HTML("<p><strong></<strong><u>Don't forget</strong></u> to set your results folder!</p>"),
                        
                        #Select results folder to work out of 
-                       selectInput("results_folder", "Select saved analysis for this file:", choices = NULL),
+                       selectInput("results_folder", "Select saved analysis for this file:",
+                                   choices = c("Select a saved analysis" = "")),
                        textOutput("results_folder_status"),
                        #Select plots, display plots
                        tags$h4(style = "text-decoration: underline;", "Loaded Plots"),
@@ -461,7 +465,8 @@ ui <- dashboardPage(
             column(3,
                    tags$h4(style = "text-decoration: underline;", "Set working environment and initialize data"),
                    #Select results folder to work out of 
-                   selectInput("results_folder2", "Select Results Folder:", choices = NULL),
+                   selectInput("results_folder2", "Select Results Folder:",
+                               choices = c("Select a saved analysis" = "")),
                    #Button for loading migration data and peak area data to reactive value
                    actionButton("load_migration_area", "Load Migration and Peak Area Data"),
                    #m/z vs MT controls

@@ -30,6 +30,15 @@ withCallingHandlers({
   title <- "PeakMeister v2.0"
   ui <- eval(Filter(function(x) is_assignment(x, "ui"), ui_code)[[1]])
   stopifnot(inherits(ui, "shiny.tag"))
+  # Shiny must send the empty value when these dynamic selectors are cleared.
+  # A data-nonempty flag suppresses that event and breaks reselecting the same run.
+  for (id in c("existing_run", "results_folder", "results_folder2")) {
+    config <- Filter(function(tag) identical(tag$attribs[["data-for"]], id),
+      htmltools::tagQuery(ui)$find("script")$selectedTags())
+    stopifnot(length(config) == 1L, is.null(config[[1]]$attribs[["data-nonempty"]]))
+    select <- htmltools::tagQuery(ui)$find(paste0("#", id))$selectedTags()
+    stopifnot(length(select) == 1L, grepl('value=""', as.character(select[[1]]), fixed = TRUE))
+  }
 }, warning = record_warning)
 stopifnot(!any(grepl("Navigation containers", warnings, fixed = TRUE)))
 
@@ -110,4 +119,4 @@ withCallingHandlers(testServer(function(input, output, session) {
   stopifnot(adjusted$individual == 1L, adjusted$all == 1L, adjusted$baseline == 2)
 }), warning = record_warning)
 stopifnot(length(warnings) == 0L)
-cat("PASS: full UI without navigation warnings; standalone README with embedded assets, equations and references; session resource cleanup; no pre-plot event warnings; zoom/reset and isolated main/dialog baseline clicks.\n")
+cat("PASS: full UI without navigation warnings; clearable run/analysis dropdowns; standalone README with embedded assets, equations and references; session resource cleanup; no pre-plot event warnings; zoom/reset and isolated main/dialog baseline clicks.\n")
