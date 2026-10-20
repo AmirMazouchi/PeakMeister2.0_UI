@@ -18,7 +18,7 @@ server_definition <- Filter(function(x) is_assignment(x, "server"), server_code)
 statements <- as.list(server_definition[[3]][[3]])[-1]
 assignment <- function(name) Filter(function(x) is_assignment(x, name), statements)[[1]]
 handler <- function(event) {
-  Filter(function(x) is.call(x) && identical(x[[1]], as.name("observeEvent")) &&
+  Filter(function(x) is.call(x) && identical(x[[1]], as.name("observe_action")) &&
     identical(paste(deparse(x[[2]]), collapse = ""), event), statements)
 }
 warnings <- character()
@@ -72,7 +72,8 @@ fixture <- list(
     intensity = c(1, 5, 3)),
   label_data = c("Target", "100"), x_axis_data = c(0, 90), y_axis_data = c(6, 0))
 event_block <- as.call(c(list(as.name("{")),
-  lapply(c("plot_function_plotly", "plot_event_data", "zoom_state",
+  lapply(c("action_label", "report_action_error", "with_action_error", "observe_action",
+    "observe_updates", "plot_function_plotly", "plot_event_data", "zoom_state",
     "baseline_adjustment_mode", "plotbaseline_adjustment_mode",
     "output$selected_plot", "output$adjust_baseline_plot"), assignment),
   handler('plot_event_data("plotly_relayout", "peakmeister_selected")')[1],

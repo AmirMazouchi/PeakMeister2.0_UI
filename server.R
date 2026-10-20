@@ -1,3 +1,7 @@
+# Shared action guards catch ordinary R errors in buttons, uploads, selection
+# events and background observers. They show the action/error, log details,
+# release loading overlays and keep the session open. Shiny validation remains
+# silent/inline; completed writes are not rolled back. All helpers stay here.
 # PCA panel validation uses shiny::validate/shiny::need explicitly so packages
 # loaded after Shiny cannot mask the display check with a different validator.
 # Quality/CV stability: validate metadata, QC groups and numeric inputs before
@@ -44,6 +48,98 @@ options(shiny.timeout = 600)  #Set timeout to 600 seconds (10 minutes)
 
 #Initialize server
 server <- function(input, output, session){ 
+
+  # UI action names used in error messages; event expressions are not evaluated here.
+  action_label <- function(event) {
+    labels <- c(
+      addMassRow = "Add Mass", deletemassrow = "Delete mass row", clearMassList = "Clear Mass List",
+      addRefMassRow = "Add Reference Mass", deleterefmassrow = "Delete reference mass row",
+      clearRefMassList = "Clear Reference Mass List", addParamRow = "Add Parameter",
+      deleteparamrow = "Delete parameter row", clearparam = "Clear Parameters",
+      saveProjectInfo = "Save Project Info", clearproject = "Clear Project Info",
+      addMTIrow = "Add manual MTI row", deleteMTIrow = "Delete MTI row", clearMTIlist = "Clear MTI List",
+      massList = "Load Mass List workbook", massListReference = "Load Reference Mass List workbook",
+      massListParameters = "Load Parameters workbook", userMTI = "Load migration-index workbook",
+      analysis_mode = "Change analysis mode", mz5Files = "Upload mz5 files",
+      existing_run = "Open existing analysis", clearFiles = "Clear Files", initialize = "Initialize Run",
+      results_folder = "Select saved analysis", confirm_migration = "Build saved-results database",
+      file_selector = "Select visualization file", draw_mode = "Change plot interaction mode",
+      plot_table_rows_selected = "Select plot", delete_peak = "Delete Selected Peaks",
+      deletemiddlepeaks = "Delete Middle Peaks", deleteallpeaks = "Delete all peaks",
+      undo = "Undo Peak Deletion", other_options = "Other plot options",
+      regenerateplots = "Regenerate Changed Plots", rebuild_peak_areas_modal = "Rebuild Peak Area CSV",
+      rebuild_mig_times_modal = "Rebuild Peak Migration Time CSV",
+      manual_integrate = "Manually Adjust Integration", confirm_peak_number = "Confirm peak integration",
+      adjust_indiv_baseline = "Adjust Individual Baseline",
+      baseline_peak_number_adjustment = "Confirm individual baseline adjustment",
+      adjust_all_baselines = "Adjust All Baselines",
+      confirm_adjust_all_baselines = "Confirm all baseline adjustments",
+      interferences = "Mark Peak Interference", results_folder2 = "Select downstream results",
+      load_migration_area = "Load Migration and Peak Area Data", normalize = "Normalize Data",
+      confirm_normalize = "Normalize Data", missing_data = "Replace Missing Data",
+      connect_metadata = "Connect Metadata to Results", create_control_chart = "Create Control Chart",
+      compute_cv = "Calculate CVs", load_batchcorr_packages = "Initialize Batch Correction Packages",
+      batch_corr = "Perform Batch Correction", generate_matrix = "Generate Data Matrix for MetaboAnalyst",
+      adherence_results = "Load adherence results", drug_databases = "Load Drug Databases",
+      confirm_parse_drugbank = "Parse DrugBank"
+    )
+    if (is.call(event) && identical(event[[1]], as.name("$")) &&
+        identical(event[[2]], as.name("input"))) {
+      id <- as.character(event[[3]])
+      if (id %in% names(labels)) return(unname(labels[id]))
+    }
+    if (is.call(event) && identical(event[[1]], as.name("plot_event_data"))) return("Plot interaction")
+    "Update selected analysis"
+  }
+
+  report_action_error <- function(action, error) {
+    detail <- conditionMessage(error)
+    message(sprintf("[PeakMeister] %s failed: %s", action, detail))
+    if (!is.null(conditionCall(error))) {
+      message("[PeakMeister] Call: ", paste(deparse(conditionCall(error)), collapse = " "))
+    }
+    # A failed plotting/database action must not leave a full-screen waiter blocking the app.
+    tryCatch({
+      if (requireNamespace("waiter", quietly = TRUE)) waiter::waiter_hide()
+    }, error = function(e) message("[PeakMeister] Loading overlay cleanup: ", conditionMessage(e)))
+    tryCatch(shiny::showNotification(paste0(action, " failed: ", detail),
+      type = "error", duration = NULL, closeButton = TRUE, id = "peakmeister-action-error",
+      session = session),
+      error = function(e) message("[PeakMeister] Could not display notification: ", conditionMessage(e)))
+    invisible(NULL)
+  }
+
+  # The expression executes in its caller's environment, preserving local state
+  # and the existing handler's early returns. Cleanup is only run after failure.
+  with_action_error <- function(expr, action, on_error = NULL) {
+    tryCatch(force(expr), error = function(e) {
+      if (inherits(e, "shiny.silent.error")) stop(e)
+      if (!is.null(on_error)) tryCatch(on_error(), error = function(cleanup_error) {
+        message("[PeakMeister] Action cleanup: ", conditionMessage(cleanup_error))
+      })
+      report_action_error(action, e)
+      invisible(NULL)
+    })
+  }
+
+  # Quote once and forward Shiny options unchanged (priority, ignoreInit, once, etc.).
+  observe_action <- function(eventExpr, handlerExpr, ...,
+                             event.env = parent.frame(), event.quoted = FALSE,
+                             handler.env = parent.frame(), handler.quoted = FALSE,
+                             label = NULL, on_error = NULL) {
+    event <- if (event.quoted) eventExpr else substitute(eventExpr)
+    handler <- if (handler.quoted) handlerExpr else substitute(handlerExpr)
+    guarded <- substitute(with_action_error(HANDLER, ACTION, on_error = CLEANUP),
+      list(HANDLER = handler, ACTION = action_label(event), CLEANUP = on_error))
+    shiny::observeEvent(event, guarded, event.env = event.env, event.quoted = TRUE,
+      handler.env = handler.env, handler.quoted = TRUE, label = label, ...)
+  }
+
+  observe_updates <- function(x, ..., env = parent.frame(), quoted = FALSE, label = NULL) {
+    expression <- if (quoted) x else substitute(x)
+    guarded <- substitute(with_action_error(EXPR, "Refresh interface"), list(EXPR = expression))
+    shiny::observe(guarded, env = env, quoted = TRUE, label = label, ...)
+  }
   
   #Initialize plotly_data as an empty reactive variable
   plotly_data <- reactiveVal(list())
@@ -191,13 +287,13 @@ server <- function(input, output, session){
       showNotification(paste("Could not load workbook:", conditionMessage(e)), type = "error")
     })
   }
-  observeEvent(input$massList, replace_mass_workbook(input$massList))
-  observeEvent(input$massListReference, replace_mass_workbook(input$massListReference))
-  observeEvent(input$massListParameters, replace_mass_workbook(input$massListParameters))
+  observe_action(input$massList, replace_mass_workbook(input$massList))
+  observe_action(input$massListReference, replace_mass_workbook(input$massListReference))
+  observe_action(input$massListParameters, replace_mass_workbook(input$massListParameters))
 
   #####2.3 Manual Mass List Input#####
   #Add a row in the table 
-  observeEvent(input$addMassRow, {
+  observe_action(input$addMassRow, {
     newRow <- data.frame(
       #Input values for table 
       name = input$name,
@@ -250,14 +346,14 @@ server <- function(input, output, session){
   })
   
   #Delete selected row in Mass List server function 
-  observeEvent(input$deletemassrow, {
+  observe_action(input$deletemassrow, {
     selected_row <- input$massListData_rows_selected
     if (length(selected_row) > 0) {
       updatedData <- massData()[-selected_row, ]
       massData(updatedData)} else {
       showNotification("Please select a row to delete.", type = "error")}})
   #Server function for clearing data table
-  observeEvent(input$clearMassList, {
+  observe_action(input$clearMassList, {
     massData(data.frame())
     showNotification("Table has been reset.", type = "message")})
   #Data table output
@@ -265,7 +361,7 @@ server <- function(input, output, session){
     DT::datatable(massData(), selection = 'single', editable = TRUE)})
   
   #####2.4 Manual Reference Mass Input#####
-  observeEvent(input$addRefMassRow, {
+  observe_action(input$addRefMassRow, {
     newRow <- data.frame(
       #Input values for table
       name = input$name,
@@ -316,7 +412,7 @@ server <- function(input, output, session){
   })
   
   #Deleting a selected row in reference mass list
-  observeEvent(input$deleterefmassrow, {
+  observe_action(input$deleterefmassrow, {
     selected_row <- input$refMassListData_rows_selected
     if (length(selected_row) > 0) {
       updatedData <- refMassListData()[-selected_row, ]
@@ -324,7 +420,7 @@ server <- function(input, output, session){
     } else {
       showNotification("Please select a row to delete.", type = "error")}})
   #Clearing the reference mass list
-  observeEvent(input$clearRefMassList, {
+  observe_action(input$clearRefMassList, {
     refMassListData(data.frame())
     showNotification("Reference Mass List has been cleared.", type = "message")})
   #Data table output
@@ -332,7 +428,7 @@ server <- function(input, output, session){
     DT::datatable(refMassListData(), selection = 'single', editable = TRUE)})
   
   #####2.5 Manual Parameters Input#####
-  observeEvent(input$addParamRow, {
+  observe_action(input$addParamRow, {
     newRow <- data.frame(
       #Input values for table
       number.of.injections = input$number.of.injections,
@@ -363,7 +459,7 @@ server <- function(input, output, session){
   })
   
   #Deleting selected parameter row
-  observeEvent(input$deleteparamrow, {
+  observe_action(input$deleteparamrow, {
     selected_row <- input$parametersData_rows_selected
     if (length(selected_row) > 0) {
       updatedData <- parametersData()[-selected_row, ]
@@ -371,7 +467,7 @@ server <- function(input, output, session){
     } else {
       showNotification("Please select a row to delete.", type = "error")}})
   #Clearing the parameters list
-  observeEvent(input$clearparam, {
+  observe_action(input$clearparam, {
     parametersData(data.frame())
     showNotification("Parameters List has been cleared.", type = "message")})
   #Data table output
@@ -387,7 +483,7 @@ server <- function(input, output, session){
   projectSupervisor <- reactiveVal("")
   projectContact <- reactiveVal("")
   #Update reactive values when someone clicks Save project info)
-  observeEvent(input$saveProjectInfo, {
+  observe_action(input$saveProjectInfo, {
     projectName(input$projectName)  
     projectDescription(input$projectDescription)  
     projectSupervisor(input$projectSupervisor)  
@@ -402,7 +498,7 @@ server <- function(input, output, session){
   })
   
   #Server function for clearing project information when button is clicked
-  observeEvent(input$clearproject, {
+  observe_action(input$clearproject, {
     #Clear the input fields
     updateTextInput(session, "projectName", value = "")
     updateTextInput(session, "projectDescription", value = "")
@@ -419,7 +515,7 @@ server <- function(input, output, session){
   #####2.7 Manual MTI input#####
   
   # Uploaded migration indexes replace the startup workbook.
-  observeEvent(input$userMTI, {
+  observe_action(input$userMTI, {
     req(input$userMTI)
     tryCatch(load_migration_workbook(input$userMTI$datapath, input$userMTI$name), error = function(e) {
       showNotification(paste("Could not load migration indexes:", conditionMessage(e)), type = "error")
@@ -427,7 +523,7 @@ server <- function(input, output, session){
   })
 
   #Manual Data Input
-  observeEvent(input$addMTIrow, {
+  observe_action(input$addMTIrow, {
     newRow <- data.frame(
       name = input$name,
       left_is = input$left_is,
@@ -463,7 +559,7 @@ server <- function(input, output, session){
   })
   
   #Delete selected MTI row
-  observeEvent(input$deleteMTIrow, {
+  observe_action(input$deleteMTIrow, {
     selected_row <- input$userMTIdata_rows_selected
     if (length(selected_row) > 0) {
       updatedData <- userMTI()[-selected_row, ]
@@ -474,7 +570,7 @@ server <- function(input, output, session){
   })
   
   #Clearing the MTI list
-  observeEvent(input$clearMTIlist, {
+  observe_action(input$clearMTIlist, {
     userMTI(data.frame())
     showNotification("User Supplied Migration Indexes list has been cleared.", type = "message")
   })
@@ -493,12 +589,14 @@ server <- function(input, output, session){
       paste("Mass List and Parameters", Sys.Date(), ".xlsx", sep = "")
     },
     content = function(file) {
-      #Create a list of data frames for each sheet
-      write_xlsx(list(
-        Parameters = parametersData(),
-        'Mass List' = massData(),
-        'Reference Mass List' = refMassListData()
-      ), path = file)
+      with_action_error({
+        #Create a list of data frames for each sheet
+        write_xlsx(list(
+          Parameters = parametersData(),
+          'Mass List' = massData(),
+          'Reference Mass List' = refMassListData()
+        ), path = file)
+      }, "Save Table (.xlsx)", on_error = function() unlink(file))
     }
   )
   
@@ -560,7 +658,7 @@ server <- function(input, output, session){
   saved_runs <- reactivePoll(5000, session,
     checkFunc = list_saved_runs, valueFunc = list_saved_runs)
 
-  observe({
+  observe_updates({
     runs <- saved_runs()
     current <- isolate(selected_saved_run())
     updateSelectInput(session, "existing_run",
@@ -631,14 +729,14 @@ server <- function(input, output, session){
   })
   outputOptions(output, "show_visualization_file_selector", suspendWhenHidden = FALSE)
 
-  observeEvent(input$analysis_mode, {
+  observe_action(input$analysis_mode, {
     uploadedmz5(empty_mz5_files())
     selected_saved_run(character())
     updateSelectInput(session, "existing_run", selected = "")
     reset_raw_selection()
   }, ignoreInit = TRUE, priority = 100)
 
-  observeEvent(input$mz5Files, {
+  observe_action(input$mz5Files, {
     if (analysis_mode() != "new") return()
     req(input$mz5Files)
     newFiles <- data.frame(FileName = input$mz5Files$name,
@@ -651,7 +749,7 @@ server <- function(input, output, session){
     if (isTRUE(input$autorun)) request_new_analysis()
   })
 
-  observeEvent(input$existing_run, {
+  observe_action(input$existing_run, {
     if (analysis_mode() != "existing") return()
     run <- input$existing_run
     uploadedmz5(empty_mz5_files())
@@ -671,7 +769,7 @@ server <- function(input, output, session){
                            Source = "saved_run", stringsAsFactors = FALSE))
   }, ignoreNULL = FALSE)
 
-  observeEvent(input$clearFiles, {
+  observe_action(input$clearFiles, {
     uploadedmz5(empty_mz5_files())
     selected_saved_run(character())
     updateSelectInput(session, "existing_run", selected = "")
@@ -2647,7 +2745,7 @@ server <- function(input, output, session){
   }
 
   #####3.3 Initialize Run: validate the selection, then call the workflow#####
-  observeEvent(input$initialize, {
+  observe_action(input$initialize, {
     if (analysis_mode() != "new") {
       shiny::showNotification("Choose New analysis to process raw files.", type = "error")
       return(NULL)
@@ -3255,7 +3353,7 @@ server <- function(input, output, session){
   #####4.2 Environmental initialization: File upload, and folder selection#####
   
   # Use uploaded filenames for new runs and saved-data filenames for reopening.
-  observe({
+  observe_updates({
     files <- uploadedmz5()$FileName
     current <- isolate(input$file_selector)
     updateSelectInput(session, "file_selector", choices = files,
@@ -3323,7 +3421,7 @@ server <- function(input, output, session){
   })
 
   last_results_filename <- reactiveVal(character())
-  observeEvent(list(selected_results_filename(), results_folders_reactive()), {
+  observe_action(list(selected_results_filename(), results_folders_reactive()), {
     filename <- selected_results_filename()
     folders <- results_folders_reactive()
     current <- input$results_folder
@@ -3348,7 +3446,7 @@ server <- function(input, output, session){
   }
 
   #Deal with changing results folder and then load database or make database
-  observeEvent(input$results_folder, {
+  observe_action(input$results_folder, {
     #Close previous connection if open
     old_con <- db_con()
     if (!is.null(old_con)) {
@@ -3405,7 +3503,7 @@ server <- function(input, output, session){
 
   # Clear stale editing/undo state only when the selected filename actually changes.
   last_visualization_filename <- reactiveVal(character())
-  observeEvent(selected_results_filename(), {
+  observe_action(selected_results_filename(), {
     filename <- selected_results_filename()
     if (identical(filename, last_visualization_filename())) return()
     last_visualization_filename(filename)
@@ -3416,7 +3514,7 @@ server <- function(input, output, session){
   }, ignoreNULL = FALSE, priority = 100)
 
   #Handle migration confirmation
-  observeEvent(input$confirm_migration, {
+  observe_action(input$confirm_migration, {
     removeModal()
     req(input$results_folder)
     folder <- input$results_folder
@@ -3472,7 +3570,7 @@ server <- function(input, output, session){
     con <- open_db(folder)
     db_con(con)
     cat("Database built and connected:", get_db_path(folder), "\n")
-  })
+  }, on_error = function() shiny::removeModal(session = session))
   
   #Clean up database connection when session ends
   session$onSessionEnded(function() {
@@ -3483,7 +3581,7 @@ server <- function(input, output, session){
   })
   
   #When file selector changes, load all data from database into reactive values
-  observeEvent(input$file_selector, {
+  observe_action(input$file_selector, {
     req(db_con(), input$file_selector)
     con       <- db_con()
     folder    <- main_folder()
@@ -3540,7 +3638,7 @@ server <- function(input, output, session){
   })
   
 #Obsereve block for loading data when app first launches when a results folder is selected and files havent been changed. Required for direct data acquisition after app startup and no file switch.
-  observeEvent(db_con(), {
+  observe_action(db_con(), {
     req(db_con(), input$file_selector)
     con       <- db_con()
     folder    <- main_folder()
@@ -3663,7 +3761,7 @@ server <- function(input, output, session){
   drag_mode <- reactiveVal("zoom")
   
   #Button toggle logic
-  observeEvent(input$draw_mode, {
+  observe_action(input$draw_mode, {
     
     #Mode for drawing boxes on plot to highlight regions to integrate between 
     if (input$draw_mode) {
@@ -3688,7 +3786,7 @@ server <- function(input, output, session){
   )
   
   #Capture zoom from relayout events for regenerating plot.
-  observeEvent(plot_event_data("plotly_relayout", "peakmeister_selected"), {
+  observe_action(plot_event_data("plotly_relayout", "peakmeister_selected"), {
     rd <- plot_event_data("plotly_relayout", "peakmeister_selected")
     if (!is.null(rd[["xaxis.range[0]"]])) {
       zoom_state$xmin <- rd[["xaxis.range[0]"]]
@@ -3706,7 +3804,7 @@ server <- function(input, output, session){
   })
   
   #Reset zoom when switching metabolites
-  observeEvent(input$plot_table_rows_selected, {
+  observe_action(input$plot_table_rows_selected, {
     zoom_state$xmin <- NULL
     zoom_state$xmax <- NULL
     zoom_state$ymin <- NULL
@@ -3714,7 +3812,7 @@ server <- function(input, output, session){
   }) 
   
   #Deal with events occuring on the plot (drawing boxes)
-  observeEvent(plot_event_data("plotly_relayout", "peakmeister_selected"), {
+  observe_action(plot_event_data("plotly_relayout", "peakmeister_selected"), {
     relayout_data <- plot_event_data("plotly_relayout", "peakmeister_selected")
     print(paste("Current drag_mode:", drag_mode()))
     print(relayout_data)
@@ -3965,7 +4063,7 @@ server <- function(input, output, session){
   
   
   #Intiialize reactive values 
-  observeEvent(input$file_selector, {
+  observe_action(input$file_selector, {
     req(loaded_plot_list_data())
     
     #Initialize reactive values only once when a new file is selected
@@ -4074,7 +4172,7 @@ server <- function(input, output, session){
     }, options = list(pageLength = 13), selection = 'multiple')
   }
 
-  observeEvent(input$delete_peak, {
+  observe_action(input$delete_peak, {
     delete_selected_peaks()
   })
   
@@ -4162,7 +4260,7 @@ server <- function(input, output, session){
     }
   }
 
-  observeEvent(input$deletemiddlepeaks, {
+  observe_action(input$deletemiddlepeaks, {
     delete_middle_peaks()
   })
   
@@ -4245,7 +4343,7 @@ server <- function(input, output, session){
     }
   }
 
-  observeEvent(input$deleteallpeaks, {
+  observe_action(input$deleteallpeaks, {
     delete_all_peaks()
   })
   
@@ -4298,7 +4396,7 @@ server <- function(input, output, session){
     }, options = list(pageLength = 13), selection = 'multiple')
   }
 
-  observeEvent(input$undo, {
+  observe_action(input$undo, {
     undo_peak_deletion()
   })
   
@@ -4715,7 +4813,7 @@ server <- function(input, output, session){
    )
    
    #Modal for other button that creates modal with three other buttons
-   observeEvent(input$other_options, {
+   observe_action(input$other_options, {
      showModal(modalDialog(
        title = "Additional Options",
        h5("Select an action:"),
@@ -4781,7 +4879,7 @@ server <- function(input, output, session){
       waiter_hide()
   }
 
-  observeEvent(input$regenerateplots, {
+  observe_action(input$regenerateplots, {
     regenerate_changed_plots()
   })
   
@@ -4791,7 +4889,7 @@ server <- function(input, output, session){
   }, selection = 'single')
   
   #Rebuild peak area csv
-  observeEvent(input$rebuild_peak_areas_modal, {
+  observe_action(input$rebuild_peak_areas_modal, {
     removeModal()
     tryCatch({
       regenerate_metabolite_peak_areas()
@@ -4802,7 +4900,7 @@ server <- function(input, output, session){
   })
   
   #Rebuild migration CSV
-  observeEvent(input$rebuild_mig_times_modal, {
+  observe_action(input$rebuild_mig_times_modal, {
     removeModal()
     tryCatch({
       regenerate_metabolite_migration_times()
@@ -4960,7 +5058,7 @@ server <- function(input, output, session){
   
   
   ######4.7.3 Applying Integration Functions######
-  observeEvent(input$manual_integrate, {
+  observe_action(input$manual_integrate, {
     #Check to see if the user has selected a row in the peak info table. If not, launch modal function.
     if (is.null(input$peak_info_table_rows_selected) || length(input$peak_info_table_rows_selected) == 0) {peak_input_modal()} else {
       manual_peak_integration(input$peak_info_table_rows_selected)
@@ -4985,7 +5083,7 @@ server <- function(input, output, session){
   })
   
   #Button for if user uses modal peak selection
-  observeEvent(input$confirm_peak_number, {
+  observe_action(input$confirm_peak_number, {
     removeModal()
     manual_peak_integration(input$manual_peak_number)
     regenerate_metabolite_peak_areas()
@@ -5134,7 +5232,7 @@ server <- function(input, output, session){
   
   ######4.7.5 Applying manual basline adjustment on individual peaks######
   #Toggle baseline adjustment mode for individual peaks
-  observeEvent(input$adjust_indiv_baseline, {
+  observe_action(input$adjust_indiv_baseline, {
     baseline_adjustment_mode(TRUE)
     plotbaseline_adjustment_mode(FALSE)
     showNotification("Baseline adjustment mode activated", type = "message")
@@ -5142,7 +5240,7 @@ server <- function(input, output, session){
   })
   
   #Observe click events on the plot only when baseline adjustment mode is active
-  observeEvent(plot_event_data("plotly_click", "peakmeister_selected"), {
+  observe_action(plot_event_data("plotly_click", "peakmeister_selected"), {
     if (baseline_adjustment_mode()) {
       click_data <- plot_event_data("plotly_click", "peakmeister_selected")
       if (!is.null(click_data)) {
@@ -5169,7 +5267,7 @@ server <- function(input, output, session){
   })
   
   #Button for if user uses modal peak selection for baseline adjustment
-  observeEvent(input$baseline_peak_number_adjustment, {
+  observe_action(input$baseline_peak_number_adjustment, {
     removeModal()
     adjust_individual_baseline(input$baseline_peak_number)
   })
@@ -5270,7 +5368,7 @@ server <- function(input, output, session){
   
   ######4.7.7 Applying baseline correction across all peaks in selected plot######
   #Button for the "adjust_all_baselines" button
-  observeEvent(input$adjust_all_baselines, {
+  observe_action(input$adjust_all_baselines, {
     plotbaseline_adjustment_mode(TRUE)
     baseline_adjustment_mode(FALSE) 
     show_adjust_all_baselines_modal()
@@ -5310,7 +5408,7 @@ server <- function(input, output, session){
   })
   
   #Observer for handling click data events on the plotly plot rendered in the modal to acquire the new baseline
-  observeEvent(plot_event_data("plotly_click", "peakmeister_baseline"), {
+  observe_action(plot_event_data("plotly_click", "peakmeister_baseline"), {
     if (plotbaseline_adjustment_mode()) {
       click_data <- plot_event_data("plotly_click", "peakmeister_baseline")
       if (!is.null(click_data)) {
@@ -5330,7 +5428,7 @@ server <- function(input, output, session){
   })
   
   #Observer for the "confirm_adjust_all_baselines" button
-  observeEvent(input$confirm_adjust_all_baselines, {
+  observe_action(input$confirm_adjust_all_baselines, {
     removeModal()
   })
   
@@ -5350,7 +5448,7 @@ server <- function(input, output, session){
 
   
   #Observe selected plots and render a combined subplot of these functions to zoom in on peaks
-    observe({
+    observe_updates({
       sel1 <- input$plottable1_rows_selected
       sel2 <- input$plottable2_rows_selected
       sel3 <- input$plottable3_rows_selected
@@ -5484,7 +5582,7 @@ server <- function(input, output, session){
     }, options = list(pageLength = 13), selection = 'multiple')
   }
 
-  observeEvent(input$interferences, {
+  observe_action(input$interferences, {
     mark_peak_interferences()
   })
   
@@ -5513,13 +5611,13 @@ server <- function(input, output, session){
   migration_times_data <- reactiveVal(NULL)
 
   # A different saved analysis must be loaded before downstream transformations.
-  observeEvent(input$results_folder2, {
+  observe_action(input$results_folder2, {
     peak_areas_data(NULL)
     migration_times_data(NULL)
   }, ignoreNULL = FALSE, priority = 100)
   
   #Observer for the action button
-  observeEvent(input$load_migration_area, {
+  observe_action(input$load_migration_area, {
     req(input$results_folder2)
     files <- grab_metabolite_files(input$results_folder2)
     peak_areas_data(files$peak_areas)
@@ -5535,7 +5633,7 @@ server <- function(input, output, session){
     })
   
   #Observe functions for selecting files and results folders to work with
-  observe({
+  observe_updates({
     results_folders_reactive()  # Refresh when completed results are discovered.
     files <- uploadedmz5()$FileName
     filename <- input$file_selector2
@@ -5548,7 +5646,7 @@ server <- function(input, output, session){
       selected = if (length(current) == 1L && current %in% folders) current else
         if (length(visualization) == 1L && visualization %in% folders) visualization else "")
   })
-  observe({
+  observe_updates({
     files <- uploadedmz5()$FileName
     current <- isolate(input$file_selector2)
     updateSelectInput(session, "file_selector2", choices = files,
@@ -5644,7 +5742,7 @@ server <- function(input, output, session){
 
   #####5.3 Normalize to Creatine, F-Phe, or Cl-Tyr#####
   #Show modal for normalization options
-  observeEvent(input$normalize, {
+  observe_action(input$normalize, {
     showModal(modalDialog(
       title = "Normalization Options",
       selectInput("normalize_by", "Normalize By", choices = c("114.0667_Creatinine", "184.0774_F-Phe", "216.0427_Cl-Tyr", "182.0617_F-Phe","198.0566_F-Tyr", "214.0271_Cl-Tyr","207.0115_NMS", "212.9412_Bromohypoxanthine")),
@@ -5657,7 +5755,7 @@ server <- function(input, output, session){
   })
   
   #Event handler for normalizing the data.
-  observeEvent(input$confirm_normalize, {
+  observe_action(input$confirm_normalize, {
     removeModal()
     
     #Load data and initialize the environment youre working in.
@@ -5706,7 +5804,7 @@ server <- function(input, output, session){
   }
 
   #####5.4 Replacing missing values in data#####
-  observeEvent(input$missing_data, {
+  observe_action(input$missing_data, {
     
     #Intialize environment, define variables
     results_folder2 <- main_folder2()
@@ -5765,7 +5863,7 @@ server <- function(input, output, session){
   #####5.5 Connect Peak Position with Metadata#####
   
   #Observe action button for connecting metadata
-  observeEvent(input$connect_metadata, {
+  observe_action(input$connect_metadata, {
     results_path <- main_folder2()
     data_folder <- file.path(results_path, "Data")
     
@@ -5819,7 +5917,7 @@ server <- function(input, output, session){
 
   #####5.6 Control Charts#####
   #Update the selectInput choices based on the reactive value
-  observe({
+  observe_updates({
     ref_data <- refMassListData()
     if (!is.null(ref_data) && nrow(ref_data) > 0) {
       updateSelectInput(session, "selected_metabolite", choices = ref_data$name)
@@ -5827,7 +5925,7 @@ server <- function(input, output, session){
   })
   
   ######5.6.1 Control Charts for Non-normalized data######
-  observeEvent(input$create_control_chart, {
+  observe_action(input$create_control_chart, {
     req(input$selected_metabolite)
     
     #Initialize environment, load data, acquire names of selected metabolite for control chart
@@ -5850,7 +5948,7 @@ server <- function(input, output, session){
   
   
   ######5.6.2 Control Charts for normalized data######
-  observeEvent(input$create_control_chart, {
+  observe_action(input$create_control_chart, {
     req(input$selected_metabolite)
     
     #Initialize environment, load data, acquire names of selected metabolite for control chart
@@ -6098,7 +6196,7 @@ server <- function(input, output, session){
   
   
   ######5.7.4 Output for CV processing######
-  observeEvent(input$compute_cv, {
+  observe_action(input$compute_cv, {
     # Clear previous results so rejected inputs cannot leave stale plots visible.
     output$average_cv_table <- renderTable(NULL)
     output$cv_plot <- renderPlotly(NULL)
@@ -6171,7 +6269,7 @@ server <- function(input, output, session){
     showNotification("Environemnt Initialized", type = "message")
   }
 
-  observeEvent(input$load_batchcorr_packages,{
+  observe_action(input$load_batchcorr_packages,{
     load_batch_correction_packages()
   })
   
@@ -6241,7 +6339,7 @@ server <- function(input, output, session){
     write.csv(BatchCorrResultsAntilog, file = "BatchCorrResultsAntilog.csv")
   }
 
-  observeEvent(input$batch_corr,{
+  observe_action(input$batch_corr,{
     apply_batch_correction()
   })
   
@@ -6295,7 +6393,7 @@ server <- function(input, output, session){
   }
 
   #####6.1 Generating Data Matrix for MetaboAnalyst#####
-  observeEvent(input$generate_matrix, {
+  observe_action(input$generate_matrix, {
 
     #Initialize environment
     data <- peak_areas_data()
@@ -6312,7 +6410,7 @@ server <- function(input, output, session){
       write.table(transposed_df, file.path(results_path, "Metaboanalyst_matrix.csv"), row.names = TRUE, col.names = FALSE, sep = ",", fileEncoding = "UTF-8")
       showNotification("Matrix Made", type = "message")
     }, error = function(e) {
-      showNotification("Failed to save matrix: " + e$message, type = "error")
+      showNotification(paste("Failed to save matrix:", conditionMessage(e)), type = "error")
     })
   })
   
@@ -6339,7 +6437,7 @@ server <- function(input, output, session){
   
   
   #Load adherence data
-  observeEvent(input$adherence_results,
+  observe_action(input$adherence_results,
                {
                 req(input$adherence_results)
                  #load data from uploaded file
@@ -6377,7 +6475,7 @@ server <- function(input, output, session){
     }
   }
 
-  observeEvent(input$drug_databases, {
+  observe_action(input$drug_databases, {
     load_drug_databases()
   })
   
@@ -6434,7 +6532,7 @@ server <- function(input, output, session){
       showNotification("DrugBank loaded and saved successfully!", type = "message")
   }
 
-  observeEvent(input$confirm_parse_drugbank,{
+  observe_action(input$confirm_parse_drugbank,{
     parse_and_save_drugbank()
   })
   

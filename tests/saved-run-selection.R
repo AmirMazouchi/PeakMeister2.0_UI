@@ -5,7 +5,7 @@ library(shiny)
 invisible(parse('ui.R'))
 expr<-parse('server.R')
 is_assign<-function(x,name) is.call(x)&&identical(x[[1]],as.name('<-'))&&identical(x[[2]],as.name(name))
-is_event<-function(x,name) is.call(x)&&identical(x[[1]],as.name('observeEvent'))&&identical(paste(deparse(x[[2]]),collapse=''),paste0('input$',name))
+is_event<-function(x,name) is.call(x)&&identical(x[[1]],as.name('observe_action'))&&identical(paste(deparse(x[[2]]),collapse=''),paste0('input$',name))
 text<-function(x) paste(deparse(x),collapse=' ')
 server_expr<-Filter(function(x)is_assign(x,'server'),as.list(expr))[[1]]
 statements<-as.list(server_expr[[3]][[3]])[-1]
@@ -15,14 +15,15 @@ first<-which(vapply(statements,is_assign,logical(1),name='empty_mz5_files'))
 last<-which(vapply(statements,is_event,logical(1),name='initialize'))
 engine<-statements[first:(last-1)]
 engine<-Filter(function(x)!grepl('^output\\$fileTable',text(x)),engine)
+guard_names<-c('action_label','report_action_error','with_action_error','observe_action','observe_updates')
 extra_names<-c('plot_list_data_values','run_metadata','previous_metadata','modified_peak_plots','plot_render_trigger','get_db_path','db_exists','list_results_folders','selected_results_filename','results_folders_reactive','last_results_filename','latest_results_folder','last_visualization_filename','db_con','clear_loaded_analysis','peak_areas_data','migration_times_data')
 extras<-lapply(extra_names,get_assign)
-selector<-Filter(function(x)is.call(x)&&identical(x[[1]],as.name('observeEvent'))&&grepl('^list\\(selected_results_filename\\(\\), results_folders_reactive\\(\\)\\)',text(x[[2]])),statements)
+selector<-Filter(function(x)is.call(x)&&identical(x[[1]],as.name('observe_action'))&&grepl('^list\\(selected_results_filename\\(\\), results_folders_reactive\\(\\)\\)',text(x[[2]])),statements)
 stopifnot(length(selector)==1)
-clear_file<-Filter(function(x)is.call(x)&&identical(x[[1]],as.name('observeEvent'))&&identical(text(x[[2]]),'selected_results_filename()'),statements)
+clear_file<-Filter(function(x)is.call(x)&&identical(x[[1]],as.name('observe_action'))&&identical(text(x[[2]]),'selected_results_filename()'),statements)
 init<-get_event('initialize');parts<-as.list(init[[3]])[-1]
 init[[3]]<-as.call(c(list(as.name('{')),parts[1:3],list(quote(events$analyses<-events$analyses+1L))))
-block<-as.call(c(list(as.name('{')),engine,extras,selector,clear_file,list(get_event('results_folder2'),init)))
+block<-as.call(c(list(as.name('{')),lapply(guard_names,get_assign),engine,extras,selector,clear_file,list(get_event('results_folder2'),init)))
 events<-new.env();events$updates<-list();events$notices<-character();events$nav<-NULL;events$analyses<-0L
 showNotification<-function(ui,...) {events$notices<-c(events$notices,as.character(ui));invisible(NULL)}
 updateSelectInput<-function(session,inputId,...) {events$updates[[inputId]]<-list(...);invisible(NULL)}

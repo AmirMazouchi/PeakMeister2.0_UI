@@ -36,6 +36,20 @@ ui.R
 
 server.R
 
+- Added shared guards for all existing button/upload/selection event handlers
+  and background observers. Ordinary R errors show a persistent, dismissible
+  message identifying the action and error, with details in the R console.
+- A failed action stops without closing the Shiny session. Loading waiters are
+  dismissed; failed database migration also closes its blocking progress modal.
+- Preserve normal Shiny req()/validation behavior and observer options. Existing
+  pipeline failure timing and cleanup continue to run before the UI guard.
+- Guard workbook downloads and remove partial temporary files on write errors.
+  Corrected MetaboAnalyst export error formatting to show the original I/O error.
+- Added tests/action-errors.R for real handler failures, continued sessions,
+  notifications, overlay cleanup, retries, and observer behavior. Updated existing
+  GUI/selection/quality tests to exercise the guarded registrations.
+- Error guards do not automatically undo data or files already changed by an
+  action before it failed; R-process termination is outside these guards.
 - Fixed the PCA panel's validate(NULL) method error by explicitly calling
   shiny::validate() and shiny::need(). The regression check reproduces the
   exact masked-validator error and verifies PCA display and error messages.

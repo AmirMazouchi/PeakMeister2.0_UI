@@ -9,7 +9,8 @@ is_assignment <- function(x, name) {
 server <- Filter(function(x) is_assignment(x, "server"), as.list(parse("server.R")))[[1]]
 statements <- as.list(server[[3]][[3]])[-1]
 assignment <- function(name) Filter(function(x) is_assignment(x, name), statements)[[1]]
-helper_names <- c("extract_mass", "calculate_cv", "pareto_scale", "remove_zero_variance",
+helper_names <- c("action_label", "report_action_error", "with_action_error", "observe_action",
+                  "observe_updates", "extract_mass", "calculate_cv", "pareto_scale", "remove_zero_variance",
                   "perform_pca", "compute_quality_metrics", "build_quality_cv_plot", "build_quality_pca_plot")
 helpers <- new.env(parent = globalenv())
 for (name in helper_names) eval(assignment(name), helpers)
@@ -91,7 +92,7 @@ stopifnot(is.null(helpers$perform_pca(numeric_data[1:2, ])),
 
 # Exercise actual Shiny observer clicks, including failure and recovery. The
 # artificial failure uses the exact NULL-object error reported by the user.
-observer <- Filter(function(x) is.call(x) && identical(x[[1]], as.name("observeEvent")) &&
+observer <- Filter(function(x) is.call(x) && identical(x[[1]], as.name("observe_action")) &&
                      identical(x[[2]], quote(input$compute_cv)), statements)[[1]]
 result_folder <- tempfile("quality-metrics-"); dir.create(file.path(result_folder, "Data"), recursive = TRUE)
 testServer(function(input, output, session) {

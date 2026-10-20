@@ -16,6 +16,7 @@ processing starts on **Engine**.
 
 | Task | Function(s) | UI page / trigger |
 | --- | --- | --- |
+| Catch action/update errors and keep the session open | `observe_action()`, `observe_updates()`, `with_action_error()`, `report_action_error()`, `action_label()` | All pages → existing button, upload, selection and background-update handlers |
 | Coordinate uploaded files and process each file | `run_new_analysis()`, `process_mz5_file()` | Engine → New analysis → Initialize Run |
 | Validate parameters and calculate/override migration indexes | `prepare_analysis_parameters()` | Engine → New analysis → Initialize Run |
 | Read the temporary raw file | `read_mz5_data()` | Engine → New analysis → Initialize Run |
@@ -72,12 +73,33 @@ handler catches errors without ending the session.
 PCA panel checks explicitly call `shiny::validate()` and `shiny::need()` so
 other packages' validators cannot mask Shiny's display validation.
 
+All existing event handlers now register through `observe_action()` and plain
+background observers through `observe_updates()`. These call a shared error
+guard, which stops a failed action, displays a persistent dismissible notification
+with the action name and error message, and logs the condition/call to the R
+console. Loading waiters are released after errors; a failed database migration
+also dismisses its non-closeable progress modal. Missing-input `req()` conditions
+and Shiny validation retain their normal silent/inline behavior. Handler options
+such as priority, ignoreInit, ignoreNULL and once are forwarded to Shiny.
+
+The parameter-workbook download content is guarded too: a failed write removes
+the partial temporary download file. The MetaboAnalyst save-error message now
+formats the original I/O error correctly. Plot/table outputs continue to use
+Shiny's existing inline error handling.
+
+These guards cover ordinary R errors in actions/updates; they do not undo
+reactive-state changes or file/database writes completed before an error. Existing
+pipeline error timing and resource cleanup still run before the error reaches
+the UI guard. Startup failures and termination of the R process are outside this
+session-level protection.
+
 Validation:
 
 - `Rscript --vanilla tests/gui-startup.R`
 - `Rscript --vanilla tests/saved-run-selection.R`
 - `Rscript --vanilla tests/modular-server.R`
 - `Rscript --vanilla tests/quality-metrics.R`
+- `Rscript --vanilla tests/action-errors.R`
 - `Rscript --vanilla tests/modular-equivalence.R /path/to/previous/server.R`
 
 The processing tests use synthetic spectra/traces and a trapezoid-integration
@@ -96,6 +118,13 @@ The observer is also tested with `jsonlite` loaded after Shiny and an S3
 validator that reproduces the reported `validate(NULL)` method error.
 The native PCA scores and eigenvalues were also compared with FactoMineR's
 full-SVD reference source, independently of irlba.
+
+The action-error tests audit observer registrations and active button coverage,
+then exercise real metadata, batch, workbook upload, integration, raw-run timing,
+and download callback failures. They verify that the session stays open,
+notifications identify the action, loading waiters are hidden, failed downloads
+are removed, and corrected input can be retried. They also verify silent
+validation, early returns, observer isolation and once behavior.
 
 A complete analysis of a real `.mz5` file was not run in this environment;
 MSnbase/mzR and the full scientific dependency set are unavailable here.
