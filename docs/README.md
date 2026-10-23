@@ -228,15 +228,29 @@ This is the default tab for displaying the plots. The user selects a plot from t
 
 1. *Delete Selected Peaks*
 
-This button is for deleting peaks such as any instances where PeakMeister has misannoatated a peak. Users can select indivdual peaks or multiple peaks at once by selecting the corresponding row in the displayed table of the plot data. Peaks are then deleted by clicking "Delete Selected Peaks" after row selection. This will change the metadata associated with the plot. Deleted peaks are replaced with the label "NPD" which corresponds to "No peak detected." This does **not** directly update the stored peak area information, but it stores the metadata information with the deleted peaks for use in regenerating the peak area excel file at a later step. Upon deleting a peak, the peak name will be marked as "edited" and appear in the table of edited plots to be regenerated. 
+Select one or more rows in **Peak Position Information** below the plot, then
+click **Delete Selected Peaks**. The selected peaks are marked **NPD** (No peak
+detected), their integration shading is removed, and the edited analysis's saved
+peak tables and CSVs are updated. The measured electropherogram remains available
+for later reintegration. The plot is marked for regeneration of saved PNGs.
 
-2. *Undo Peak Deletion*
+2. *Undo / Redo and preserving the original analysis*
 
-This button is for undoing peak deleting **PRIOR** to regenerating the plots. This is used in case the user accidentally deletes the wrong. It will return the metadata to whatever it was prior to the last peak deletion event. Note: this can only undo the previous peak deletion and this will reset if the user switches files.  
+The first peak edit creates a separate saved analysis copy. The app switches to
+that copy and labels it **(edited)** in the saved-analysis selector. The original
+analysis stays available in the same selector. Reopening an edited copy resumes
+editing that copy.
 
-If there is no valid deletion history for the current analysis, the app shows
-"There is no peak deletion to undo for this analysis" and leaves saved data
-unchanged. Snapshot writes also reject incomplete tables or missing traces.
+Click **Undo** repeatedly to reverse previous peak edits, including deletions,
+manual integration, baseline adjustments and interference flags. Click **Redo**
+to reapply an undone action. Deleting several selected rows in one click is one
+action. Applying a new edit after Undo discards the remaining Redo branch.
+The action count is shown beside these controls, and history survives reopening
+the edited analysis. Undo/Redo updates saved peak tables, CSVs and the live plot;
+use **Other → Regenerate Changed Plots** to refresh saved PNGs.
+
+When there are no actions to undo or redo, the app shows a message and leaves
+saved data unchanged. Snapshot writes reject incomplete tables or missing traces.
 
 3. *Manually Adjust Integration* 
 

@@ -25,8 +25,8 @@ counts <- new.env(); counts$messages <- character(); counts$errors <- character(
 showNotification <- function(ui, ...) { counts$messages <- c(counts$messages, as.character(ui)); invisible(NULL) }
 names_to_load <- c("action_label", "report_action_error", "with_action_error", "observe_action",
   "read_saved_electropherogram", "validate_analysis_snapshot", "save_analysis_snapshot",
-  "save_plot_data", "undo_peak_deletion", "clear_loaded_analysis", "initialize_db",
-  "plot_list_data_values", "run_metadata", "previous_metadata", "modified_peak_plots", "plot_render_trigger", "db_con")
+  "save_plot_data", "undo_peak_deletion", "step_peak_history", "peak_history_position", "clear_loaded_analysis", "initialize_db",
+  "editing_context", "edit_history_trigger", "peak_edit_in_progress", "plot_list_data_values", "run_metadata", "previous_metadata", "modified_peak_plots", "plot_render_trigger", "db_con")
 harness <- function(input, output, session) {
   for (name in names_to_load) eval(assignment(name), environment())
   main_folder <- reactive(input$results_folder)
@@ -58,31 +58,23 @@ testServer(harness, {
   same(lapply(dbListTables(connection), function(table) dbReadTable(connection, table)), database_before)
   same(readBin(snapshot_path, "raw", n = file.info(snapshot_path)$size), before)
   put_state(plot_list_data_values, snapshot)
-  # Incomplete, foreign-file and malformed histories cannot be saved or activated.
+  # Old in-memory history cannot be mistaken for persistent committed actions.
   put_state(previous_metadata, make_snapshot(20)); previous_metadata$file_name <- "Run01.mz5"
-  previous_metadata$mi_df <- NULL; session$setInputs(undo = 2)
-  put_state(previous_metadata, make_snapshot(20)); previous_metadata$file_name <- "Run02.mz5"
-  session$setInputs(undo = 3)
-  previous_metadata$file_name <- "Run01.mz5"
-  previous_metadata$plot_list <- list(Target = list(eie_data = NULL))
-  session$setInputs(undo = 4)
-  stopifnot(length(counts$messages) == 3L, length(counts$errors) == 1L)
+  session$setInputs(undo = 2)
   same(readBin(snapshot_path, "raw", n = file.info(snapshot_path)$size), before)
   same(run_metadata$plot_list, snapshot$plot_list)
-  # An intact matching history remains saveable and is restored without NULLs.
+  # A valid snapshot remains saveable without NULLs or duplicate names.
   restored <- make_snapshot(30)
-  put_state(previous_metadata, restored); previous_metadata$file_name <- "Run01.mz5"
-  session$setInputs(undo = 5)
+  do.call(save_analysis_snapshot, c(list(subfolder_path = path), restored))
   loaded <- new.env(); saved_names <- load(snapshot_path, loaded)
   stopifnot(length(saved_names) == 6L, !anyDuplicated(saved_names))
   same(as.list(loaded)[names(restored)], restored)
-  same(run_metadata$plot_list, restored$plot_list)
   # Clearing/switching analyses invalidates Undo; a later click leaves the file intact.
   good_bytes <- readBin(snapshot_path, "raw", n = file.info(snapshot_path)$size)
   clear_loaded_analysis(); session$setInputs(undo = 6)
   same(readBin(snapshot_path, "raw", n = file.info(snapshot_path)$size), good_bytes)
-  stopifnot(length(counts$messages) == 4L, is.null(run_metadata$plot_list))
+  stopifnot(length(counts$messages) == 3L, is.null(run_metadata$plot_list))
   dbDisconnect(connection)
 })
 unlink(work, recursive = TRUE)
-cat("PASS: Undo with empty, incomplete, foreign or malformed history preserves files/state; invalid edits preserve SQLite; valid snapshots restore; cleared sessions cannot overwrite saved traces.\n")
+cat("PASS: empty Undo and obsolete one-slot state cannot overwrite saved files; invalid direct edits preserve SQLite; snapshot validation and cleared-session safety remain intact.\n")

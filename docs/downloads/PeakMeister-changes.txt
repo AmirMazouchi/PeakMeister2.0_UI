@@ -9,10 +9,11 @@ workflows that were later replaced are described only in their final form.
 
 ui.R
 
+- Replaced Undo Peak Deletion with Undo and Redo buttons covering all peak
+  edits, and added the number of actions available in each direction.
 - Removed Visualization's unused Uploaded .RData file box and Clear uploaded
   data button. Existing analyses open through Engine's run-folder selection
   and Visualization's saved-analysis selector.
-- The modular refactor uses the existing ui.R without changing GUI controls.
 - Added separate New analysis and Open existing analysis modes in Engine.
 - New analysis retains real .mz5 uploads, multiple-file selection, and the
   optional automatic start after uploading.
@@ -39,16 +40,33 @@ ui.R
 
 server.R
 
+- Create a separate analysis copy on the first peak edit or Visualization
+  CSV/plot regeneration. Keep the original folder unchanged, automatically
+  select the copy and label it (edited) in the analysis selectors.
+- Store multi-step, per-file Undo/Redo in SQLite for selected/middle/all peak
+  deletions, integrations, individual/all baseline adjustments and interference
+  flags. History survives reopening. A multi-peak action is one history step.
+- A new edit discards the Redo branch; no-op actions do not. History omits EIE
+  vectors and stores only editable state. Empty Undo/Redo shows a message.
+- Restore SQLite tables, RData, CSVs and live peak views together. Keep pending
+  plot-regeneration markers across reopening. Preserve migration-time units
+  as minutes after moving an apex. Regenerate PNGs through Other as before.
+- Save peak changes and history in one SQLite transaction. Validate and stage
+  RData replacements; ordinary failures restore state and roll back edits.
+- Remove the old RData-only initializer so it cannot replace current SQL edits.
+- Add tests/peak-edit-history.R for real action handlers, preserved originals,
+  mixed edits, persistent history, redo branching, grouped/no-op actions,
+  SQLite/RData/CSV restoration, failed writes and run isolation.
 - Found a pre-refactor data-loss bug: Undo with no previous deletion could save
   six NULL objects over plot_list_data.RData. Reproduced the uploaded 122-byte
   file structure with the second branch's actual Undo observer and reproduced
   the names/vector loading error with the uploaded RData and SQLite files.
-- Refuse empty, incomplete or foreign-file Undo history before changing state
-  or files. Deletion actions now capture the filename for the Undo check.
+- Empty Undo/Redo never activates an in-memory NULL snapshot. Persistent history
+  is scoped to the selected file and edited analysis.
 - Validate full snapshot tables and electropherograms before saving, including
   before a plot edit deletes SQLite rows. Snapshot saves share that validation.
-- Added tests/undo-safety.R for unchanged saved files/state on invalid Undo,
-  invalid-edit SQLite preservation, and a valid saved snapshot restoration.
+- Keep tests/undo-safety.R for empty Undo, obsolete one-slot state rejection,
+  incomplete snapshots and edits outside a transaction.
 - These guards prevent future empty overwrites. Already-missing traces require
   an intact backup, saved Plotly traces, or reprocessing; they are not in SQLite.
 - Replaced duplicate saved-analysis load observers with one observer for both
@@ -79,8 +97,8 @@ server.R
 - Added tests/action-errors.R for real handler failures, continued sessions,
   notifications, overlay cleanup, retries, and observer behavior. Updated existing
   GUI/selection/quality tests to exercise the guarded registrations.
-- Error guards do not automatically undo data or files already changed by an
-  action before it failed; R-process termination is outside these guards.
+- Outside peak-edit transactions, error guards do not automatically undo data
+  or files already changed by an action before it failed; R-process termination is outside these guards.
 - Fixed the PCA panel's validate(NULL) method error by explicitly calling
   shiny::validate() and shiny::need(). The regression check reproduces the
   exact masked-validator error and verifies PCA display and error messages.

@@ -17,17 +17,29 @@ normalize <- function(x) {
 }
 for (pair in list(c('delete_peak','delete_selected_peaks'), c('deletemiddlepeaks','delete_middle_peaks'),
   c('deleteallpeaks','delete_all_peaks'),
-  c('regenerateplots','regenerate_changed_plots'), c('interferences','mark_peak_interferences'),
+  c('interferences','mark_peak_interferences'),
   c('load_batchcorr_packages','load_batch_correction_packages'), c('batch_corr','apply_batch_correction'),
   c('drug_databases','load_drug_databases'), c('confirm_parse_drugbank','parse_and_save_drugbank'))) {
   original <- Filter(function(x) is.call(x) && identical(x[[1]], as.name('observeEvent')) && identical(x[[2]], as.call(list(as.name('$'), as.name('input'), as.name(pair[1])))), before_statements)[[1]][[3]]
   current <- body(tasks[[pair[2]]])
-  # Deletions now also record the filename used by the Undo guard. Undo itself
-  # intentionally differs from the unsafe original and has its own behavior test.
-  if (pair[2] %in% c('delete_selected_peaks', 'delete_middle_peaks', 'delete_all_peaks')) {
-    filename_capture <- quote(previous_metadata$file_name <- run_metadata$file_name)
-    current <- as.call(Filter(function(x) !identical(x, filename_capture), as.list(current)))
+  # Peak actions now run inside one history transaction. Compare their original
+  # processing bodies after removing the obsolete single-slot history capture.
+  wrapped <- Filter(function(x) is.call(x) && identical(x[[1]], as.name('perform_peak_edit')), as.list(current)[-1])
+  if (length(wrapped)) current <- wrapped[[1]][[3]][[3]]
+  strip_history_capture <- function(body) as.call(Filter(function(x) {
+    !(is.call(x) && identical(x[[1]], as.name('<-')) && is.call(x[[2]]) &&
+      identical(x[[2]][[1]], as.name('$')) && identical(x[[2]][[2]], as.name('previous_metadata')))
+  }, as.list(body)))
+  original <- strip_history_capture(original)
+  current <- strip_history_capture(current)
+  # Visualization writes resolve to the active edited copy rather than the
+  # browser's previous selection during its first-edit transition.
+  substitute_folder <- function(x) {
+    if (identical(x, quote(input$results_folder))) return(quote(main_folder()))
+    if (is.call(x)) return(as.call(lapply(as.list(x), substitute_folder)))
+    x
   }
+  original <- substitute_folder(original)
   stopifnot(identical(normalize(original), normalize(current)))
 }
 
@@ -84,4 +96,4 @@ for (run in c('Run01','Run02')) {
   same(at[,c('file','stage','status')],bt[,c('file','stage','status')])
 }
 setwd(original_dir); unlink(comparison, recursive = TRUE)
-cat('PASS: old/new two-file pipeline produces identical CSVs, saved analysis objects, all SQLite tables, Plotly traces/layouts and stage/status sequences; nine moved GUI action bodies match apart from Undo filename capture. Undo safety is tested separately.\n')
+cat('PASS: old/new two-file pipeline produces identical CSVs, saved analysis objects, all SQLite tables, Plotly traces/layouts and stage/status sequences; eight unchanged GUI task bodies match within the new transaction wrappers. Editing/history safety is tested separately.\n')

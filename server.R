@@ -1,6 +1,9 @@
-# Undo refuses an empty or mismatched deletion history before changing state or
-# files. Snapshot writes validate traces and tables first, including before any
-# SQLite edit, so an empty session cannot overwrite saved electropherograms.
+# Peak edits use a separate analysis copy. Persistent SQLite action history
+# supports multi-step Undo/Redo for deletions, integration, baselines and flags;
+# restoring a step updates peak tables, the RData snapshot and CSV exports.
+# Original analysis folders are preserved. History excludes immutable traces.
+# Empty Undo/Redo leaves saved data unchanged. Snapshot writes validate traces
+# and tables before peak-data writes, so an empty session cannot overwrite EIEs.
 # Saved-analysis loading runs once per connection/file change. Saved traces are
 # matched by exact list name or a unique saved label, with checks for missing or
 # malformed traces. RData is read once per file; SQLite edits remain authoritative.
@@ -10,7 +13,7 @@
 # Shared action guards catch ordinary R errors in buttons, uploads, selection
 # events and background observers. They show the action/error, log details,
 # release loading overlays and keep the session open. Shiny validation remains
-# silent/inline; completed writes are not rolled back. All helpers stay here.
+# silent/inline; peak transactions handle edit rollback. All helpers stay here.
 # PCA panel validation uses shiny::validate/shiny::need explicitly so packages
 # loaded after Shiny cannot mask the display check with a different validator.
 # Quality/CV stability: validate metadata, QC groups and numeric inputs before
@@ -75,7 +78,7 @@ server <- function(input, output, session){
       file_selector = "Select visualization file", draw_mode = "Change plot interaction mode",
       plot_table_rows_selected = "Select plot", delete_peak = "Delete Selected Peaks",
       deletemiddlepeaks = "Delete Middle Peaks", deleteallpeaks = "Delete all peaks",
-      undo = "Undo Peak Deletion", other_options = "Other plot options",
+      undo = "Undo peak edit", redo = "Redo peak edit", other_options = "Other plot options",
       regenerateplots = "Regenerate Changed Plots", rebuild_peak_areas_modal = "Rebuild Peak Area CSV",
       rebuild_mig_times_modal = "Rebuild Peak Migration Time CSV",
       manual_integrate = "Manually Adjust Integration", confirm_peak_number = "Confirm peak integration",
@@ -2609,8 +2612,13 @@ server <- function(input, output, session){
   # Save the named RData objects used by Visualization and database migration.
   save_analysis_snapshot <- function(subfolder_path, plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df) {
     validate_analysis_snapshot(plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df)
+    temporary <- tempfile(".peakmeister-snapshot-", tmpdir = subfolder_path, fileext = ".RData")
+    on.exit(unlink(temporary), add = TRUE)
     save(plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df,
-         file = file.path(subfolder_path, "plot_list_data.RData"))
+         file = temporary)
+    if (!file.rename(temporary, file.path(subfolder_path, "plot_list_data.RData"))) {
+      stop("Could not replace the saved analysis snapshot. The previous snapshot was kept.")
+    }
   }
 
   # Write the existing SQLite schema; always close this writer connection.
@@ -2825,8 +2833,15 @@ server <- function(input, output, session){
   )
   
   #Reactive expression to store the path to the selected results folder. Required to grab the correct annotation_data information from the subsequent runs and useful for processing data if you have closed the app.
+  editing_context <- reactiveVal(NULL)
+  edit_history_trigger <- reactiveVal(0L)
+  peak_edit_in_progress <- reactiveVal(FALSE)
+
   main_folder <- reactive({
-    req(input$results_folder, input$results_folder %in% results_folders_reactive())
+    context <- editing_context()
+    if (!is.null(context) && identical(input$results_folder, context$selected_folder)) return(context$folder)
+    req(input$results_folder, input$results_folder %in% results_folders_reactive() ||
+          file.exists(file.path(input$results_folder, ".peakmeister-edit-copy.rds")))
     input$results_folder
   })
   
@@ -3496,7 +3511,7 @@ server <- function(input, output, session){
     current <- input$results_folder
     same_file <- identical(filename, last_results_filename())
     last_results_filename(filename)
-    choices <- c("Select a saved analysis" = "", stats::setNames(folders, basename(folders)))
+    choices <- c("Select a saved analysis" = "", analysis_folder_choices(folders))
     selected <- if (same_file && length(current) == 1L && current %in% folders) current else
       if (analysis_mode() == "existing" && length(selected_saved_run())) latest_results_folder(folders) else ""
     updateSelectInput(session, "results_folder", choices = choices, selected = selected)
@@ -3504,7 +3519,236 @@ server <- function(input, output, session){
 
   db_con <- reactiveVal(NULL)
 
+  # A marker distinguishes intentionally editable copies from original analyses.
+  analysis_folder_choices <- function(folders) {
+    edited <- file.exists(file.path(folders, ".peakmeister-edit-copy.rds"))
+    stats::setNames(folders, paste0(basename(folders), ifelse(edited, " (edited)", "")))
+  }
+
+  initialize_peak_history <- function(con) {
+    DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS peak_edit_history (
+      step INTEGER PRIMARY KEY AUTOINCREMENT, file_name TEXT NOT NULL,
+      action TEXT NOT NULL, before_state BLOB NOT NULL, after_state BLOB NOT NULL,
+      changed_plots BLOB NOT NULL, created_at TEXT NOT NULL)")
+    DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS peak_edit_cursor (
+      file_name TEXT PRIMARY KEY, step INTEGER NOT NULL)")
+    DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS peak_edit_dirty_plots (
+      file_name TEXT NOT NULL, plot_name TEXT NOT NULL, PRIMARY KEY (file_name, plot_name))")
+  }
+
+  pending_peak_plots <- function(con, file_name) {
+    if (!DBI::dbExistsTable(con, "peak_edit_dirty_plots")) return(character())
+    DBI::dbGetQuery(con, "SELECT plot_name FROM peak_edit_dirty_plots WHERE file_name = ? ORDER BY plot_name",
+                    params = list(file_name))$plot_name
+  }
+
+  mark_pending_peak_plots <- function(con, file_name, plots) {
+    for (plot in plots) DBI::dbExecute(con,
+      "INSERT OR IGNORE INTO peak_edit_dirty_plots (file_name, plot_name) VALUES (?, ?)", params = list(file_name, plot))
+  }
+
+  peak_history_position <- function(con, file_name) {
+    if (length(file_name) != 1L || is.null(con) || !DBI::dbIsValid(con) || !DBI::dbExistsTable(con, "peak_edit_history")) {
+      return(list(step = 0L, undo = 0L, redo = 0L))
+    }
+    cursor <- DBI::dbGetQuery(con, "SELECT step FROM peak_edit_cursor WHERE file_name = ?", params = list(file_name))$step
+    if (!length(cursor)) cursor <- 0L
+    steps <- DBI::dbGetQuery(con, "SELECT step FROM peak_edit_history WHERE file_name = ?", params = list(file_name))$step
+    list(step = cursor, undo = sum(steps <= cursor), redo = sum(steps > cursor))
+  }
+
+  # Copy the complete analysis and use SQLite's backup API to include WAL data.
+  # The context bridges the first edit until the browser selects the new folder.
+  ensure_editable_analysis <- function() {
+    req(db_con(), input$file_selector)
+    source <- main_folder()
+    marker <- file.path(source, ".peakmeister-edit-copy.rds")
+    if (file.exists(marker)) {
+      initialize_peak_history(db_con())
+      return(invisible(source))
+    }
+    validate_analysis_snapshot(plot_list_data_values$plot_list, plot_list_data_values$peaks_df,
+      plot_list_data_values$mi_df, plot_list_data_values$peak_mt_df,
+      plot_list_data_values$peak_area_df, plot_list_data_values$comment_df)
+    target <- create_results_folder(input$file_selector)
+    copied <- FALSE
+    connection <- NULL
+    on.exit(if (!copied) {
+      if (!is.null(connection) && DBI::dbIsValid(connection)) DBI::dbDisconnect(connection)
+      unlink(target, recursive = TRUE)
+    }, add = TRUE)
+    shiny::withProgress(message = "Creating an edited analysis copy", value = 0, {
+      shiny::incProgress(0.1)
+      entries <- list.files(source, all.files = TRUE, no.. = TRUE, full.names = TRUE)
+      entries <- entries[!basename(entries) %in% c("results.sqlite", "results.sqlite-wal", "results.sqlite-shm")]
+      if (length(entries) && !all(file.copy(entries, target, recursive = TRUE, copy.date = TRUE))) {
+        stop("Could not create the editable analysis copy. Original results were kept.")
+      }
+      shiny::incProgress(0.7, detail = "Copying the result database")
+      destination <- DBI::dbConnect(RSQLite::SQLite(), get_db_path(target))
+      tryCatch(RSQLite::sqliteCopyDatabase(db_con(), destination), finally = DBI::dbDisconnect(destination))
+      shiny::incProgress(0.2)
+    })
+    saveRDS(list(version = 1L, original = normalizePath(source), created_at = as.character(Sys.time())),
+            file.path(target, ".peakmeister-edit-copy.rds"))
+    connection <- open_db(target)
+    initialize_peak_history(connection)
+    old <- db_con()
+    editing_context(list(selected_folder = input$results_folder, folder = target))
+    db_con(connection)
+    tryCatch(DBI::dbDisconnect(old), error = function(e) NULL)
+    copied <- TRUE
+    folders <- list_results_folders(input$file_selector, selected_saved_run())
+    updateSelectInput(session, "results_folder", choices = c("Select a saved analysis" = "", analysis_folder_choices(folders)),
+                      selected = target)
+    updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "", analysis_folder_choices(folders)),
+                      selected = target)
+    showNotification(paste("Edits are saved in", basename(target), "(edited). The original analysis is preserved."), type = "message")
+    invisible(target)
+  }
+
+  capture_peak_state <- function() {
+    keys <- c("plot_list", "comment_df", "peaks_df", "peak_mt_df", "peak_area_df", "mi_df")
+    state <- stats::setNames(lapply(keys, function(key) plot_list_data_values[[key]]), keys)
+    state$modified <- modified_peak_plots$names
+    # EIE vectors are immutable and can be large; only editable data goes in history.
+    state$plot_list <- lapply(state$plot_list, function(plot) { plot$eie_data <- NULL; plot })
+    state
+  }
+
+  apply_peak_state <- function(state, changed = character()) {
+    traces <- lapply(plot_list_data_values$plot_list, function(plot) plot$eie_data)
+    for (name in names(state$plot_list)) state$plot_list[[name]]$eie_data <- traces[[name]]
+    validate_analysis_snapshot(state$plot_list, state$peaks_df, state$mi_df,
+                               state$peak_mt_df, state$peak_area_df, state$comment_df)
+    for (key in c("plot_list", "comment_df", "peaks_df", "peak_mt_df", "peak_area_df", "mi_df")) {
+      plot_list_data_values[[key]] <- state[[key]]
+      run_metadata[[key]] <- state[[key]]
+    }
+    modified_peak_plots$names <- unique(c(state$modified, changed))
+  }
+
+  save_current_peak_snapshot <- function() {
+    save_analysis_snapshot(file.path(main_folder(), "Data", input$file_selector),
+      plot_list_data_values$plot_list, plot_list_data_values$peaks_df, plot_list_data_values$mi_df,
+      plot_list_data_values$peak_mt_df, plot_list_data_values$peak_area_df, plot_list_data_values$comment_df)
+  }
+
+  export_edited_peak_tables <- function() {
+    # An export failure must not disguise a successfully committed edit/history step.
+    with_action_error({ regenerate_metabolite_peak_areas(); regenerate_metabolite_migration_times() },
+                       "Export edited peak tables")
+  }
+
+  perform_peak_edit <- function(action, callback) {
+    req(db_con(), input$file_selector, plot_list_data_values$plot_list)
+    ensure_editable_analysis()
+    con <- db_con()
+    file_name <- sub("\\.mz5$", "", input$file_selector)
+    before <- capture_peak_state()
+    DBI::dbBegin(con)
+    peak_edit_in_progress(TRUE)
+    completed <- FALSE
+    on.exit(peak_edit_in_progress(FALSE), add = TRUE)
+    on.exit(if (!completed) {
+      tryCatch(DBI::dbRollback(con), error = function(e) NULL)
+      apply_peak_state(before)
+      tryCatch(save_current_peak_snapshot(), error = function(e) message("Snapshot rollback: ", conditionMessage(e)))
+      plot_render_trigger(plot_render_trigger() + 1L)
+    }, add = TRUE)
+    value <- callback()
+    after <- capture_peak_state()
+    left <- before; right <- after; left$modified <- NULL; right$modified <- NULL
+    if (identical(left, right)) {
+      DBI::dbRollback(con)
+      apply_peak_state(before)
+      completed <- TRUE
+      return(invisible(value))
+    }
+    changed <- names(after$plot_list)[!vapply(names(after$plot_list), function(name)
+      identical(before$plot_list[[name]], after$plot_list[[name]]), logical(1))]
+    changed <- paste0(file_name, "_", changed)
+    cursor <- peak_history_position(con, file_name)$step
+    DBI::dbExecute(con, "DELETE FROM peak_edit_history WHERE file_name = ? AND step > ?", params = list(file_name, cursor))
+    DBI::dbExecute(con, "INSERT INTO peak_edit_history (file_name, action, before_state, after_state, changed_plots, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)", params = list(file_name, action, list(serialize(before, NULL)),
+        list(serialize(after, NULL)), list(serialize(changed, NULL)), as.character(Sys.time())))
+    step <- DBI::dbGetQuery(con, "SELECT last_insert_rowid() AS step")$step
+    DBI::dbExecute(con, "INSERT OR REPLACE INTO peak_edit_cursor (file_name, step) VALUES (?, ?)", params = list(file_name, step))
+    mark_pending_peak_plots(con, file_name, changed)
+    save_current_peak_snapshot()
+    DBI::dbCommit(con)
+    completed <- TRUE
+    apply_peak_state(after)
+    modified_peak_plots$names <- pending_peak_plots(con, file_name)
+    edit_history_trigger(edit_history_trigger() + 1L)
+    plot_render_trigger(plot_render_trigger() + 1L)
+    export_edited_peak_tables()
+    invisible(value)
+  }
+
+  step_peak_history <- function(direction) {
+    req(direction %in% c("undo", "redo"))
+    con <- db_con()
+    file_name <- sub("\\.mz5$", "", input$file_selector)
+    position <- peak_history_position(con, file_name)
+    if ((direction == "undo" && !position$undo) || (direction == "redo" && !position$redo)) {
+      showNotification(paste("There are no changes to", direction, "for this analysis."), type = "message")
+      return(invisible(FALSE))
+    }
+    req(plot_list_data_values$plot_list)
+    query <- if (direction == "undo") "SELECT * FROM peak_edit_history WHERE file_name = ? AND step = ?" else
+      "SELECT * FROM peak_edit_history WHERE file_name = ? AND step > ? ORDER BY step LIMIT 1"
+    entry <- DBI::dbGetQuery(con, query, params = list(file_name, position$step))
+    target <- unserialize(entry[[if (direction == "undo") "before_state" else "after_state"]][[1]])
+    changed <- unserialize(entry$changed_plots[[1]])
+    before <- capture_peak_state()
+    DBI::dbBegin(con)
+    peak_edit_in_progress(TRUE)
+    completed <- FALSE
+    on.exit(peak_edit_in_progress(FALSE), add = TRUE)
+    on.exit(if (!completed) {
+      tryCatch(DBI::dbRollback(con), error = function(e) NULL)
+      apply_peak_state(before)
+      tryCatch(save_current_peak_snapshot(), error = function(e) message("Snapshot rollback: ", conditionMessage(e)))
+      plot_render_trigger(plot_render_trigger() + 1L)
+    }, add = TRUE)
+    apply_peak_state(target, changed)
+    metabolites <- substring(changed, nchar(file_name) + 2L)
+    for (name in intersect(names(plot_list_data_values$plot_list), metabolites)) {
+      save_plot_data(name, refresh = FALSE)
+    }
+    step <- if (direction == "redo") entry$step else {
+      previous <- DBI::dbGetQuery(con, "SELECT MAX(step) AS step FROM peak_edit_history WHERE file_name = ? AND step < ?",
+                                 params = list(file_name, entry$step))$step
+      if (is.na(previous)) 0L else previous
+    }
+    DBI::dbExecute(con, "UPDATE peak_edit_cursor SET step = ? WHERE file_name = ?", params = list(step, file_name))
+    mark_pending_peak_plots(con, file_name, changed)
+    save_current_peak_snapshot()
+    DBI::dbCommit(con)
+    completed <- TRUE
+    modified_peak_plots$names <- pending_peak_plots(con, file_name)
+    edit_history_trigger(edit_history_trigger() + 1L)
+    plot_render_trigger(plot_render_trigger() + 1L)
+    export_edited_peak_tables()
+    showNotification(paste(if (direction == "undo") "Undid:" else "Redid:", entry$action), type = "message")
+    invisible(TRUE)
+  }
+
+  output$edit_history_status <- renderText({
+    edit_history_trigger()
+    req(db_con(), input$file_selector)
+    position <- peak_history_position(db_con(), sub("\\.mz5$", "", input$file_selector))
+    if (!file.exists(file.path(main_folder(), ".peakmeister-edit-copy.rds"))) {
+      return("Original analysis. Applying an edit creates a separate edited copy.")
+    }
+    paste0("Edited analysis — Undo: ", position$undo, " | Redo: ", position$redo)
+  })
+
   clear_loaded_analysis <- function() {
+    editing_context(NULL)
+    edit_history_trigger(edit_history_trigger() + 1L)
     for (state in list(plot_list_data_values, run_metadata, previous_metadata)) {
       for (key in c("plot_list", "comment_df", "peaks_df", "peak_mt_df", "peak_area_df", "mi_df", "file_name")) {
         state[[key]] <- NULL
@@ -3536,7 +3780,7 @@ server <- function(input, output, session){
     updateSelectInput(session, "file_selector2", choices = uploadedmz5()$FileName, selected = filename)
     folders <- list_results_folders(filename, selected_saved_run())
     updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
-                      stats::setNames(folders, basename(folders))), selected = folder)
+                      analysis_folder_choices(folders)), selected = folder)
 
     if (db_exists(folder)) {
       #Database exists — open it and we're done
@@ -3691,6 +3935,7 @@ server <- function(input, output, session){
     run_metadata$peak_area_df <- wide$peak_area_df
     run_metadata$mi_df        <- wide$mi_df
     run_metadata$file_name    <- input$file_selector
+    modified_peak_plots$names <- pending_peak_plots(con, file_name)
 
     cat("Loaded from database:", file_name,
         "| metabolites:", length(plot_list), "\n")
@@ -3704,8 +3949,12 @@ server <- function(input, output, session){
   ######4.3.1 Populate plot table and render selected plot######
   #Populate the plot table
   output$plot_table <- DT::renderDataTable({
-    data.frame(Plot = filtered_plot_names())
-  }, selection = 'single')
+    plots <- filtered_plot_names()
+    # Copying/switching versions of the same file should keep the current plot.
+    selected <- if (identical(plots, session$userData$previous_peak_plot_names)) isolate(input$plot_table_rows_selected) else NULL
+    session$userData$previous_peak_plot_names <- plots
+    DT::datatable(data.frame(Plot = plots), selection = list(mode = "single", selected = selected))
+  })
 
   
   #Render and construct plot on demand from SQL databse data
@@ -3914,30 +4163,10 @@ server <- function(input, output, session){
   #####4.4 Delete Peaks and Update Metadata#####
   ######4.4.1 Initialize environment, define reactive expressions, and define functions######
   
-  #Define reactive expression to load plot_list_data
-  loaded_plot_list_data <- reactive({
-    req(main_folder(), input$file_selector)
-    file_name <- input$file_selector
-    subfolder_path <- file.path(main_folder(), "Data", file_name)
-
-    #Debug print statements for paths
-    print(paste("Main folder:", main_folder()))
-    print(paste("File selector:", file_name))
-    print(paste("Subfolder path:", subfolder_path))
-
-    #Check if the file exists before attempting to load it
-    if (file.exists(file.path(subfolder_path, "plot_list_data.RData"))) {
-      load(file.path(subfolder_path, "plot_list_data.RData"))
-      return(list(plot_list = plot_list, peaks_df = peaks_df, peak_mt_df = peak_mt_df, peak_area_df = peak_area_df, comment_df = comment_df, mi_df = mi_df))
-    } else {
-      warning("File not found: ", file.path(subfolder_path, "plot_list_data.RData"))
-      return(NULL)
-    }
-  })
-
   #Function for saving and updating raw data aftyer any edit to a plot. Writes edited data for a single metabolite into the SQL database and then rerenders plot with new data. Also keeps writing .Rdata as a backup.
-  save_plot_data <- function(plotname) {
+  save_plot_data <- function(plotname, refresh = TRUE) {
     req(db_con())
+    if (!isTRUE(peak_edit_in_progress())) stop("Peak changes must be applied through edit history.")
     con       <- db_con()
     file_name <- plot_list_data_values$file_name
     folder    <- main_folder()
@@ -4016,33 +4245,26 @@ server <- function(input, output, session){
       stringsAsFactors = FALSE
     )
     dbAppendTable(con, "peak_area_df", area_db)
+
+    # Keep migration-time exports and Undo/Redo consistent with moved peak apices.
+    dbExecute(con, "DELETE FROM peak_mt_df WHERE file_name = ? AND metabolite = ?", params = list(file_name, plotname))
+    dbAppendTable(con, "peak_mt_df", data.frame(file_name = file_name, peak_number = seq_len(num_peaks),
+      metabolite = plotname, migration_time = as.numeric(plot_list_data_values$peak_mt_df[, plotname])))
     
     #Record data edit in edit_log trail.
     log_edit(con, file_name, plotname, "save")
     
-    #Write and update .Rdata in the datafolder as backup
-    subfolder_path <- file.path(folder, "Data", paste0(file_name, ".mz5"))
-    if (dir.exists(subfolder_path)) {
-      plot_list    <- plot_list_data_values$plot_list
-      comment_df   <- plot_list_data_values$comment_df
-      peaks_df     <- plot_list_data_values$peaks_df
-      peak_mt_df   <- plot_list_data_values$peak_mt_df
-      peak_area_df <- plot_list_data_values$peak_area_df
-      mi_df        <- plot_list_data_values$mi_df
-      save_analysis_snapshot(subfolder_path, plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df)
-    }
+    # The action transaction writes the full RData snapshot once, after all edits.
     
     #Update reactive values with new metabolite data.
-    updated_plot_data <- tryCatch(
-      read_plot_data_from_db(con, folder, file_name, plotname),
-      error = function(e) NULL)
-    if (!is.null(updated_plot_data)) {
+    # Undo/Redo already has validated state and immutable traces in memory.
+    # Do not reload the large RData file once for every restored metabolite.
+    if (refresh) {
+      updated_plot_data <- read_plot_data_from_db(con, folder, file_name, plotname)
       plot_list_data_values$plot_list[[plotname]] <- updated_plot_data
       run_metadata$plot_list[[plotname]]          <- updated_plot_data
+      plot_render_trigger(plot_render_trigger() + 1)
     }
-    
-    #Force plot and annotation table to re-render
-    plot_render_trigger(plot_render_trigger() + 1)
   }
   
   
@@ -4067,115 +4289,93 @@ server <- function(input, output, session){
   
   
   
-  #Intiialize reactive values 
-  observe_action(input$file_selector, {
-    req(loaded_plot_list_data())
-    
-    #Initialize reactive values only once when a new file is selected
-    plot_list_data_values$plot_list <- loaded_plot_list_data()$plot_list
-    plot_list_data_values$comment_df <- loaded_plot_list_data()$comment_df
-    plot_list_data_values$peaks_df <- loaded_plot_list_data()$peaks_df
-    plot_list_data_values$peak_mt_df <- loaded_plot_list_data()$peak_mt_df
-    plot_list_data_values$peak_area_df <- loaded_plot_list_data()$peak_area_df
-    plot_list_data_values$mi_df <- loaded_plot_list_data()$mi_df
-    
-    #Store metadata in a separate reactive structure to allow users to access/undo peak deletions
-    run_metadata$comment_df <- plot_list_data_values$comment_df
-    run_metadata$plot_list <- plot_list_data_values$plot_list
-    run_metadata$file_name <- input$file_selector
-    run_metadata$peaks_df <- plot_list_data_values$peaks_df
-    run_metadata$peak_mt_df <- plot_list_data_values$peak_mt_df
-    run_metadata$peak_area_df <- plot_list_data_values$peak_area_df
-    run_metadata$mi_df <- plot_list_data_values$mi_df
-  })
-  
   ######4.4.2 Server logic for deleting peaks in plots######
   # Session action called by the delete_peak button.
   delete_selected_peaks <- function() {
-    req(input$peak_info_table_rows_selected)
-
-    #Store the current state before making changes
-    previous_metadata$file_name <- run_metadata$file_name
-    previous_metadata$comment_df <- run_metadata$comment_df
-    previous_metadata$plot_list <- run_metadata$plot_list
-    previous_metadata$peaks_df <- run_metadata$peaks_df
-    previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
-    previous_metadata$peak_area_df <- run_metadata$peak_area_df
-    previous_metadata$mi_df <- run_metadata$mi_df
-
-    selected_rows <- input$peak_info_table_rows_selected
-
-    #Extract the current annotation_data
-    selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-    base_file_name <- sub("\\.mz5$", "", input$file_selector)
-    plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-    plot_list <- plot_list_data_values$plot_list
-
-    #Mark the plot as edited so only plots that have been edited can be regenerated later
-    modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-
-    if (plotname %in% names(plot_list)) {
-      annotation_data <- plot_list[[plotname]]$annotation_data
-      integration_data <- plot_list[[plotname]]$integration_data
-
-      #Loop through each selected row
-      for (selected_row in selected_rows) {
-        #Get the peak number from the selected row to allow matching accross various acccesible data streams
-        peak_number <- annotation_data$peak.number[selected_row]
-
-        #Update the comment column for the selected peak
-        annotation_data$comment[selected_row] <- "NPD"
-
-        #Update comment_df so peak areas can be recauculated/reintegrated later on
-        if (plotname %in% colnames(plot_list_data_values$comment_df)) {
-          plot_list_data_values$comment_df[peak_number, plotname] <- "NPD"
-        }
-
-        if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
-          plot_list_data_values$peak_area_df[peak_number, plotname] <- "NPD"
-        }
-
-        #Remove all integration_data associated with the relevant peak number so regenerated plots will update with the deleted peaks once regenerated
-        integration_data <- integration_data[integration_data$peak.number != peak_number, ]
-      }
-
-      #Update the plot_list with the modified annotation_data
-      plot_list[[plotname]]$annotation_data <- annotation_data
-      plot_list[[plotname]]$integration_data <- integration_data
-
-      #Update the reactive plot_list_data
-      plot_list_data_values$plot_list <- plot_list
+    if (!length(input$peak_info_table_rows_selected)) {
+      showNotification("Select peak rows in the Peak Position Information table first.", type = "message")
+      return(invisible(FALSE))
     }
 
-    #Save changes 
-    save_plot_data(plotname)
+    req(input$plot_table_rows_selected)
+    perform_peak_edit("Delete selected peaks", function() {
+      req(input$peak_info_table_rows_selected)
 
-    #Reload the updated data
-    subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
-    reload_plot_data(subfolder_path)
+      selected_rows <- input$peak_info_table_rows_selected
 
-    #Update reactive values directly
-    plot_list_data_values$plot_list <- plot_list
-    plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-
-
-    #Update the peak_info_table
-    output$peak_info_table <- DT::renderDataTable({
-      req(input$plot_table_rows_selected)
+      #Extract the current annotation_data
       selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-
       base_file_name <- sub("\\.mz5$", "", input$file_selector)
       plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
       plot_list <- plot_list_data_values$plot_list
 
-      #Ensure the plotname exists in the plot_list
+      #Mark the plot as edited so only plots that have been edited can be regenerated later
+      modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
+
       if (plotname %in% names(plot_list)) {
         annotation_data <- plot_list[[plotname]]$annotation_data
-        annotation_data
-      } else {
-        data.frame()
+        integration_data <- plot_list[[plotname]]$integration_data
+
+        #Loop through each selected row
+        for (selected_row in selected_rows) {
+          #Get the peak number from the selected row to allow matching accross various acccesible data streams
+          peak_number <- annotation_data$peak.number[selected_row]
+
+          #Update the comment column for the selected peak
+          annotation_data$comment[selected_row] <- "NPD"
+
+          #Update comment_df so peak areas can be recauculated/reintegrated later on
+          if (plotname %in% colnames(plot_list_data_values$comment_df)) {
+            plot_list_data_values$comment_df[peak_number, plotname] <- "NPD"
+          }
+
+          if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
+            plot_list_data_values$peak_area_df[peak_number, plotname] <- "NPD"
+          }
+
+          #Remove all integration_data associated with the relevant peak number so regenerated plots will update with the deleted peaks once regenerated
+          integration_data <- integration_data[integration_data$peak.number != peak_number, ]
+        }
+
+        #Update the plot_list with the modified annotation_data
+        plot_list[[plotname]]$annotation_data <- annotation_data
+        plot_list[[plotname]]$integration_data <- integration_data
+
+        #Update the reactive plot_list_data
+        plot_list_data_values$plot_list <- plot_list
       }
-    }, options = list(pageLength = 13), selection = 'multiple')
+
+      #Save changes
+      save_plot_data(plotname)
+
+      #Reload the updated data
+      subfolder_path <- file.path(main_folder(), "Data", run_metadata$file_name)
+      reload_plot_data(subfolder_path)
+
+      #Update reactive values directly
+      plot_list_data_values$plot_list <- plot_list
+      plot_list_data_values$comment_df <- plot_list_data_values$comment_df
+
+
+      #Update the peak_info_table
+      output$peak_info_table <- DT::renderDataTable({
+        req(input$plot_table_rows_selected)
+        selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+
+        base_file_name <- sub("\\.mz5$", "", input$file_selector)
+        plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+        plot_list <- plot_list_data_values$plot_list
+
+        #Ensure the plotname exists in the plot_list
+        if (plotname %in% names(plot_list)) {
+          annotation_data <- plot_list[[plotname]]$annotation_data
+          annotation_data
+        } else {
+          data.frame()
+        }
+      }, options = list(pageLength = 13), selection = 'multiple')
+
+    })
   }
 
   observe_action(input$delete_peak, {
@@ -4187,84 +4387,79 @@ server <- function(input, output, session){
   # Session action called by the deletemiddlepeaks button.
   delete_middle_peaks <- function() {
     req(input$plot_table_rows_selected)
+    perform_peak_edit("Delete middle peaks", function() {
+      req(input$plot_table_rows_selected)
 
-    #Store the current state before making changes
-    previous_metadata$file_name <- run_metadata$file_name
-    previous_metadata$comment_df <- run_metadata$comment_df
-    previous_metadata$plot_list <- run_metadata$plot_list
-    previous_metadata$peaks_df <- run_metadata$peaks_df
-    previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
-    previous_metadata$peak_area_df <- run_metadata$peak_area_df
-    previous_metadata$mi_df <- run_metadata$mi_df
+      #Extract the current plot name
+      selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+      base_file_name <- sub("\\.mz5$", "", input$file_selector)
+      plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+      plot_list <- plot_list_data_values$plot_list
 
-    #Extract the current plot name
-    selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-    base_file_name <- sub("\\.mz5$", "", input$file_selector)
-    plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-    plot_list <- plot_list_data_values$plot_list
+      #Mark the plot as edited so only plots that have been edited can be regenerated later
+      modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
 
-    #Mark the plot as edited so only plots that have been edited can be regenerated later
-    modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
+      if (plotname %in% names(plot_list)) {
+        annotation_data <- plot_list[[plotname]]$annotation_data
+        integration_data <- plot_list[[plotname]]$integration_data
 
-    if (plotname %in% names(plot_list)) {
-      annotation_data <- plot_list[[plotname]]$annotation_data
-      integration_data <- plot_list[[plotname]]$integration_data
+        #Identify the first and last peak numbers
+        first_peak <- annotation_data$peak.number[1]
+        last_peak <- annotation_data$peak.number[nrow(annotation_data)]
 
-      #Identify the first and last peak numbers
-      first_peak <- annotation_data$peak.number[1]
-      last_peak <- annotation_data$peak.number[nrow(annotation_data)]
+        #Update the comment column for all peaks except the first and last
+        annotation_data$comment[-c(1, nrow(annotation_data))] <- "NPD"
 
-      #Update the comment column for all peaks except the first and last
-      annotation_data$comment[-c(1, nrow(annotation_data))] <- "NPD"
-
-      #Update comment_df so peak areas can be recalculated/reintegrated later on
-      if (plotname %in% colnames(plot_list_data_values$comment_df)) {
-        plot_list_data_values$comment_df[-c(first_peak, last_peak), plotname] <- "NPD"
-      }
-
-      if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
-        plot_list_data_values$peak_area_df[-c(first_peak, last_peak), plotname] <- "NPD"
-      }
-
-      #Remove all integration_data associated with peaks except the first and last
-      integration_data <- integration_data[integration_data$peak.number %in% c(first_peak, last_peak), ]
-
-      #Update the plot_list with the modified annotation_data
-      plot_list[[plotname]]$annotation_data <- annotation_data
-      plot_list[[plotname]]$integration_data <- integration_data
-
-      #Update the reactive plot_list_data
-      plot_list_data_values$plot_list <- plot_list
-
-      #Save changes
-      save_plot_data(plotname)
-
-      #Reload the updated data
-      subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
-      reload_plot_data(subfolder_path)
-
-      #Update reactive values directly
-      plot_list_data_values$plot_list <- plot_list
-      plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-
-      #Update the peak_info_table
-      output$peak_info_table <- DT::renderDataTable({
-        req(input$plot_table_rows_selected)
-        selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-
-        base_file_name <- sub("\\.mz5$", "", input$file_selector)
-        plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-        plot_list <- plot_list_data_values$plot_list
-
-        #Ensure the plotname exists in the plot_list
-        if (plotname %in% names(plot_list)) {
-          annotation_data <- plot_list[[plotname]]$annotation_data
-          annotation_data
-        } else {
-          data.frame()
+        #Update comment_df so peak areas can be recalculated/reintegrated later on
+        if (plotname %in% colnames(plot_list_data_values$comment_df)) {
+          plot_list_data_values$comment_df[-c(first_peak, last_peak), plotname] <- "NPD"
         }
-      }, options = list(pageLength = 13), selection = 'multiple')
-    }
+
+        if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
+          plot_list_data_values$peak_area_df[-c(first_peak, last_peak), plotname] <- "NPD"
+        }
+
+        #Remove all integration_data associated with peaks except the first and last
+        integration_data <- integration_data[integration_data$peak.number %in% c(first_peak, last_peak), ]
+
+        #Update the plot_list with the modified annotation_data
+        plot_list[[plotname]]$annotation_data <- annotation_data
+        plot_list[[plotname]]$integration_data <- integration_data
+
+        #Update the reactive plot_list_data
+        plot_list_data_values$plot_list <- plot_list
+
+        #Save changes
+        save_plot_data(plotname)
+
+        #Reload the updated data
+        subfolder_path <- file.path(main_folder(), "Data", run_metadata$file_name)
+        reload_plot_data(subfolder_path)
+
+        #Update reactive values directly
+        plot_list_data_values$plot_list <- plot_list
+        plot_list_data_values$comment_df <- plot_list_data_values$comment_df
+
+        #Update the peak_info_table
+        output$peak_info_table <- DT::renderDataTable({
+          req(input$plot_table_rows_selected)
+          selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+
+          base_file_name <- sub("\\.mz5$", "", input$file_selector)
+          plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+          plot_list <- plot_list_data_values$plot_list
+
+          #Ensure the plotname exists in the plot_list
+          if (plotname %in% names(plot_list)) {
+            annotation_data <- plot_list[[plotname]]$annotation_data
+            annotation_data
+          } else {
+            data.frame()
+          }
+        }, options = list(pageLength = 13), selection = 'multiple')
+      }
+
+    })
   }
 
   observe_action(input$deletemiddlepeaks, {
@@ -4275,80 +4470,75 @@ server <- function(input, output, session){
   # Session action called by the deleteallpeaks button.
   delete_all_peaks <- function() {
     req(input$plot_table_rows_selected)
+    perform_peak_edit("Delete all peaks", function() {
+      req(input$plot_table_rows_selected)
 
-    #Store the current state before making changes
-    previous_metadata$file_name <- run_metadata$file_name
-    previous_metadata$comment_df <- run_metadata$comment_df
-    previous_metadata$plot_list <- run_metadata$plot_list
-    previous_metadata$peaks_df <- run_metadata$peaks_df
-    previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
-    previous_metadata$peak_area_df <- run_metadata$peak_area_df
-    previous_metadata$mi_df <- run_metadata$mi_df
+      #Extract the current plot name
+      selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+      base_file_name <- sub("\\.mz5$", "", input$file_selector)
+      plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+      plot_list <- plot_list_data_values$plot_list
 
-    #Extract the current plot name
-    selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-    base_file_name <- sub("\\.mz5$", "", input$file_selector)
-    plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-    plot_list <- plot_list_data_values$plot_list
+      #Mark the plot as edited so only plots that have been edited can be regenerated later
+      modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
 
-    #Mark the plot as edited so only plots that have been edited can be regenerated later
-    modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
+      if (plotname %in% names(plot_list)) {
+        annotation_data <- plot_list[[plotname]]$annotation_data
+        integration_data <- plot_list[[plotname]]$integration_data
 
-    if (plotname %in% names(plot_list)) {
-      annotation_data <- plot_list[[plotname]]$annotation_data
-      integration_data <- plot_list[[plotname]]$integration_data
+        #Update the comment column for all peaks
+        annotation_data$comment <- "NPD"
 
-      #Update the comment column for all peaks
-      annotation_data$comment <- "NPD"
-
-      #Update comment_df so peak areas can be recalculated/reintegrated later on
-      if (plotname %in% colnames(plot_list_data_values$comment_df)) {
-        plot_list_data_values$comment_df[, plotname] <- "NPD"
-      }
-
-      if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
-        plot_list_data_values$peak_area_df[, plotname] <- "NPD"
-      }
-
-      #Remove all integration_data
-      integration_data <- integration_data[0, ]
-
-      #Update the plot_list with the modified annotation_data
-      plot_list[[plotname]]$annotation_data <- annotation_data
-      plot_list[[plotname]]$integration_data <- integration_data
-
-      #Update the reactive plot_list_data
-      plot_list_data_values$plot_list <- plot_list
-
-      #Save changes
-      save_plot_data(plotname)
-
-      #Reload the updated data
-      subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
-      reload_plot_data(subfolder_path)
-
-      #Update reactive values directly
-      plot_list_data_values$plot_list <- plot_list
-      plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-
-      #Update the peak_info_table
-      output$peak_info_table <- DT::renderDataTable({
-        req(input$plot_table_rows_selected)
-        selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-
-        base_file_name <- sub("\\.mz5$", "", input$file_selector)
-        plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-        plot_list <- plot_list_data_values$plot_list
-
-        #Ensure the plotname exists in the plot_list
-        if (plotname %in% names(plot_list)) {
-          annotation_data <- plot_list[[plotname]]$annotation_data
-          annotation_data
-        } else {
-          data.frame()
+        #Update comment_df so peak areas can be recalculated/reintegrated later on
+        if (plotname %in% colnames(plot_list_data_values$comment_df)) {
+          plot_list_data_values$comment_df[, plotname] <- "NPD"
         }
-      }, options = list(pageLength = 13), selection = 'multiple')
-    }
+
+        if (plotname %in% colnames(plot_list_data_values$peak_area_df)) {
+          plot_list_data_values$peak_area_df[, plotname] <- "NPD"
+        }
+
+        #Remove all integration_data
+        integration_data <- integration_data[0, ]
+
+        #Update the plot_list with the modified annotation_data
+        plot_list[[plotname]]$annotation_data <- annotation_data
+        plot_list[[plotname]]$integration_data <- integration_data
+
+        #Update the reactive plot_list_data
+        plot_list_data_values$plot_list <- plot_list
+
+        #Save changes
+        save_plot_data(plotname)
+
+        #Reload the updated data
+        subfolder_path <- file.path(main_folder(), "Data", run_metadata$file_name)
+        reload_plot_data(subfolder_path)
+
+        #Update reactive values directly
+        plot_list_data_values$plot_list <- plot_list
+        plot_list_data_values$comment_df <- plot_list_data_values$comment_df
+
+        #Update the peak_info_table
+        output$peak_info_table <- DT::renderDataTable({
+          req(input$plot_table_rows_selected)
+          selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+
+          base_file_name <- sub("\\.mz5$", "", input$file_selector)
+          plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+          plot_list <- plot_list_data_values$plot_list
+
+          #Ensure the plotname exists in the plot_list
+          if (plotname %in% names(plot_list)) {
+            annotation_data <- plot_list[[plotname]]$annotation_data
+            annotation_data
+          } else {
+            data.frame()
+          }
+        }, options = list(pageLength = 13), selection = 'multiple')
+      }
+
+    })
   }
 
   observe_action(input$deleteallpeaks, {
@@ -4359,70 +4549,12 @@ server <- function(input, output, session){
   #####4.5 Undo peak deletion#####
   # Session action called by the undo button.
   undo_peak_deletion <- function() {
-    # Undo can be clicked before any deletion. Never save the initial NULL state.
-    keys <- c("plot_list", "comment_df", "peaks_df", "peak_mt_df", "peak_area_df", "mi_df")
-    if (any(vapply(keys, function(key) is.null(previous_metadata[[key]]), logical(1)))) {
-      showNotification("There is no peak deletion to undo for this analysis.", type = "message")
-      return(invisible(FALSE))
-    }
-    req(main_folder(), input$file_selector)
-    if (!identical(previous_metadata$file_name, input$file_selector) ||
-        !identical(run_metadata$file_name, input$file_selector)) {
-      showNotification("There is no peak deletion to undo for this analysis.", type = "message")
-      return(invisible(FALSE))
-    }
-    validate_analysis_snapshot(previous_metadata$plot_list, previous_metadata$peaks_df,
-      previous_metadata$mi_df, previous_metadata$peak_mt_df,
-      previous_metadata$peak_area_df, previous_metadata$comment_df)
-    #Revert to the previous state
-    run_metadata$comment_df <- previous_metadata$comment_df
-    run_metadata$plot_list <- previous_metadata$plot_list
-    run_metadata$peaks_df <- previous_metadata$peaks_df
-    run_metadata$peak_mt_df <- previous_metadata$peak_mt_df
-    run_metadata$peak_area_df <- previous_metadata$peak_area_df
-    run_metadata$mi_df <- previous_metadata$mi_df
-
-    #Store metadata in a separate reactive structure to allow users to access/undo peak deletions
-    plot_list_data_values$comment_df <- run_metadata$comment_df 
-    plot_list_data_values$plot_list <- run_metadata$plot_list
-    plot_list_data_values$peaks_df <- run_metadata$peaks_df
-    plot_list_data_values$peak_mt_df <- run_metadata$peak_mt_df
-    plot_list_data_values$peak_area_df <- run_metadata$peak_area_df
-    plot_list_data_values$mi_df <- run_metadata$mi_df
-
-    #Extract objects from run_metadata
-    plot_list <- run_metadata$plot_list
-    comment_df <- run_metadata$comment_df
-    peaks_df <- run_metadata$peaks_df
-    peak_mt_df <- run_metadata$peak_mt_df
-    peak_area_df <- run_metadata$peak_area_df
-    mi_df <- run_metadata$mi_df
-
-    #Save the reverted state back to the file
-    subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
-    save_analysis_snapshot(subfolder_path, plot_list, peaks_df, mi_df, peak_mt_df, peak_area_df, comment_df)
-
-    #Update the UI to reflect the reverted state
-    output$peak_info_table <- DT::renderDataTable({
-      req(input$plot_table_rows_selected)
-      selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-      base_file_name <- sub("\\.mz5$", "", run_metadata$file_name)
-      plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-      plot_list <- run_metadata$plot_list
-
-      if (plotname %in% names(plot_list)) {
-        annotation_data <- plot_list[[plotname]]$annotation_data
-        annotation_data
-      } else {
-        data.frame()  
-      }
-    }, options = list(pageLength = 13), selection = 'multiple')
+    step_peak_history("undo")
   }
 
-  observe_action(input$undo, {
-    undo_peak_deletion()
-  })
-  
+  observe_action(input$undo, { undo_peak_deletion() })
+  observe_action(input$redo, { step_peak_history("redo") })
+
   #####4.6 Regenerate plots#####
 
   ######4.6.1 Defining Plotting Functions######
@@ -4527,6 +4659,7 @@ server <- function(input, output, session){
   
    ######4.6.2 Defining functions for modifying saved peak area information######
    regenerate_metabolite_peak_areas <- function() {
+     ensure_editable_analysis()
      req(db_con())
      con       <- db_con()
      file_name <- plot_list_data_values$file_name
@@ -4556,12 +4689,13 @@ server <- function(input, output, session){
    
   ######4.6.3 Function for regenerating plotly plots######
    regenerate_plots <- function() {
+     ensure_editable_analysis()
      #Define font sizes for plotting functions
      font_size_1 <- 7
      font_size_2 <- 25
      
      #Get the list of all folders in the Data directory
-     data_subfolders <- list.dirs(path = file.path(input$results_folder, "Data"), full.names = TRUE, recursive = FALSE)
+     data_subfolders <- list.dirs(path = file.path(main_folder(), "Data"), full.names = TRUE, recursive = FALSE)
      
      #Initialize an empty list to store all plotly objects
      plotly_objects <- list()
@@ -4607,12 +4741,13 @@ server <- function(input, output, session){
      
      
      #Save all plotly objects to a single .RData file
-     save(plotly_objects, file = file.path(input$results_folder, "plotly_objects.RData"), compress = "xz")
+     save(plotly_objects, file = file.path(main_folder(), "plotly_objects.RData"), compress = "xz")
      print("Finished regenerating and compressing all plots!")
    }
 
    ######4.6.4 Function for regenerating ggplots plots and saving them to specified locations######
    regenerate_ggplot <- function() {
+     ensure_editable_analysis()
      #Define plotting housekeeping variables
      plot_format <- parametersData()$plot.format
      name_vec <- c(refMassListData()$name, massData()$name)
@@ -4620,7 +4755,7 @@ server <- function(input, output, session){
      num_of_is <- nrow(refMassListData())
      
      #Get the list of all folders in the Data directory
-     data_subfolders <- list.dirs(path = file.path(input$results_folder, "Data"), full.names = TRUE, recursive = FALSE)
+     data_subfolders <- list.dirs(path = file.path(main_folder(), "Data"), full.names = TRUE, recursive = FALSE)
      
      for (subfolder_path in data_subfolders) {
        #Extract the base file name from the subfolder name and remove the .mz5 extension
@@ -4672,7 +4807,7 @@ server <- function(input, output, session){
                                            base_file_name = base_file_name,
                                            font_size_1 = font_size_1,
                                            font_size_2 = font_size_2),
-                      path = paste(input$results_folder, "/Plots/", folder, "/", base_file_name, sep = ""))
+                      path = paste(main_folder(), "/Plots/", folder, "/", base_file_name, sep = ""))
              } else {
                folder <- "Analytes"
                
@@ -4714,7 +4849,7 @@ server <- function(input, output, session){
                         width = 16,
                         height = 9,
                         plot = figure,
-                        path = paste(input$results_folder, "/Plots/", folder, "/", base_file_name, sep = ""))
+                        path = paste(main_folder(), "/Plots/", folder, "/", base_file_name, sep = ""))
                } else {
                  font_size_1 <- 4
                  font_size_2 <- 12
@@ -4741,7 +4876,7 @@ server <- function(input, output, session){
                         width = 16,
                         height = 9,
                         plot = figure,
-                        path = paste(input$results_folder, "/Plots/", folder, "/", base_file_name, sep = ""))
+                        path = paste(main_folder(), "/Plots/", folder, "/", base_file_name, sep = ""))
                }
              }
            }
@@ -4762,7 +4897,7 @@ server <- function(input, output, session){
                                            label_data = plot_list[[n]]$label_data,
                                            x_axis_data = plot_list[[n]]$x_axis_data,
                                            y_axis_data = plot_list[[n]]$y_axis_data),
-                      path = paste(input$results_folder, "/Plots/", folder, "/", sep = ""))
+                      path = paste(main_folder(), "/Plots/", folder, "/", sep = ""))
              }
            }
          }
@@ -4772,13 +4907,14 @@ server <- function(input, output, session){
    
    ######4.6.5 Function for Regenerating Migration time file#####
    regenerate_metabolite_migration_times <- function() {
+     ensure_editable_analysis()
      req(db_con())
      con <- db_con()
      
-     # Pull all apex times from annotation_data across all files
+     # Stored/report migration times are minutes, matching new-analysis CSVs.
      mt_long <- dbGetQuery(con,
-                           "SELECT file_name, peak_number, metabolite, peak_apex_secs
-     FROM annotation_data
+                           "SELECT file_name, peak_number, metabolite, migration_time AS peak_apex_secs
+     FROM peak_mt_df
      ORDER BY file_name, peak_number"
      )
      
@@ -4895,10 +5031,11 @@ server <- function(input, output, session){
       } else {
         regenerate_ggplot()
         showNotification("Successfully regenerated plots and updated metadata", type = "message")
+        modified_peak_plots$names <- character()
+        dbExecute(db_con(), "DELETE FROM peak_edit_dirty_plots WHERE file_name = ?",
+                  params = list(sub("\\.mz5$", "", input$file_selector)))
       }
 
-      #Reset modified peaks table
-      modified_peak_plots$names <- character(0)
       waiter_hide()
   }
 
@@ -4949,134 +5086,144 @@ server <- function(input, output, session){
   
   ######4.7.2 Integration function######
   manual_peak_integration <- function(peak_number){
-    
-    #define variables required for plotting 
-    selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-    base_file_name <- sub("\\.mz5$", "", input$file_selector)
-    plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-    
-    #load plot data
-    plot_data <- plot_list_data_values$plot_list[[plotname]]
-    eie_df <- plot_data$eie_data
-    peaks_df <- plot_list_data_values$peaks_df
-    peak_area_df <- plot_list_data_values$peak_area_df
-    
-    #Get the start and end positions from the reactive line_positions
-    red_line <- line_positions$red #start
-    blue_line <- line_positions$blue #end
-    
-    #Convert from minutes to seconds
-    red_line <- as.numeric(red_line) * 60
-    blue_line <- as.numeric(blue_line) *60
-    
-    #Filter the data between the red and blue lines. This defines the integration boundaries 
-    integrated_data <- eie_df[eie_df$mt.seconds >= red_line & eie_df$mt.seconds <= blue_line, ]
-    
-    #Define name that will macth to existing metadata.
-    intensity_column <- paste(plotname, "intensity", sep = " ")
-    print("starting integration")
-    
-    #Load variables used for integrating 
-    time <- integrated_data$mt.seconds
-    intensity <- integrated_data[[intensity_column]]
-     
-     #Find the peak apex within the range
-     apex_index <- which.max(intensity)
-     apex_time <- time[apex_index]
-     apex_intensity <- intensity[apex_index]
-     
-     #Calculate the area using the trapezoidal rule
-     area <- tryCatch({
-       AUC(time,
-           intensity,
-           method = "trapezoid",
-           from = min(time),
-           to = max(time),
-           absolutearea = FALSE,
-           na.rm = FALSE)
-     }, error = function(e) {
-       showNotification(paste("Error in AUC calculation:", e), type = "error")
-       return(NA)
-     })
-     
-     #Check is error is NA or not
-     if (is.na(area)) {
-       showNotification("Error: Area calculation returned NA", type = "error")
-       return(NA)
-     }
-     
-     #Adjust for baseline
-     baseline_adjustment <- (blue_line - red_line) * min(intensity)
-     area <- area - baseline_adjustment
-     
-     #Determine the peak number to use
-     selected_peak_index <- if (!is.null(peak_number)) {
-       as.numeric(peak_number)
-     } else {
-       input$peak_info_table_rows_selected
-     }
-     
-     #Update the specific row in peaks_df with the new integration data
-     peaks_df[selected_peak_index, paste0(plotname, ".start.seconds")] <- red_line
-     peaks_df[selected_peak_index, paste0(plotname, ".apex.seconds")] <- apex_time
-     peaks_df[selected_peak_index, paste0(plotname, ".end.seconds")] <- blue_line
-     peaks_df[selected_peak_index, paste0(plotname, ".start_intensity")] <- min(intensity)
-     peaks_df[selected_peak_index, paste0(plotname, ".apex_intensity")] <- apex_intensity
-     peaks_df[selected_peak_index, paste0(plotname, ".end_intensity")] <- min(intensity)
-     peaks_df[selected_peak_index, paste0(plotname, ".peak.area")] <- area
-     
-     #Update comment_df to remove any comments for the metabolite
-     comment_df <- plot_list_data_values$comment_df
-     if (plotname %in% colnames(comment_df)) {
-       comment_df[selected_peak_index, plotname] <- ""}
-     
-     #Update peak_area_df with the new peak area
-     peak_area_df[selected_peak_index, paste0(plotname)] <- area
-     
-     #Create temporary integration_data for the manually integrated peak to add to existing integration-data later
-     temp_integration_data <- data.frame(
-       "peak.number" = selected_peak_index,
-       "mt.seconds" = time,
-       "intensity" = intensity,
-       "baseline" = min(intensity)
-     )
-     
-     #Load existing integration_data. Convert the peak number from factor to character 
-     integration_data <- plot_data$integration_data
-       integration_data <- as.data.frame(lapply(integration_data, function(x) if(is.factor(x)) as.character(x) else x))
-     
-     #Check if the peak number exists in the existing integration_data and replace existing data if peak is already there
-     if (selected_peak_index %in% integration_data$peak.number) {
-       integration_data <- integration_data[integration_data$peak.number != selected_peak_index, ]
-     }
-     
-     #Add the temporary integration_data to the existing integration_data
-     integration_data <- rbind(integration_data, temp_integration_data)
-     
-     #Update annotation_data with the new peak.apex.seconds and peak.height.counts
-     annotation_data <- plot_data$annotation_data
-     annotation_data$peak.apex.seconds[selected_peak_index] <- apex_time
-     annotation_data$peak.height.counts[selected_peak_index] <- apex_intensity
-     annotation_data$comment[selected_peak_index] <- ""
-     
-     #Update values with new data
-     plot_list_data_values$plot_list[[plotname]]$integration_data <- integration_data
-     plot_list_data_values$plot_list[[plotname]]$annotation_data <- annotation_data
-     plot_list_data_values$comment_df <- comment_df
-     plot_list_data_values$peak_area_df <- peak_area_df
-     plot_list_data_values$peaks_df <- peaks_df
-     
-     #Mark the plot as modified
-     modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-     
-     #Save the updated peaks_df back to the plot_list_data.RData file
-     save_plot_data(plotname)
-     
-     #Clear workspace
-     rm(list = c())
-     gc()
-     
-     showNotification("Integration Successful. Metadata updated", type = "message")
+    if (length(peak_number) != 1L || is.na(suppressWarnings(as.numeric(peak_number)))) {
+      showNotification("Select one peak row, or enter one valid peak number.", type = "message")
+      return(invisible(FALSE))
+    }
+
+    req(input$plot_table_rows_selected)
+    perform_peak_edit("Adjust peak integration", function() {
+
+      #define variables required for plotting
+      selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+      base_file_name <- sub("\\.mz5$", "", input$file_selector)
+      plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+
+      #load plot data
+      plot_data <- plot_list_data_values$plot_list[[plotname]]
+      eie_df <- plot_data$eie_data
+      peaks_df <- plot_list_data_values$peaks_df
+      peak_area_df <- plot_list_data_values$peak_area_df
+
+      #Get the start and end positions from the reactive line_positions
+      red_line <- line_positions$red #start
+      blue_line <- line_positions$blue #end
+
+      #Convert from minutes to seconds
+      red_line <- as.numeric(red_line) * 60
+      blue_line <- as.numeric(blue_line) *60
+
+      #Filter the data between the red and blue lines. This defines the integration boundaries
+      integrated_data <- eie_df[eie_df$mt.seconds >= red_line & eie_df$mt.seconds <= blue_line, ]
+
+      #Define name that will macth to existing metadata.
+      intensity_column <- paste(plotname, "intensity", sep = " ")
+      print("starting integration")
+
+      #Load variables used for integrating
+      time <- integrated_data$mt.seconds
+      intensity <- integrated_data[[intensity_column]]
+
+       #Find the peak apex within the range
+       apex_index <- which.max(intensity)
+       apex_time <- time[apex_index]
+       apex_intensity <- intensity[apex_index]
+
+       #Calculate the area using the trapezoidal rule
+       area <- tryCatch({
+         AUC(time,
+             intensity,
+             method = "trapezoid",
+             from = min(time),
+             to = max(time),
+             absolutearea = FALSE,
+             na.rm = FALSE)
+       }, error = function(e) {
+         showNotification(paste("Error in AUC calculation:", e), type = "error")
+         return(NA)
+       })
+
+       #Check is error is NA or not
+       if (is.na(area)) {
+         showNotification("Error: Area calculation returned NA", type = "error")
+         return(NA)
+       }
+
+       #Adjust for baseline
+       baseline_adjustment <- (blue_line - red_line) * min(intensity)
+       area <- area - baseline_adjustment
+
+       #Determine the peak number to use
+       selected_peak_index <- if (!is.null(peak_number)) {
+         as.numeric(peak_number)
+       } else {
+         input$peak_info_table_rows_selected
+       }
+
+       #Update the specific row in peaks_df with the new integration data
+       peaks_df[selected_peak_index, paste0(plotname, ".start.seconds")] <- red_line
+       peaks_df[selected_peak_index, paste0(plotname, ".apex.seconds")] <- apex_time
+       peaks_df[selected_peak_index, paste0(plotname, ".end.seconds")] <- blue_line
+       peaks_df[selected_peak_index, paste0(plotname, ".start_intensity")] <- min(intensity)
+       peaks_df[selected_peak_index, paste0(plotname, ".apex_intensity")] <- apex_intensity
+       peaks_df[selected_peak_index, paste0(plotname, ".end_intensity")] <- min(intensity)
+       peaks_df[selected_peak_index, paste0(plotname, ".peak.area")] <- area
+
+       #Update comment_df to remove any comments for the metabolite
+       comment_df <- plot_list_data_values$comment_df
+       if (plotname %in% colnames(comment_df)) {
+         comment_df[selected_peak_index, plotname] <- ""}
+
+       #Update peak_area_df with the new peak area
+       peak_area_df[selected_peak_index, paste0(plotname)] <- area
+       plot_list_data_values$peak_mt_df[selected_peak_index, plotname] <- apex_time / 60
+
+       #Create temporary integration_data for the manually integrated peak to add to existing integration-data later
+       temp_integration_data <- data.frame(
+         "peak.number" = selected_peak_index,
+         "mt.seconds" = time,
+         "intensity" = intensity,
+         "baseline" = min(intensity)
+       )
+
+       #Load existing integration_data. Convert the peak number from factor to character
+       integration_data <- plot_data$integration_data
+         integration_data <- as.data.frame(lapply(integration_data, function(x) if(is.factor(x)) as.character(x) else x))
+
+       #Check if the peak number exists in the existing integration_data and replace existing data if peak is already there
+       if (selected_peak_index %in% integration_data$peak.number) {
+         integration_data <- integration_data[integration_data$peak.number != selected_peak_index, ]
+       }
+
+       #Add the temporary integration_data to the existing integration_data
+       integration_data <- rbind(integration_data, temp_integration_data)
+
+       #Update annotation_data with the new peak.apex.seconds and peak.height.counts
+       annotation_data <- plot_data$annotation_data
+       annotation_data$peak.apex.seconds[selected_peak_index] <- apex_time
+       annotation_data$peak.height.counts[selected_peak_index] <- apex_intensity
+       annotation_data$comment[selected_peak_index] <- ""
+
+       #Update values with new data
+       plot_list_data_values$plot_list[[plotname]]$integration_data <- integration_data
+       plot_list_data_values$plot_list[[plotname]]$annotation_data <- annotation_data
+       plot_list_data_values$comment_df <- comment_df
+       plot_list_data_values$peak_area_df <- peak_area_df
+       plot_list_data_values$peaks_df <- peaks_df
+
+       #Mark the plot as modified
+       modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
+
+       #Save the updated peaks_df back to the plot_list_data.RData file
+       save_plot_data(plotname)
+
+       #Clear workspace
+       rm(list = c())
+       gc()
+
+       showNotification("Integration Successful. Metadata updated", type = "message")
+
+    })
   }
   
   
@@ -5085,7 +5232,6 @@ server <- function(input, output, session){
     #Check to see if the user has selected a row in the peak info table. If not, launch modal function.
     if (is.null(input$peak_info_table_rows_selected) || length(input$peak_info_table_rows_selected) == 0) {peak_input_modal()} else {
       manual_peak_integration(input$peak_info_table_rows_selected)
-      regenerate_metabolite_peak_areas()
     }
     
     #Update the UI to reflect new data
@@ -5109,7 +5255,6 @@ server <- function(input, output, session){
   observe_action(input$confirm_peak_number, {
     removeModal()
     manual_peak_integration(input$manual_peak_number)
-    regenerate_metabolite_peak_areas()
     
     #Update the UI to reflect new data
     output$peak_info_table <- DT::renderDataTable({
@@ -5145,112 +5290,116 @@ server <- function(input, output, session){
   
   #Function for adjusting individual baseline
   adjust_individual_baseline <- function(peak_index = NULL){
-    
-    #define variables required for plotting 
-    selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-    base_file_name <- sub("\\.mz5$", "", input$file_selector)
-    plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-    
-    #Mark the plot as modified
-    modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-    
-    #Use clicked Y value as the new baseline
-    new_baseline <- session$userData$clicked_position$y
-    print(paste("New baseline:", new_baseline))
-    
-    #load plot data
-    plot_data <- plot_list_data_values$plot_list[[plotname]]
-    eie_df <- plot_data$eie_data
-    peaks_df <- plot_list_data_values$peaks_df
-    peak_area_df <- plot_list_data_values$peak_area_df
-    
-    #Determine the peak from the selected row in the peak info table or from the modal input
-    if (is.null(peak_index)) {
-      peak_index <- input$peak_info_table_rows_selected
-    } else {
-      peak_index <- as.numeric(peak_index)
-    }
-    
-    #Get the integration boundaries from peaks_df
-    left_boundary <- peaks_df[peak_index, paste0(plotname, ".start.seconds")]
-    right_boundary <- peaks_df[peak_index, paste0(plotname, ".end.seconds")]
-    
-    #Filter the data between the left and right boundaries
-    integrated_data <- eie_df[eie_df$mt.seconds >= left_boundary & eie_df$mt.seconds <= right_boundary, ]
-    
-    #Define name that will match to existing metadata
-    intensity_column <- paste(plotname, "intensity", sep = " ")
-    
-    #Load variables used for integrating
-    time <- integrated_data$mt.seconds
-    intensity <- integrated_data[[intensity_column]]
-    
-    #Calculate the area using the trapezoidal rule with the new baseline
-    area <- tryCatch({
-      AUC(time,
-          intensity,
-          method = "trapezoid",
-          from = min(time),
-          to = max(time),
-          absolutearea = FALSE,
-          na.rm = FALSE)
-    }, error = function(e) {
-      showNotification(paste("Error in AUC calculation:", e), type = "error")
-      return(NA)
+    req(input$plot_table_rows_selected)
+    perform_peak_edit("Adjust individual baseline", function() {
+
+      #define variables required for plotting
+      selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+      base_file_name <- sub("\\.mz5$", "", input$file_selector)
+      plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+
+      #Mark the plot as modified
+      modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
+
+      #Use clicked Y value as the new baseline
+      new_baseline <- session$userData$clicked_position$y
+      print(paste("New baseline:", new_baseline))
+
+      #load plot data
+      plot_data <- plot_list_data_values$plot_list[[plotname]]
+      eie_df <- plot_data$eie_data
+      peaks_df <- plot_list_data_values$peaks_df
+      peak_area_df <- plot_list_data_values$peak_area_df
+
+      #Determine the peak from the selected row in the peak info table or from the modal input
+      if (is.null(peak_index)) {
+        peak_index <- input$peak_info_table_rows_selected
+      } else {
+        peak_index <- as.numeric(peak_index)
+      }
+
+      #Get the integration boundaries from peaks_df
+      left_boundary <- peaks_df[peak_index, paste0(plotname, ".start.seconds")]
+      right_boundary <- peaks_df[peak_index, paste0(plotname, ".end.seconds")]
+
+      #Filter the data between the left and right boundaries
+      integrated_data <- eie_df[eie_df$mt.seconds >= left_boundary & eie_df$mt.seconds <= right_boundary, ]
+
+      #Define name that will match to existing metadata
+      intensity_column <- paste(plotname, "intensity", sep = " ")
+
+      #Load variables used for integrating
+      time <- integrated_data$mt.seconds
+      intensity <- integrated_data[[intensity_column]]
+
+      #Calculate the area using the trapezoidal rule with the new baseline
+      area <- tryCatch({
+        AUC(time,
+            intensity,
+            method = "trapezoid",
+            from = min(time),
+            to = max(time),
+            absolutearea = FALSE,
+            na.rm = FALSE)
+      }, error = function(e) {
+        showNotification(paste("Error in AUC calculation:", e), type = "error")
+        return(NA)
+      })
+
+      #Check if error is NA or not
+      if (is.na(area)) {
+        showNotification("Error: Area calculation returned NA", type = "error")
+        return(NA)
+      }
+
+      #Adjust for baseline
+      baseline_adjustment <- (right_boundary - left_boundary) * new_baseline
+      area <- area - baseline_adjustment
+
+      #Update the specific row in peaks_df with the new integration data
+      peaks_df[peak_index, paste0(plotname, ".start_intensity")] <- min(intensity)
+      peaks_df[peak_index, paste0(plotname, ".end_intensity")] <- min(intensity)
+      peaks_df[peak_index, paste0(plotname, ".peak.area")] <- area
+
+      #Update peak_area_df with the new peak area
+      peak_area_df[peak_index, paste0(plotname)] <- area
+
+      #Create temporary integration_data for the manually integrated peak to add to existing integration-data later
+      temp_integration_data <- data.frame(
+        "peak.number" = peak_index,
+        "mt.seconds" = time,
+        "intensity" = intensity,
+        "baseline" = new_baseline)
+
+      #Load existing integration_data. Convert the peak number from factor to character
+      integration_data <- plot_data$integration_data
+
+      integration_data <- as.data.frame(lapply(integration_data, function(x) if(is.factor(x)) as.character(x) else x))
+
+      #Check if the peak number exists in the existing integration_data and replace existing data if peak is already there
+      if (peak_index %in% integration_data$peak.number) {
+        integration_data <- integration_data[integration_data$peak.number != peak_index, ]
+      }
+
+      #Add the temporary integration_data to the existing integration_data with the new baseline
+      integration_data <- rbind(integration_data, temp_integration_data)
+
+      #Update values with new data
+      plot_list_data_values$plot_list[[plotname]]$integration_data <- integration_data
+      plot_list_data_values$peak_area_df <- peak_area_df
+      plot_list_data_values$peaks_df <- peaks_df
+
+
+      #Save the updated peaks_df back to the plot_list_data.RData file
+      save_plot_data(plotname)
+
+      #Clear workspace
+      rm(list = c())
+      gc()
+
+      showNotification("Baseline adjusted for individual peak. Area Updated. Metadata updated", type = "message")
+
     })
-    
-    #Check if error is NA or not
-    if (is.na(area)) {
-      showNotification("Error: Area calculation returned NA", type = "error")
-      return(NA)
-    }
-    
-    #Adjust for baseline
-    baseline_adjustment <- (right_boundary - left_boundary) * new_baseline
-    area <- area - baseline_adjustment
-    
-    #Update the specific row in peaks_df with the new integration data
-    peaks_df[peak_index, paste0(plotname, ".start_intensity")] <- min(intensity)
-    peaks_df[peak_index, paste0(plotname, ".end_intensity")] <- min(intensity)
-    peaks_df[peak_index, paste0(plotname, ".peak.area")] <- area
-    
-    #Update peak_area_df with the new peak area
-    peak_area_df[peak_index, paste0(plotname)] <- area
-    
-    #Create temporary integration_data for the manually integrated peak to add to existing integration-data later
-    temp_integration_data <- data.frame(
-      "peak.number" = peak_index,
-      "mt.seconds" = time,
-      "intensity" = intensity,
-      "baseline" = new_baseline)
-    
-    #Load existing integration_data. Convert the peak number from factor to character 
-    integration_data <- plot_data$integration_data
-    
-    integration_data <- as.data.frame(lapply(integration_data, function(x) if(is.factor(x)) as.character(x) else x))
-    
-    #Check if the peak number exists in the existing integration_data and replace existing data if peak is already there
-    if (peak_index %in% integration_data$peak.number) {
-      integration_data <- integration_data[integration_data$peak.number != peak_index, ]
-    }
-    
-    #Add the temporary integration_data to the existing integration_data with the new baseline
-    integration_data <- rbind(integration_data, temp_integration_data)
-    
-    #Update values with new data
-    plot_list_data_values$plot_list[[plotname]]$integration_data <- integration_data
-    plot_list_data_values$peak_area_df <- peak_area_df
-    plot_list_data_values$peaks_df <- peaks_df
-    
-    
-    #Save the updated peaks_df back to the plot_list_data.RData file
-    save_plot_data(plotname)
-    
-    #Clear workspace
-    rm(list = c())
-    gc()
-    
-    showNotification("Baseline adjusted for individual peak. Area Updated. Metadata updated", type = "message")
   }
   
   ######4.7.5 Applying manual basline adjustment on individual peaks######
@@ -5312,81 +5461,85 @@ server <- function(input, output, session){
   
   #Function to adjust all baselines in the plot
   adjust_plot_baseline <- function(plot_baseline) {
-    
-    #Initialize variables and load data
-    selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-    base_file_name <- sub("\\.mz5$", "", input$file_selector)
-    plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-    
-    #Mark the plot as modified
-    modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-    
-    plot_data <- plot_list_data_values$plot_list[[plotname]]
-    eie_df <- plot_data$eie_data
-    peaks_df <- plot_list_data_values$peaks_df
-    peak_area_df <- plot_list_data_values$peak_area_df
-    integration_data <- plot_data$integration_data
-    
-    #Loop through all peaks 
-    for (peak_index in 1:nrow(peaks_df)) {
-      
-      #Get boundaries of the individual peaks to integrate between 
-      left_boundary <- peaks_df[peak_index, paste0(plotname, ".start.seconds")]
-      right_boundary <- peaks_df[peak_index, paste0(plotname, ".end.seconds")]
-      
-      integrated_data <- eie_df[eie_df$mt.seconds >= left_boundary & eie_df$mt.seconds <= right_boundary, ]
-      intensity_column <- paste(plotname, "intensity", sep = " ")
-      time <- integrated_data$mt.seconds
-      intensity <- integrated_data[[intensity_column]]
-      
-      #Area function
-      area <- tryCatch({
-        AUC(time,
-            intensity,
-            method = "trapezoid",
-            from = min(time),
-            to = max(time),
-            absolutearea = FALSE,
-            na.rm = FALSE)
-      }, error = function(e) {
-        showNotification(paste("Error in AUC calculation:", e), type = "error")
-        return(NA)})
-      
-      #Check if area is NA
-      if (is.na(area)) {
-        showNotification("Error: Area calculation returned NA", type = "error")
-        next
-      }
-      
-      #Adjust baseline and update area
-      baseline_adjustment <- (right_boundary - left_boundary) * plot_baseline
-      area <- area - baseline_adjustment
+    req(input$plot_table_rows_selected)
+    perform_peak_edit("Adjust all baselines", function() {
 
-      peaks_df[peak_index, paste0(plotname, ".peak.area")] <- area
-      peak_area_df[peak_index, paste0(plotname)] <- area
-      
-      #Update integration data
-      temp_integration_data <- data.frame(
-        "peak.number" = peak_index,
-        "mt.seconds" = time,
-        "intensity" = intensity,
-        "baseline" = plot_baseline)
-      
-      integration_data <- as.data.frame(lapply(integration_data, function(x) if(is.factor(x)) as.character(x) else x))
-      if (peak_index %in% integration_data$peak.number) {
-        integration_data <- integration_data[integration_data$peak.number != peak_index, ]
+      #Initialize variables and load data
+      selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+      base_file_name <- sub("\\.mz5$", "", input$file_selector)
+      plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+
+      #Mark the plot as modified
+      modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
+
+      plot_data <- plot_list_data_values$plot_list[[plotname]]
+      eie_df <- plot_data$eie_data
+      peaks_df <- plot_list_data_values$peaks_df
+      peak_area_df <- plot_list_data_values$peak_area_df
+      integration_data <- plot_data$integration_data
+
+      #Loop through all peaks
+      for (peak_index in 1:nrow(peaks_df)) {
+
+        #Get boundaries of the individual peaks to integrate between
+        left_boundary <- peaks_df[peak_index, paste0(plotname, ".start.seconds")]
+        right_boundary <- peaks_df[peak_index, paste0(plotname, ".end.seconds")]
+
+        integrated_data <- eie_df[eie_df$mt.seconds >= left_boundary & eie_df$mt.seconds <= right_boundary, ]
+        intensity_column <- paste(plotname, "intensity", sep = " ")
+        time <- integrated_data$mt.seconds
+        intensity <- integrated_data[[intensity_column]]
+
+        #Area function
+        area <- tryCatch({
+          AUC(time,
+              intensity,
+              method = "trapezoid",
+              from = min(time),
+              to = max(time),
+              absolutearea = FALSE,
+              na.rm = FALSE)
+        }, error = function(e) {
+          showNotification(paste("Error in AUC calculation:", e), type = "error")
+          return(NA)})
+
+        #Check if area is NA
+        if (is.na(area)) {
+          showNotification("Error: Area calculation returned NA", type = "error")
+          next
+        }
+
+        #Adjust baseline and update area
+        baseline_adjustment <- (right_boundary - left_boundary) * plot_baseline
+        area <- area - baseline_adjustment
+
+        peaks_df[peak_index, paste0(plotname, ".peak.area")] <- area
+        peak_area_df[peak_index, paste0(plotname)] <- area
+
+        #Update integration data
+        temp_integration_data <- data.frame(
+          "peak.number" = peak_index,
+          "mt.seconds" = time,
+          "intensity" = intensity,
+          "baseline" = plot_baseline)
+
+        integration_data <- as.data.frame(lapply(integration_data, function(x) if(is.factor(x)) as.character(x) else x))
+        if (peak_index %in% integration_data$peak.number) {
+          integration_data <- integration_data[integration_data$peak.number != peak_index, ]
+        }
+        integration_data <- rbind(integration_data, temp_integration_data)
       }
-      integration_data <- rbind(integration_data, temp_integration_data)
-    }
-    
-    #Update metadata 
-    plot_list_data_values$plot_list[[plotname]]$integration_data <- integration_data
-    plot_list_data_values$peak_area_df <- peak_area_df
-    plot_list_data_values$peaks_df <- peaks_df
-    
-    save_plot_data(plotname)
-    
-    showNotification("All baselines adjusted. Areas and metadata updated.", type = "message")
+
+      #Update metadata
+      plot_list_data_values$plot_list[[plotname]]$integration_data <- integration_data
+      plot_list_data_values$peak_area_df <- peak_area_df
+      plot_list_data_values$peaks_df <- peaks_df
+
+      save_plot_data(plotname)
+
+      showNotification("All baselines adjusted. Areas and metadata updated.", type = "message")
+
+    })
   }
   
   ######4.7.7 Applying baseline correction across all peaks in selected plot######
@@ -5525,84 +5678,85 @@ server <- function(input, output, session){
   #####4.9 Marking Interferences#####
   # Session action called by the interferences button.
   mark_peak_interferences <- function() {
-    req(input$peak_info_table_rows_selected)
-
-    #Store the current state before making changes
-    previous_metadata$comment_df <- run_metadata$comment_df
-    previous_metadata$plot_list <- run_metadata$plot_list
-    previous_metadata$peaks_df <- run_metadata$peaks_df
-    previous_metadata$peak_mt_df <- run_metadata$peak_mt_df
-    previous_metadata$peak_area_df <- run_metadata$peak_area_df
-    previous_metadata$mi_df <- run_metadata$mi_df
-
-    selected_rows <- input$peak_info_table_rows_selected
-
-    #Extract the current annotation_data
-    selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-    base_file_name <- sub("\\.mz5$", "", input$file_selector)
-    plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
-    plot_list <- plot_list_data_values$plot_list
-
-    #Mark the plot as edited so only plots that have been edited can be regenerated later
-    modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
-
-    if (plotname %in% names(plot_list)) {
-      annotation_data <- plot_list[[plotname]]$annotation_data
-      integration_data <- plot_list[[plotname]]$integration_data
-
-      #Loop through each selected row
-      for (selected_row in selected_rows) {
-        #Get the peak number from the selected row to allow matching accross various acccesible data streams
-        peak_number <- annotation_data$peak.number[selected_row]
-
-        #Update the comment column for the selected peak
-        annotation_data$comment[selected_row] <- "Interferred"
-
-        #Update comment_df so peak areas can be recauculated/reintegrated later on
-        if (plotname %in% colnames(plot_list_data_values$comment_df)) {
-          plot_list_data_values$comment_df[peak_number, plotname] <- "Interferred"
-        }
-
-        #Remove all integration_data associated with the relevant peak number so regenerated plots will update with the interferred peaks once regenerated
-        integration_data <- integration_data[integration_data$peak.number != peak_number, ]
-      }
-
-      #Update the plot_list with the modified annotation_data
-      plot_list[[plotname]]$annotation_data <- annotation_data
-      plot_list[[plotname]]$integration_data <- integration_data
-
-      #Update the reactive plot_list_data
-      plot_list_data_values$plot_list <- plot_list
+    if (!length(input$peak_info_table_rows_selected)) {
+      showNotification("Select peak rows in the Peak Position Information table first.", type = "message")
+      return(invisible(FALSE))
     }
 
-    save_plot_data(plotname)
+    req(input$plot_table_rows_selected)
+    perform_peak_edit("Mark peak interference", function() {
+      req(input$peak_info_table_rows_selected)
 
-    #Reload the updated data
-    subfolder_path <- file.path(input$results_folder, "Data", run_metadata$file_name)
-    reload_plot_data(subfolder_path)
+      selected_rows <- input$peak_info_table_rows_selected
 
-    #Update reactive values directly
-    plot_list_data_values$plot_list <- plot_list
-    plot_list_data_values$comment_df <- plot_list_data_values$comment_df
-
-
-    #Update the peak_info_table
-    output$peak_info_table <- DT::renderDataTable({
-      req(input$plot_table_rows_selected)
+      #Extract the current annotation_data
       selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
-
       base_file_name <- sub("\\.mz5$", "", input$file_selector)
       plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
       plot_list <- plot_list_data_values$plot_list
 
-      #Ensure the plotname exists in the plot_list
+      #Mark the plot as edited so only plots that have been edited can be regenerated later
+      modified_peak_plots$names <- unique(c(modified_peak_plots$names, selected_plot_name))
+
       if (plotname %in% names(plot_list)) {
         annotation_data <- plot_list[[plotname]]$annotation_data
-        annotation_data
-      } else {
-        data.frame()
+        integration_data <- plot_list[[plotname]]$integration_data
+
+        #Loop through each selected row
+        for (selected_row in selected_rows) {
+          #Get the peak number from the selected row to allow matching accross various acccesible data streams
+          peak_number <- annotation_data$peak.number[selected_row]
+
+          #Update the comment column for the selected peak
+          annotation_data$comment[selected_row] <- "Interferred"
+
+          #Update comment_df so peak areas can be recauculated/reintegrated later on
+          if (plotname %in% colnames(plot_list_data_values$comment_df)) {
+            plot_list_data_values$comment_df[peak_number, plotname] <- "Interferred"
+          }
+
+          #Remove all integration_data associated with the relevant peak number so regenerated plots will update with the interferred peaks once regenerated
+          integration_data <- integration_data[integration_data$peak.number != peak_number, ]
+        }
+
+        #Update the plot_list with the modified annotation_data
+        plot_list[[plotname]]$annotation_data <- annotation_data
+        plot_list[[plotname]]$integration_data <- integration_data
+
+        #Update the reactive plot_list_data
+        plot_list_data_values$plot_list <- plot_list
       }
-    }, options = list(pageLength = 13), selection = 'multiple')
+
+      save_plot_data(plotname)
+
+      #Reload the updated data
+      subfolder_path <- file.path(main_folder(), "Data", run_metadata$file_name)
+      reload_plot_data(subfolder_path)
+
+      #Update reactive values directly
+      plot_list_data_values$plot_list <- plot_list
+      plot_list_data_values$comment_df <- plot_list_data_values$comment_df
+
+
+      #Update the peak_info_table
+      output$peak_info_table <- DT::renderDataTable({
+        req(input$plot_table_rows_selected)
+        selected_plot_name <- filtered_plot_names()[input$plot_table_rows_selected]
+
+        base_file_name <- sub("\\.mz5$", "", input$file_selector)
+        plotname <- sub(paste0("^", base_file_name, "_"), "", selected_plot_name)
+        plot_list <- plot_list_data_values$plot_list
+
+        #Ensure the plotname exists in the plot_list
+        if (plotname %in% names(plot_list)) {
+          annotation_data <- plot_list[[plotname]]$annotation_data
+          annotation_data
+        } else {
+          data.frame()
+        }
+      }, options = list(pageLength = 13), selection = 'multiple')
+
+    })
   }
 
   observe_action(input$interferences, {
@@ -5665,7 +5819,7 @@ server <- function(input, output, session){
     current <- isolate(input$results_folder2)
     visualization <- isolate(input$results_folder)
     updateSelectInput(session, "results_folder2", choices = c("Select a saved analysis" = "",
-                      stats::setNames(folders, basename(folders))),
+                      analysis_folder_choices(folders)),
       selected = if (length(current) == 1L && current %in% folders) current else
         if (length(visualization) == 1L && visualization %in% folders) visualization else "")
   })

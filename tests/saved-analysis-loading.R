@@ -99,13 +99,13 @@ load_event <- Filter(function(x) is.call(x) && identical(x[[1]], as.name("observ
 stopifnot(length(load_event) == 1L)
 guard_names <- c("action_label", "report_action_error", "with_action_error", "observe_action", "observe_updates")
 state_names <- c("plot_list_data_values", "run_metadata", "previous_metadata", "modified_peak_plots",
-                 "plot_render_trigger", "main_folder", "db_con")
+                 "plot_render_trigger", "editing_context", "edit_history_trigger", "main_folder", "db_con")
 counts <- new.env(); counts$loads <- 0L; counts$errors <- character()
 harness <- function(input, output, session) {
   results_folders_reactive <- reactive(c(first, second, other))
   for (name in c(guard_names, state_names)) eval(assignment(name), environment())
   for (name in c("load_saved_plot_list", "read_saved_electropherogram", "read_plot_data_from_db",
-                 "load_wide_data_from_db", "clear_loaded_analysis")) eval(assignment(name), environment())
+                 "load_wide_data_from_db", "pending_peak_plots", "clear_loaded_analysis")) eval(assignment(name), environment())
   original_loader <- tasks$load_plot_list_from_db
   load_plot_list_from_db <- function(...) {
     counts$loads <- counts$loads + 1L

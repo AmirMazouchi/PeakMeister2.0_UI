@@ -1,3 +1,5 @@
+# Visualization has multi-step Undo/Redo and a history count. Peak edits create
+# a separate edited analysis copy; the original analysis remains available.
 # Visualization's unused .RData upload and Clear uploaded data controls are
 # removed. Reopen saved data through Engine's run selection and Visualization's
 # saved-analysis selector.
@@ -393,7 +395,7 @@ ui <- dashboardPage(
                        tags$style(HTML("
                         #adjust_all_baselines {background-color: #71A9F7; color: black;}
                         #delete_peak {background-color: #2E86AB; color: black;}
-                        #undo {background-color: #243B4A; color: white;}
+                        #undo, #redo {background-color: #243B4A; color: white;}
                         #other_options {background-color: #0E3B43; color: white;}
                         #manual_integrate {background-color: #00A8E8; color: black;}
                         #adjust_indiv_baseline {background-color: #28536B; color: white;}
@@ -401,7 +403,9 @@ ui <- dashboardPage(
                        #Action button for deleting peaks
                        actionButton("delete_peak", "Delete Selected Peaks"),
                        #Action button for undoing peak deletion
-                       actionButton("undo", "Undo Peak Deletion"),
+                       actionButton("undo", "Undo"),
+                       actionButton("redo", "Redo"),
+                       textOutput("edit_history_status"),
                        #Action button for manual integration 
                        actionButton("manual_integrate", "Manually Adjust Integration"),
                        #Action button for adjusting baseline (across individual peaks)
