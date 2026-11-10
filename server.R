@@ -1,3 +1,7 @@
+# Original numbered section comments are restored in their original order.
+# Reorganized tasks include pointers to their current function implementations;
+# the removed pseudo-file section is retained as a comment-only historical marker.
+# This section-comment update does not change executable code.
 # Peak edits use a separate analysis copy. Persistent SQLite action history
 # supports multi-step Undo/Redo for deletions, integration, baselines and flags;
 # restoring a step updates peak tables, the RData snapshot and CSV exports.
@@ -788,7 +792,17 @@ server <- function(input, output, session){
     reset_raw_selection()
   })
 
-  #####3.2 Processing task functions#####
+  ######3.1.2 Upload file names and generate pseudo .mz5 files######
+  # Removed: filename-table inputs and pseudo .mz5 generation were deleted.
+  # Engine -> Open existing analysis now selects a saved run folder instead.
+  # This historical marker does not restore the removed controls or handlers.
+
+  #####3.2 Initialze Run Button - Main Content######
+  # Reorganized: Initialize Run is split into the task functions below,
+  # run_new_analysis() and process_mz5_file(). The input$initialize observer
+  # follows those helpers, after section 3.12.3. This marker retains its
+  # original position before migration-index calculation.
+  # Processing task functions:
   # Data functions receive ordinary tables/objects and return their results.
   # GUI action functions below retain this session's reactive state.
 
@@ -979,6 +993,9 @@ server <- function(input, output, session){
          num_of_is = num_of_is, num_of_injections = num_of_injections, mi_df = mi_df)
   }
 
+  #####3.5 Data File Analysis#####
+  # Reorganized: raw-file reading starts here; process_mz5_file() below
+  # coordinates the per-file folders, temporary copy and subsequent tasks.
   # Read one copied raw file and unlock its spectra for calibration.
   read_mz5_data <- function(temporary_file, total_steps) {
     #Read copied data file and update progress bar
@@ -1004,6 +1021,7 @@ server <- function(input, output, session){
     run_data
   }
 
+  #####3.6 Perform Mass Calibration#####
   # Apply optional lock-mass calibration; return the run object.
   calibrate_masses <- function(run_data, parameters_df, total_steps) {
     calibration_response <- parameters_df$apply.mass.calibration
@@ -1145,6 +1163,7 @@ server <- function(input, output, session){
     run_data
   }
 
+  #####3.7 Extract Electropherograms#####
   # Build extraction windows and sort the spectra used for extraction.
   prepare_extraction_spectra <- function(run_data, is_df, mass_df, total_steps) {
     #Update progress bar
@@ -1252,6 +1271,7 @@ server <- function(input, output, session){
     eie_df
   }
 
+  #####3.8 Smooth Intensity Vectors#####
   # Optionally smooth the intensity columns; temporary objects stay local.
   smooth_electropherograms <- function(eie_df, is_df, mass_df, parameters_df, name_vec, total_steps) {
     smoothing_response <- parameters_df$apply.smoothing
@@ -1278,6 +1298,7 @@ server <- function(input, output, session){
     eie_df
   }
 
+  #####3.9 Internal Standard Peak Detection, Integration, and Filtering#####
   # Detect, integrate and filter the internal-standard peaks.
   process_internal_standard_peaks <- function(eie_df, is_df, parameters_df, name_vec, num_of_is, num_of_injections, total_steps) {
     #Update progress bar
@@ -1603,6 +1624,7 @@ server <- function(input, output, session){
     is_peaks_df
   }
 
+  #####3.10 Metabolite  Peak Detection, Integration, and Filtering#####
   # Detect, integrate and align metabolite peaks using the reference peaks/indexes.
   process_metabolite_peaks <- function(eie_df, mass_df, is_df, is_mt_df, mi_df, name_vec, num_of_is, num_of_injections, total_steps) {
     #Update progress bar
@@ -2039,6 +2061,7 @@ server <- function(input, output, session){
     metabolite_peaks_df
   }
 
+  ######3.10.8 Filter peaks below LOD######
   # Annotate metabolite peaks below the noise threshold or with no detection.
   flag_peaks_below_lod <- function(eie_df, metabolite_peaks_df, mass_df, num_of_is, num_of_metabolites, num_of_injections) {
     #Build a data frame to store comments for each metabolite peak
@@ -2096,6 +2119,7 @@ server <- function(input, output, session){
     comment_df
   }
 
+  ######3.10.9 Filter interfered peaks######
   # Flag co-migration interference and combine standard/metabolite tables.
   flag_interfered_peaks <- function(comment_df, is_peaks_df, metabolite_peaks_df, mass_df, is_df, name_vec, num_of_metabolites, num_of_injections) {
     #Build an interference data frame since some are metabolites and some are internal standards
@@ -2168,6 +2192,7 @@ server <- function(input, output, session){
     list(peaks_df = peaks_df, comment_df = comment_df)
   }
 
+  #####3.11 Plotting#####
   # Build annotations, integration ribbons and axes for every trace.
   build_plot_data <- function(eie_df, peaks_df, comment_df, name_vec, mz_vec, num_of_injections) {
     #Make a list to save plots to
@@ -2249,6 +2274,7 @@ server <- function(input, output, session){
     plot_list
   }
 
+  ######3.11.2 Create plot function for ggplots######
   # Save PNG plots in the existing Sample or Metabolite folder layout.
   save_static_plots <- function(plot_list, eie_df, mi_df, parameters_df, name_vec, num_of_is, file_name, file_stem, raw_path) {
     plot_function <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data){
@@ -2288,6 +2314,14 @@ server <- function(input, output, session){
 
     }
 
+    ######3.11.3 Create Plot Function for making plotly plots######
+    # Reorganized: the Plotly factory is now nested in build_interactive_plots(),
+    # in section 3.11.6 below. Keep this marker in its original section order
+    # without moving executable code out of its current task functions.
+
+    ######3.11.4 Initialize Saving Locations and Folders######
+    # Shared Plots/Data setup is in prepare_results_folder(); Sample plot
+    # subfolders are created here, and Metabolite folders by that helper.
     if (parameters_df$plot.format == "Sample"){
 
 
@@ -2432,8 +2466,11 @@ server <- function(input, output, session){
     invisible(NULL)
   }
 
+  ######3.11.6 Save plots as editable plotly plots######
   # Build the editable Plotly objects without publishing or saving them.
+  # Saving the assembled list is delegated to save_interactive_plots().
   build_interactive_plots <- function(plot_list, mi_df, name_vec, num_of_is, file_stem) {
+    # Implementation of the Plotly factory referenced by section 3.11.3.
     plot_function_plotly <- function(eie_data, annotation_data, integration_data, label_data, x_axis_data, y_axis_data, source = "A") {
       plot_ly(source = source) %>%
         add_lines(
@@ -2566,8 +2603,10 @@ server <- function(input, output, session){
     plotly_objects
   }
 
+  #####3.12 Export Data#####
   # Build the peak-area and migration-time reports with existing annotations.
   build_result_tables <- function(peaks_df, comment_df, name_vec, num_of_injections, file_stem) {
+    ######3.12.1 Generate peak area data frame######
     peak_area_df <- cbind("file.name" = c(file_stem, rep("", num_of_injections - 1)),
                           "peak.number" = c(1:num_of_injections),
                           peaks_df[,seq(from = 7, to = ncol(peaks_df), by = 7)])
@@ -2652,6 +2691,7 @@ server <- function(input, output, session){
     print(paste("database write complete for:", file_stem))
   }
 
+  ######3.12.3 Export data######
   # Export the per-file reports without changing their names or column formats.
   export_result_csvs <- function(file_name, peak_area_df, peak_mt_df) {
     write.csv(peak_area_df, file.path(file_name, "Metabolite Peak Areas.csv"), row.names = FALSE)
@@ -2780,7 +2820,8 @@ server <- function(input, output, session){
     })
   }
 
-  #####3.3 Initialize Run: validate the selection, then call the workflow#####
+  # Initialize Run action for reorganized section 3.2: validate the selection,
+  # then call the workflow. Its numbered marker remains before section 3.3.
   observe_action(input$initialize, {
     if (analysis_mode() != "new") {
       shiny::showNotification("Choose New analysis to process raw files.", type = "error")
@@ -6389,6 +6430,8 @@ server <- function(input, output, session){
   
   ######5.7.4 Output for CV processing######
   observe_action(input$compute_cv, {
+    #######5.7.4.1 CV plot#######
+    # CV plot construction is delegated to build_quality_cv_plot() above.
     # Clear previous results so rejected inputs cannot leave stale plots visible.
     output$average_cv_table <- renderTable(NULL)
     output$cv_plot <- renderPlotly(NULL)
@@ -6405,6 +6448,8 @@ server <- function(input, output, session){
                  `Average CV` = c(avg_cv$qc_cv, avg_cv$non_qc_cv))
     })
     output$cv_plot <- renderPlotly({ build_quality_cv_plot(avg_cv) })
+    #######5.7.4.2 Create PCA plot#######
+    # PCA plot construction is delegated to build_quality_pca_plot() above.
     output$pca_plot <- renderPlot({
       shiny::validate(shiny::need(!is.null(avg_cv$pca_result),
         "PCA is unavailable for these data. CV results are shown separately."))
