@@ -110,6 +110,10 @@ investigate_harness <- function(input, output, session) {
   report_action_error <- function(action, error) {
     signals$errors[[length(signals$errors) + 1L]] <- list(action = action, message = conditionMessage(error))
   }
+  # Reproduce packages loaded after Shiny masking its progress updater. Calling
+  # this S3 generic with a numeric fraction matches the reported runtime error.
+  setProgress <- function(value, ...) UseMethod("setProgress")
+  withProgress <- function(...) stop("A masked withProgress() was called.")
   eval(investigate_block, environment())
   investigate_open_raw <- open_fixture
   if (inherits(session, "MockShinySession")) {
@@ -164,7 +168,7 @@ testServer(investigate_harness, {
 })
 stopifnot(signals$opens == signals$closes)
 same(unname(tools::md5sum(fixture_path)), hash_before)
-cat("PASS: ppm/Da, inclusive boundaries, mean/sum/max, MS1-only and finite data; bounded batches/grid; real 3D/log/slice Plotly traces; actual GUI actions, cache/range changes, click selection, recoverable errors, handle cleanup and unchanged raw input.\n")
+cat("PASS: ppm/Da, inclusive boundaries, mean/sum/max, MS1-only and finite data; bounded batches/grid; real 3D/log/slice Plotly traces; actual GUI actions with masked progress functions, cache/range changes, click selection, recoverable errors, handle cleanup and unchanged raw input.\n")
 
 # New UI IDs are unique, and the menu places Investigate between Engine and Visualization.
 suppressPackageStartupMessages({ library(shinydashboard); library(DT); library(shinyjs); library(waiter) })

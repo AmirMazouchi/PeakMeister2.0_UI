@@ -76,6 +76,8 @@ an MSnbase object. Only one preview and one exact trace are cached per session.
 File handles close when the loaded file is replaced, the investigation is
 cleared, or the session ends. Opening a file that cannot be read and invalid
 range requests use the existing guarded error handling, allowing retry.
+Both plotting actions explicitly call `shiny::withProgress()` and
+`shiny::setProgress()` so other loaded packages cannot mask progress updates.
 
 ## Code sections
 

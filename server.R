@@ -1,4 +1,6 @@
 # MetaboMeister adds a read-only Investigate tab in section Matabo3.6.
+# Investigate explicitly uses Shiny's progress functions so packages loaded
+# later cannot mask the numeric progress updates for either plot.
 # mzR reads raw MS1 scans in small batches; only a bounded grid is sent to the
 # 3D plot. Cross-sections use the original scans, not that preview grid.
 # Raw handles close on Clear, replacement or session end. Analysis code and
@@ -1419,10 +1421,10 @@ server <- function(input, output, session){
         c(input$investigate_z_min, input$investigate_z_max), "3D intensity range", nonnegative = FALSE)
       key <- c(raw$name, mz_range, time_range, input$investigate_mz_bins, input$investigate_time_bins)
       grid <- if (!is.null(previous) && identical(previous$key, key)) previous else {
-        withProgress(message = "Building raw 3D preview", value = 0, {
+        shiny::withProgress(message = "Building raw 3D preview", value = 0, {
           investigate_build_grid(raw, mz_range, time_range,
             as.integer(input$investigate_mz_bins), as.integer(input$investigate_time_bins),
-            progress = function(fraction) setProgress(value = fraction))
+            progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
       grid$key <- key
@@ -1442,10 +1444,10 @@ server <- function(input, output, session){
       key <- c(raw$name, input$investigate_center, input$investigate_window,
         input$investigate_unit, time_range, input$investigate_aggregation)
       trace <- if (!is.null(previous) && identical(previous$key, key)) previous else {
-        withProgress(message = "Extracting original MS1 scans", value = 0, {
+        shiny::withProgress(message = "Extracting original MS1 scans", value = 0, {
           investigate_extract_slice(raw, input$investigate_center, input$investigate_window,
             input$investigate_unit, time_range, input$investigate_aggregation,
-            progress = function(fraction) setProgress(value = fraction))
+            progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
       trace$key <- key
