@@ -1,3 +1,6 @@
+# MetaboMeister adds Investigate between Engine and Visualization. It provides
+# a bounded 3D raw-MS1 preview and an exact m/z-window trace with range controls.
+# Original section headings are retained; new sections use the Matabo prefix.
 # Visualization has multi-step Undo/Redo and a history count. Peak edits create
 # a separate edited analysis copy; the original analysis remains available.
 # Visualization's unused .RData upload and Clear uploaded data controls are
@@ -50,6 +53,10 @@ ui <- dashboardPage(
       menuItem("Engine",
                tabName = "engine",
                icon = icon("heartbeat")),
+      #####Matabo2.1 Investigate navigation#####
+      menuItem("Investigate",
+               tabName = "investigate",
+               icon = icon("cube")),
       #Visualization tab for checking electropherograms
       menuItem("Visualization",
         tabName = "processing",
@@ -363,6 +370,78 @@ ui <- dashboardPage(
       ),
       
       
+      #####Matabo5.1 Investigate raw mass spectra#####
+      tabItem(tabName = "investigate",
+        h3("Investigate raw data"),
+        p("Explore MS1 measurements without running peak detection. Time is shown in minutes."),
+        radioButtons("investigate_source", "Raw file source",
+          choices = c("Use an Engine upload" = "engine", "Select another .mz5 file" = "upload"),
+          selected = "engine", inline = TRUE),
+        conditionalPanel("input.investigate_source === 'engine'",
+          selectInput("investigate_engine_file", "Raw .mz5 uploaded in Engine:",
+            choices = c("Select a raw upload" = ""))),
+        conditionalPanel("input.investigate_source === 'upload'",
+          fileInput("investigate_raw_file", "Select raw .mz5 for investigation:", accept = ".mz5")),
+        helpText("Saved analyses do not contain the full m/z data. To investigate an existing analysis, select its original .mz5 here. This does not start an analysis."),
+        actionButton("investigate_load", "Load raw file"),
+        actionButton("investigate_clear", "Clear investigation"),
+        verbatimTextOutput("investigate_status"),
+        fluidRow(
+          column(3,
+            h4("3D display ranges"),
+            fluidRow(
+              column(6, numericInput("investigate_mz_min", "m/z minimum", 50, min = 0)),
+              column(6, numericInput("investigate_mz_max", "m/z maximum", 1000, min = 0))),
+            fluidRow(
+              column(6, numericInput("investigate_time_min", "Time start (min)", 0, min = 0)),
+              column(6, numericInput("investigate_time_max", "Time end (min)", 40, min = 0))),
+            checkboxInput("investigate_auto_z", "Automatic intensity range", TRUE),
+            conditionalPanel("!input.investigate_auto_z",
+              fluidRow(
+                column(6, numericInput("investigate_z_min", "Intensity min", 0)),
+                column(6, numericInput("investigate_z_max", "Intensity max", 1000)))),
+            fluidRow(
+              column(6, selectInput("investigate_mz_bins", "m/z bins", c(100, 200, 400), selected = 200)),
+              column(6, selectInput("investigate_time_bins", "Time bins", c(80, 160, 320), selected = 160))),
+            checkboxInput("investigate_log_z", "Show log10(1 + intensity)", FALSE),
+            helpText("In log view, negative intensities are shown at zero height."),
+            actionButton("investigate_draw_3d", "Draw / apply 3D ranges"),
+            actionButton("investigate_reset_3d", "Reset 3D view"),
+            helpText("Drag to rotate; use the toolbar to pan, zoom or reset the camera. Click the surface to select a centre m/z for the trace below."),
+            tags$hr(),
+            h4("m/z cross-section"),
+            numericInput("investigate_center", "Centre m/z", 100, min = 0),
+            helpText("A 3D click selects a bin centre. For a precise ppm window, enter the exact m/z or narrow the 3D range first."),
+            fluidRow(
+              column(6, numericInput("investigate_window", "Window (±)", 20, min = 0)),
+              column(6, selectInput("investigate_unit", "Window unit", c("ppm", "Da"), selected = "ppm"))),
+            selectInput("investigate_aggregation", "Intensity within the m/z window",
+              choices = c("Mean (matches current extraction)" = "mean", "Sum" = "sum", "Maximum" = "max")),
+            fluidRow(
+              column(6, numericInput("investigate_slice_time_min", "Time start (min)", 0, min = 0)),
+              column(6, numericInput("investigate_slice_time_max", "Time end (min)", 40, min = 0))),
+            checkboxInput("investigate_auto_y", "Automatic trace intensity range", TRUE),
+            conditionalPanel("!input.investigate_auto_y",
+              fluidRow(
+                column(6, numericInput("investigate_y_min", "Intensity min", 0)),
+                column(6, numericInput("investigate_y_max", "Intensity max", 1000)))),
+            actionButton("investigate_draw_slice", "Plot / apply cross-section"),
+            actionButton("investigate_reset_slice", "Reset trace view")
+          ),
+          column(9,
+            h4("m/z × time × intensity"),
+            textOutput("investigate_grid_status"),
+            plotlyOutput("investigate_3d", height = "560px"),
+            helpText("The 3D preview shows the maximum measured intensity in each m/z/time bin; empty bins are zero. The orange band marks the selected m/z window. Narrow the display ranges for more detail."),
+            h4("Extracted m/z cross-section"),
+            textOutput("investigate_slice_status"),
+            plotlyOutput("investigate_slice", height = "350px"),
+            helpText("This trace uses the original scans, not the binned surface. Set the centre and ± window, then click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range.")
+          )
+        )
+      ),
+      #####Matabo5.1 End Investigate raw mass spectra#####
+
       ####6. Visualization tab####
       tabItem(tabName = "processing",
               fluidRow(

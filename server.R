@@ -1,7 +1,12 @@
+# MetaboMeister adds a read-only Investigate tab in section Matabo3.6.
+# mzR reads raw MS1 scans in small batches; only a bounded grid is sent to the
+# 3D plot. Cross-sections use the original scans, not that preview grid.
+# Raw handles close on Clear, replacement or session end. Analysis code and
+# original numbered section comments are preserved.
 # Original numbered section comments are restored in their original order.
 # Reorganized tasks include pointers to their current function implementations;
 # the removed pseudo-file section is retained as a comment-only historical marker.
-# This section-comment update does not change executable code.
+# The earlier section-comment restoration did not change executable code.
 # Peak edits use a separate analysis copy. Persistent SQLite action history
 # supports multi-step Undo/Redo for deletions, integration, baselines and flags;
 # restoring a step updates peak tables, the RData snapshot and CSV exports.
@@ -1162,6 +1167,353 @@ server <- function(input, output, session){
 
     run_data
   }
+
+  #####Matabo3.6 Investigate raw m/z, time and intensity#####
+  # This independent, read-only workflow uses an Engine upload or its own raw
+  # upload. It never starts analysis, calibrates spectra or writes result files.
+  investigate_raw <- reactiveVal(NULL)
+  investigate_grid <- reactiveVal(NULL)
+  investigate_trace <- reactiveVal(NULL)
+
+  ######Matabo3.6.1 Raw-file metadata, validation and bounded scan reading######
+  investigate_range <- function(values, label, nonnegative = TRUE) {
+    if (!is.numeric(values) || length(values) != 2L || any(!is.finite(values)) ||
+        values[1] >= values[2] || (nonnegative && values[1] < 0)) {
+      stop(label, " must have finite minimum and maximum values, with minimum < maximum.", call. = FALSE)
+    }
+    as.numeric(values)
+  }
+
+  investigate_window_limits <- function(center, window, unit) {
+    if (length(center) != 1L || !is.finite(center) || center <= 0 ||
+        length(window) != 1L || !is.finite(window) || window <= 0 ||
+        length(unit) != 1L || !unit %in% c("ppm", "Da")) {
+      stop("Choose a positive centre m/z and a positive ± window in ppm or Da.", call. = FALSE)
+    }
+    half_width <- if (unit == "ppm") center * window / 1e6 else window
+    investigate_range(c(max(0, center - half_width), center + half_width), "m/z window")
+  }
+
+  investigate_clean_scan <- function(scan) {
+    if (is.null(scan) || !length(scan)) return(matrix(numeric(), ncol = 2L))
+    scan <- as.matrix(scan)
+    if (!is.numeric(scan) || ncol(scan) < 2L) stop("The raw reader returned an invalid spectrum.")
+    scan <- scan[, 1:2, drop = FALSE]
+    scan[is.finite(scan[, 1]) & scan[, 1] >= 0 & is.finite(scan[, 2]), , drop = FALSE]
+  }
+
+  investigate_open_raw <- function(path, name,
+      opener = function(path) mzR::openMSfile(path, backend = "pwiz"),
+      read_header = mzR::header, read_peaks = mzR::peaks,
+      closer = function(handle) mzR::close(handle)) {
+    if (length(path) != 1L || is.na(path) || !file.exists(path)) stop("Select an available raw .mz5 file.")
+    if (length(name) != 1L || !grepl("\\.mz5$", name, ignore.case = TRUE)) stop("Select a real .mz5 file.")
+    handle <- opener(path)
+    ready <- FALSE
+    on.exit(if (!ready) try(closer(handle), silent = TRUE), add = TRUE)
+    header <- as.data.frame(read_header(handle))
+    if (!all(c("msLevel", "retentionTime") %in% names(header))) stop("The file has no usable scan metadata.")
+    scans <- which(header$msLevel == 1L & is.finite(header$retentionTime) & header$retentionTime >= 0)
+    if (!length(scans)) stop("The file contains no MS1 scans with valid acquisition times.")
+    scans <- scans[order(header$retentionTime[scans])]
+    times <- header$retentionTime[scans] / 60
+    time_range <- range(times)
+    if (diff(time_range) == 0) time_range <- c(max(0, time_range[1] - 1/120), time_range[2] + 1/120)
+    mz_range <- c(NA_real_, NA_real_)
+    range_source <- "scan metadata"
+    if (all(c("lowMZ", "highMZ") %in% names(header))) {
+      low <- header$lowMZ[scans]; high <- header$highMZ[scans]
+      good <- is.finite(low) & is.finite(high) & low >= 0 & high > low
+      if (any(good)) mz_range <- c(min(low[good]), max(high[good]))
+    }
+    # Check a small, evenly spaced sample: some converted files have missing
+    # or inconsistent header ranges. Only one sampled spectrum is held at a time.
+    sample_scans <- unique(scans[round(seq(1, length(scans), length.out = min(8L, length(scans))))])
+    observed <- c(Inf, -Inf)
+    for (index in sample_scans) {
+      scan <- investigate_clean_scan(read_peaks(handle, scans = index))
+      if (nrow(scan)) observed <- c(min(observed[1], scan[, 1]), max(observed[2], scan[, 1]))
+    }
+    if (all(is.finite(observed))) {
+      if (any(!is.finite(mz_range)) || observed[2] < mz_range[1] || observed[1] > mz_range[2]) {
+        mz_range <- observed
+        range_source <- "sampled MS1 measurements"
+      } else if (observed[1] < mz_range[1] || observed[2] > mz_range[2]) {
+        mz_range <- c(min(mz_range[1], observed[1]), max(mz_range[2], observed[2]))
+        range_source <- "scan metadata expanded to include sampled MS1 measurements"
+      }
+    }
+    if (any(!is.finite(mz_range))) stop("No finite m/z range was found in the metadata or sampled MS1 scans.")
+    if (diff(mz_range) == 0) mz_range <- mz_range + c(-0.01, 0.01)
+    mz_range[1] <- max(0, mz_range[1])
+    ready <- TRUE
+    list(handle = handle, name = name, scans = scans, times = times,
+      time_range = time_range, mz_range = mz_range, range_source = range_source,
+      read_peaks = read_peaks, closer = closer)
+  }
+
+  investigate_close_raw <- function(raw) {
+    if (!is.null(raw)) tryCatch(raw$closer(raw$handle), error = function(e) {
+      message("[MetaboMeister] Closing Investigate file: ", conditionMessage(e))
+    })
+    invisible(NULL)
+  }
+
+  investigate_walk_scans <- function(raw, time_range, callback, progress = function(fraction) NULL) {
+    selected <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
+    if (!length(selected)) stop("No MS1 scans fall inside the selected time range.", call. = FALSE)
+    # Eight spectra at a time bounds memory independently of total file size.
+    for (start in seq.int(1L, length(selected), by = 8L)) {
+      batch <- selected[start:min(start + 7L, length(selected))]
+      spectra <- raw$read_peaks(raw$handle, scans = raw$scans[batch])
+      if (is.matrix(spectra) || is.data.frame(spectra)) spectra <- list(spectra)
+      if (!is.list(spectra) || length(spectra) != length(batch)) stop("The raw reader returned an incomplete scan batch.")
+      for (j in seq_along(batch)) callback(investigate_clean_scan(spectra[[j]]), batch[j])
+      progress(min(start + 7L, length(selected)) / length(selected))
+    }
+    selected
+  }
+
+  ######Matabo3.6.2 Binned 3D preview and exact m/z-window extraction######
+  investigate_build_grid <- function(raw, mz_range, time_range, mz_bins = 200L,
+                                      time_bins = 160L, progress = function(fraction) NULL) {
+    mz_range <- investigate_range(mz_range, "3D m/z range")
+    time_range <- investigate_range(time_range, "3D time range")
+    if (length(mz_bins) != 1L || length(time_bins) != 1L ||
+        !mz_bins %in% c(100L, 200L, 400L) || !time_bins %in% c(80L, 160L, 320L)) {
+      stop("Choose one of the available preview resolutions.")
+    }
+    mz_edges <- seq(mz_range[1], mz_range[2], length.out = mz_bins + 1L)
+    time_edges <- seq(time_range[1], time_range[2], length.out = time_bins + 1L)
+    z <- matrix(NA_real_, nrow = time_bins, ncol = mz_bins)
+    points <- 0
+    selected <- investigate_walk_scans(raw, time_range, function(scan, index) {
+      scan <- scan[scan[, 1] >= mz_range[1] & scan[, 1] <= mz_range[2], , drop = FALSE]
+      if (!nrow(scan)) return()
+      points <<- points + nrow(scan)
+      mass_bin <- findInterval(scan[, 1], mz_edges, all.inside = TRUE)
+      time_bin <- findInterval(raw$times[index], time_edges, all.inside = TRUE)
+      maxima <- tapply(scan[, 2], mass_bin, max)
+      columns <- as.integer(names(maxima))
+      z[time_bin, columns] <<- pmax(z[time_bin, columns], as.numeric(maxima), na.rm = TRUE)
+    }, progress)
+    if (!points) stop("No m/z measurements fall inside the selected 3D ranges.", call. = FALSE)
+    z[is.na(z)] <- 0
+    list(mz = head(mz_edges, -1) + diff(mz_edges)/2,
+      time = head(time_edges, -1) + diff(time_edges)/2, z = z,
+      mz_range = mz_range, time_range = time_range, points = points, scans = length(selected))
+  }
+
+  investigate_extract_slice <- function(raw, center, window, unit, time_range,
+                                         aggregation = "mean", progress = function(fraction) NULL) {
+    mz_range <- investigate_window_limits(center, window, unit)
+    time_range <- investigate_range(time_range, "Cross-section time range")
+    if (length(aggregation) != 1L || !aggregation %in% c("mean", "sum", "max")) stop("Choose mean, sum or maximum intensity.")
+    values <- numeric(length(raw$scans))
+    selected <- investigate_walk_scans(raw, time_range, function(scan, index) {
+      intensity <- scan[scan[, 1] >= mz_range[1] & scan[, 1] <= mz_range[2], 2]
+      values[index] <<- if (!length(intensity)) 0 else switch(aggregation,
+        mean = mean(intensity), sum = sum(intensity), max = max(intensity))
+    }, progress)
+    list(data = data.frame(time = raw$times[selected], intensity = values[selected]),
+      center = center, window = window, unit = unit, mz_range = mz_range,
+      time_range = time_range, aggregation = aggregation)
+  }
+
+  investigate_intensity_range <- function(values) {
+    limits <- range(c(0, values[is.finite(values)]))
+    if (diff(limits) == 0) return(c(0, 1))
+    c(if (limits[1] < 0) limits[1] * 1.05 else 0,
+      if (limits[2] > 0) limits[2] * 1.05 else 0)
+  }
+
+  investigate_camera <- function() list(eye = list(x = 1.6, y = 1.6, z = 1.1))
+
+  investigate_plot_grid <- function(grid, band = NULL, logarithmic = FALSE) {
+    transform <- if (logarithmic) function(x) log10(1 + pmax(x, 0)) else identity
+    limits <- transform(grid$intensity_range)
+    if (diff(limits) == 0) limits <- c(0, 1)
+    plot <- plotly::plot_ly(x = grid$mz, y = grid$time, z = transform(grid$z),
+      surfacecolor = grid$z, type = "surface", colorscale = "Viridis",
+      source = "metabomeister_investigate", colorbar = list(title = "Ion counts"),
+      hovertemplate = "m/z: %{x:.5f}<br>Time: %{y:.4f} min<br>Intensity: %{surfacecolor:.4g}<extra></extra>")
+    if (!is.null(band) && band[2] >= grid$mz_range[1] && band[1] <= grid$mz_range[2]) {
+      band <- pmax(grid$mz_range[1], pmin(grid$mz_range[2], band))
+      plot <- plotly::add_trace(plot, type = "mesh3d", inherit = FALSE,
+        x = c(band[1], band[2], band[2], band[1]),
+        y = c(grid$time_range[1], grid$time_range[1], grid$time_range[2], grid$time_range[2]),
+        z = rep(limits[1] + diff(limits) * 0.002, 4), i = c(0, 0), j = c(1, 2), k = c(2, 3),
+        color = I("#f59e0b"), opacity = 0.7, showscale = FALSE, hoverinfo = "skip", name = "Selected m/z window")
+    }
+    plot <- plotly::layout(plot, uirevision = paste(grid$key, collapse = ":"),
+      scene = list(xaxis = list(title = "m/z", range = grid$mz_range),
+        yaxis = list(title = "Time (min)", range = grid$time_range),
+        zaxis = list(title = if (logarithmic) "log10(1 + intensity)" else "Intensity (ion counts)", range = limits),
+        camera = investigate_camera(), dragmode = "orbit", aspectmode = "manual",
+        aspectratio = list(x = 1.3, y = 1.3, z = 0.8)), margin = list(l = 0, r = 0, b = 0, t = 25))
+    plotly::event_register(plotly::config(plot, scrollZoom = TRUE, displaylogo = FALSE), "plotly_click")
+  }
+
+  investigate_plot_slice <- function(trace) {
+    plotly::plot_ly(trace$data, x = ~time, y = ~intensity, type = "scattergl", mode = "lines",
+      line = list(color = "#24547b"), name = paste(trace$aggregation, "intensity"),
+      hovertemplate = "Time: %{x:.4f} min<br>Intensity: %{y:.5g}<extra></extra>") %>%
+      plotly::layout(uirevision = paste(trace$key, collapse = ":"),
+        xaxis = list(title = "Time (min)", range = trace$time_range),
+        yaxis = list(title = paste(trace$aggregation, "intensity (ion counts)"), range = trace$intensity_range),
+        margin = list(l = 70, r = 20, b = 55, t = 20)) %>%
+      plotly::config(scrollZoom = TRUE, displaylogo = FALSE)
+  }
+
+  ######Matabo3.6.3 File selection, range controls and guarded GUI actions######
+  observe_updates({
+    files <- uploadedmz5()
+    files <- files[files$Source == "upload" & !is.na(files$FilePath) & file.exists(files$FilePath), , drop = FALSE]
+    current <- isolate(input$investigate_engine_file)
+    paths <- files$FilePath
+    updateSelectInput(session, "investigate_engine_file",
+      choices = c("Select a raw upload" = "", stats::setNames(paths, files$FileName)),
+      selected = if (length(current) == 1L && current %in% paths) current else if (length(paths)) paths[1] else "")
+  })
+
+  observe_action(input$investigate_clear, {
+    investigate_close_raw(investigate_raw())
+    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL)
+  })
+  session$onSessionEnded(function() investigate_close_raw(isolate(investigate_raw())))
+
+  observe_action(input$investigate_load, {
+    with_action_error({
+      investigate_close_raw(investigate_raw())
+      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL)
+      if (identical(input$investigate_source, "upload")) {
+        file <- input$investigate_raw_file
+        if (is.null(file) || !nrow(file)) stop("Select the original .mz5 file in Investigate first.")
+        path <- file$datapath[1]; name <- file$name[1]
+      } else {
+        files <- uploadedmz5()
+        selected <- which(files$Source == "upload" & files$FilePath == input$investigate_engine_file)
+        if (!length(selected)) stop("No Engine raw upload is selected. Upload a .mz5 in Engine or select another file here.")
+        path <- files$FilePath[selected[1]]; name <- files$FileName[selected[1]]
+      }
+      raw <- investigate_open_raw(path, name)
+      investigate_raw(raw)
+      defaults <- list(investigate_mz_min = raw$mz_range[1], investigate_mz_max = raw$mz_range[2],
+        investigate_time_min = raw$time_range[1], investigate_time_max = raw$time_range[2],
+        investigate_slice_time_min = raw$time_range[1], investigate_slice_time_max = raw$time_range[2])
+      targets <- suppressWarnings(as.numeric(c(refMassListData()$mz, massData()$mz)))
+      targets <- targets[is.finite(targets) & targets >= raw$mz_range[1] & targets <= raw$mz_range[2]]
+      defaults$investigate_center <- if (length(targets)) targets[1] else mean(raw$mz_range)
+      for (id in names(defaults)) updateNumericInput(session, id, value = defaults[[id]])
+    }, "Investigate: load raw file")
+  })
+
+  observe_action(input$investigate_draw_3d, {
+    with_action_error({
+      raw <- investigate_raw()
+      if (is.null(raw)) stop("Load a raw .mz5 file first.")
+      previous <- investigate_grid(); investigate_grid(NULL)
+      mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "3D m/z range")
+      time_range <- investigate_range(c(input$investigate_time_min, input$investigate_time_max), "3D time range")
+      limits <- if (isTRUE(input$investigate_auto_z)) NULL else investigate_range(
+        c(input$investigate_z_min, input$investigate_z_max), "3D intensity range", nonnegative = FALSE)
+      key <- c(raw$name, mz_range, time_range, input$investigate_mz_bins, input$investigate_time_bins)
+      grid <- if (!is.null(previous) && identical(previous$key, key)) previous else {
+        withProgress(message = "Building raw 3D preview", value = 0, {
+          investigate_build_grid(raw, mz_range, time_range,
+            as.integer(input$investigate_mz_bins), as.integer(input$investigate_time_bins),
+            progress = function(fraction) setProgress(value = fraction))
+        })
+      }
+      grid$key <- key
+      grid$intensity_range <- if (is.null(limits)) investigate_intensity_range(grid$z) else limits
+      investigate_grid(grid)
+    }, "Investigate: draw 3D preview")
+  })
+
+  observe_action(input$investigate_draw_slice, {
+    with_action_error({
+      raw <- investigate_raw()
+      if (is.null(raw)) stop("Load a raw .mz5 file first.")
+      previous <- investigate_trace(); investigate_trace(NULL)
+      time_range <- investigate_range(c(input$investigate_slice_time_min, input$investigate_slice_time_max), "Cross-section time range")
+      limits <- if (isTRUE(input$investigate_auto_y)) NULL else investigate_range(
+        c(input$investigate_y_min, input$investigate_y_max), "Trace intensity range", nonnegative = FALSE)
+      key <- c(raw$name, input$investigate_center, input$investigate_window,
+        input$investigate_unit, time_range, input$investigate_aggregation)
+      trace <- if (!is.null(previous) && identical(previous$key, key)) previous else {
+        withProgress(message = "Extracting original MS1 scans", value = 0, {
+          investigate_extract_slice(raw, input$investigate_center, input$investigate_window,
+            input$investigate_unit, time_range, input$investigate_aggregation,
+            progress = function(fraction) setProgress(value = fraction))
+        })
+      }
+      trace$key <- key
+      trace$intensity_range <- if (is.null(limits)) investigate_intensity_range(trace$data$intensity) else limits
+      investigate_trace(trace)
+    }, "Investigate: extract m/z cross-section")
+  })
+
+  observe_action(input$investigate_reset_3d, {
+    req(investigate_grid())
+    grid <- investigate_grid()
+    limits <- grid$intensity_range
+    if (isTRUE(input$investigate_log_z)) limits <- log10(1 + pmax(limits, 0))
+    if (diff(limits) == 0) limits <- c(0, 1)
+    plotly::plotlyProxy("investigate_3d", session) %>% plotly::plotlyProxyInvoke("relayout",
+      list("scene.camera" = investigate_camera(), "scene.xaxis.range" = grid$mz_range,
+        "scene.yaxis.range" = grid$time_range, "scene.zaxis.range" = limits))
+  })
+  observe_action(input$investigate_reset_slice, {
+    req(investigate_trace())
+    trace <- investigate_trace()
+    plotly::plotlyProxy("investigate_slice", session) %>% plotly::plotlyProxyInvoke("relayout",
+      list("xaxis.range" = trace$time_range, "yaxis.range" = trace$intensity_range))
+  })
+  observe_action(plot_event_data("plotly_click", "metabomeister_investigate"), {
+    click <- plot_event_data("plotly_click", "metabomeister_investigate")
+    if (!is.null(click) && length(click$x) && is.finite(click$x[1]) &&
+        (!"curveNumber" %in% names(click) || click$curveNumber[1] == 0L)) {
+      updateNumericInput(session, "investigate_center", value = as.numeric(click$x[1]))
+    }
+  })
+
+  ######Matabo3.6.4 Interactive plots and data provenance######
+  output$investigate_status <- renderText({
+    raw <- investigate_raw()
+    if (is.null(raw)) return("Load a raw file, set the ranges, then draw the 3D view or cross-section.")
+    paste0("Loaded: ", raw$name, " | ", length(raw$scans), " MS1 scans\n",
+      "m/z: ", paste(signif(raw$mz_range, 7), collapse = " to "), " | Time: ",
+      paste(signif(raw$time_range, 6), collapse = " to "), " min\n",
+      "Initial m/z range from ", raw$range_source, ".\n",
+      "Ready. Choose Draw / apply 3D ranges or Plot / apply cross-section.")
+  })
+  output$investigate_grid_status <- renderText({
+    grid <- investigate_grid()
+    if (is.null(grid)) return("No 3D preview drawn yet.")
+    paste(format(grid$points, big.mark = ","), "measurements from", grid$scans,
+      "MS1 scans;", ncol(grid$z), "m/z bins ×", nrow(grid$z), "time bins. Raw, uncalibrated data.")
+  })
+  output$investigate_slice_status <- renderText({
+    trace <- investigate_trace()
+    if (is.null(trace)) return("No cross-section extracted yet.")
+    paste0("m/z ", format(trace$center, digits = 8), " ± ", trace$window, " ", trace$unit,
+      " [", paste(format(trace$mz_range, digits = 9), collapse = ", "), "]; ",
+      trace$aggregation, " intensity; ", nrow(trace$data), " original MS1 scans. No smoothing or peak fitting.")
+  })
+  output$investigate_3d <- plotly::renderPlotly({
+    grid <- investigate_grid()
+    shiny::validate(shiny::need(!is.null(grid), "Load a raw file and draw the 3D preview."))
+    band <- tryCatch(investigate_window_limits(input$investigate_center,
+      input$investigate_window, input$investigate_unit), error = function(e) NULL)
+    investigate_plot_grid(grid, band, isTRUE(input$investigate_log_z))
+  })
+  output$investigate_slice <- plotly::renderPlotly({
+    trace <- investigate_trace()
+    shiny::validate(shiny::need(!is.null(trace), "Choose an m/z window and plot its cross-section."))
+    investigate_plot_slice(trace)
+  })
+  #####Matabo3.6 End Investigate raw m/z, time and intensity#####
 
   #####3.7 Extract Electropherograms#####
   # Build extraction windows and sort the spectra used for extraction.
