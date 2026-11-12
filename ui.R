@@ -1,7 +1,9 @@
 # MetaboMeister adds Investigate between Engine and Visualization. It provides
 # a bounded 3D raw-MS1 preview and an exact m/z-window trace with range controls.
-# Custom bins default to 50 × 40 and show their widths. Time slices can combine
-# a window of scans or overlay original spectra in nearest-to-farthest order.
+# Native sampling spacing/counts are measured once. Positive whole factors
+# group adjacent mass readings and scans by mean; differing mass axes expose an
+# adjustable alignment grid. A separate exact median spectrum uses the selected
+# 3D time range independently of grouping. Time slices can combine or overlay.
 # Original section headings are retained; new sections use the Matabo prefix.
 # Visualization has multi-step Undo/Redo and a history count. Peak edits create
 # a separate edited analysis copy; the original analysis remains available.
@@ -403,9 +405,13 @@ ui <- dashboardPage(
                 column(6, numericInput("investigate_z_min", "Intensity min", 0)),
                 column(6, numericInput("investigate_z_max", "Intensity max", 1000)))),
             fluidRow(
-              column(6, numericInput("investigate_mz_bins", "m/z bins", value = 50, min = 2, max = 10000, step = 1)),
-              column(6, numericInput("investigate_time_bins", "Time bins", value = 40, min = 2, max = 10000, step = 1))),
-            textOutput("investigate_bin_widths"),
+              column(6, numericInput("investigate_mz_group", "m/z grouping factor", value = 1, min = 1, max = 1e9, step = 1)),
+              column(6, numericInput("investigate_time_group", "Time grouping factor", value = 1, min = 1, max = 1e9, step = 1))),
+            helpText("1 keeps each position; 10 averages every 10 adjacent readings. Load initializes factors for about 50 × 40 display positions."),
+            conditionalPanel("output.investigate_needs_alignment",
+              numericInput("investigate_alignment_width", "Shared m/z alignment width (Da)", value = 0.01, min = 0, step = 0.001),
+              helpText("Scans have different m/z coordinates. Align each scan by its mean intensity per cell, then group. Missing cells contribute zero. This width is separate from measured raw spacing.")),
+            textOutput("investigate_group_status"),
             checkboxInput("investigate_log_z", "Show log10(1 + intensity)", FALSE),
             helpText("In log view, negative intensities are shown at zero height."),
             actionButton("investigate_draw_3d", "Draw / apply 3D ranges"),
@@ -455,11 +461,17 @@ ui <- dashboardPage(
             h4("m/z × time × intensity"),
             textOutput("investigate_grid_status"),
             plotlyOutput("investigate_3d", height = "560px"),
-            helpText("The 3D preview shows the maximum measured intensity in each m/z/time bin; empty bins are zero. The orange marker shows the selected m/z window or time. Narrow the display ranges for more detail."),
+            helpText("The 3D preview averages consecutive mass positions and consecutive MS1 scans by the grouping factors. Missing positions contribute zero. The orange marker shows the selected m/z window or time."),
             h4("Cross-section"),
             textOutput("investigate_slice_status"),
             plotlyOutput("investigate_slice", height = "350px"),
-            helpText("Cross-sections use the original scans. Choose an m/z window for intensity versus time, or choose a time for an MS1 mass spectrum. Click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range.")
+            helpText("Cross-sections use the original scans. Choose an m/z window for intensity versus time, or choose a time for an MS1 mass spectrum. Click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range."),
+            h4("Median m/z spectrum"),
+            helpText("Uses all MS1 scans inside the current 3D time range and m/z limits above. Uses native m/z positions when shared, otherwise the adjustable alignment grid. Missing signal counts as zero; 3D grouping factors do not affect the median."),
+            actionButton("investigate_draw_median", "Calculate median spectrum"),
+            actionButton("investigate_reset_median", "Reset median view"),
+            textOutput("investigate_median_status"),
+            plotlyOutput("investigate_median_plot", height = "350px")
           )
         )
       ),

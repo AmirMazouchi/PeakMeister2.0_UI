@@ -34,9 +34,23 @@ local({
     actual <- tasks$investigate_extract_slice(raw, center, width, "Da", raw$time_range, method)
     same(actual$data$intensity, expected)
   }
-  grid <- tasks$investigate_build_grid(raw, limits, raw$time_range, 100L, 80L)
-  same(max(grid$z), max(c(0, unlist(values))))
-  stopifnot(grid$scans == length(raw$scans), all(dim(grid$z) == c(80L, 100L)))
+  stopifnot(raw$sampling$shared, length(raw$sampling$mz_axis) == 15L,
+    raw$sampling$mz_delta == 1, raw$sampling$time_count == 3L)
+  full <- matrix(0, nrow = length(scans), ncol = 15L)
+  for (row in seq_along(cleaned)) if (nrow(cleaned[[row]])) {
+    full[row, match(cleaned[[row]][, 1], raw$sampling$mz_axis)] <- cleaned[[row]][, 2]
+  }
+  grid <- tasks$investigate_build_grid(raw, raw$mz_range, raw$time_range, 4L, 2L)
+  same(dim(grid$z), c(2L, 4L))
+  for (row in 1:2) for (column in 1:4) {
+    rows <- seq.int((row - 1)*2 + 1, min(row*2, 3))
+    columns <- seq.int((column - 1)*4 + 1, min(column*4, 15))
+    same(grid$z[row, column], mean(full[rows, columns]))
+  }
+  for (budget in c(64, 1e6)) {
+    med <- tasks$investigate_median_spectrum(raw, raw$mz_range, raw$time_range, cache_bytes = budget)
+    same(med$data$intensity, apply(full, 2, median))
+  }
   time_center <- raw$times[nonempty[1]]
   time_window <- max(abs(raw$times - time_center)) * 60 + 1
   combined <- tasks$investigate_extract_time_slice(raw, time_center, raw$mz_range,
@@ -62,4 +76,4 @@ local({
   stopifnot(!is.unsorted(distances))
 })
 same(unname(tools::md5sum(fixture)), hash)
-cat("PASS: genuine mz5 MS1 metadata/reading; exact m/z traces; independently checked combined-spectrum averages and original nearest-first overlays; grid maxima, closed handle and unchanged raw file.\n")
+cat("PASS: genuine mz5 MS1 metadata/reading; exact m/z traces; independently checked combined-spectrum averages and original nearest-first overlays; native sampling, adjacent grouped means, exact sparse medians, closed handle and unchanged raw file.\n")

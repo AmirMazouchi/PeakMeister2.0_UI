@@ -1,8 +1,11 @@
 # MetaboMeister adds a read-only Investigate tab in section Matabo3.6.
-# Investigate reports bin widths, accepts custom counts (50 × 40 by default),
-# uses a light surface palette, and combines or overlays time-window spectra.
+# Investigate measures native MS1 spacing/counts once, groups adjacent readings
+# by mean intensity, and computes an exact time-range median spectrum using
+# sparse values and bounded temporary partitions when needed. Shared native
+# mass coordinates are retained; differing axes use an adjustable alignment grid.
+# The light 3D palette and combined/overlaid time-window spectra are retained.
 # Investigate explicitly uses Shiny's progress functions so packages loaded
-# later cannot mask the numeric progress updates for either plot.
+# later cannot mask numeric progress updates for raw-data actions.
 # mzR reads raw MS1 scans in small batches; only a bounded grid is sent to the
 # 3D plot. Cross-sections use the original scans, not that preview grid.
 # Raw handles close on Clear, replacement or session end. Analysis code and
@@ -1178,6 +1181,7 @@ server <- function(input, output, session){
   investigate_raw <- reactiveVal(NULL)
   investigate_grid <- reactiveVal(NULL)
   investigate_trace <- reactiveVal(NULL)
+  investigate_median <- reactiveVal(NULL)
 
   ######Matabo3.6.1 Raw-file metadata, validation and bounded scan reading######
   investigate_range <- function(values, label, nonnegative = TRUE) {
@@ -1209,7 +1213,7 @@ server <- function(input, output, session){
   investigate_open_raw <- function(path, name,
       opener = function(path) mzR::openMSfile(path, backend = "pwiz"),
       read_header = mzR::header, read_peaks = mzR::peaks,
-      closer = function(handle) mzR::close(handle)) {
+      closer = function(handle) mzR::close(handle), progress = function(fraction) NULL) {
     if (length(path) != 1L || is.na(path) || !file.exists(path)) stop("Select an available raw .mz5 file.")
     if (length(name) != 1L || !grepl("\\.mz5$", name, ignore.case = TRUE)) stop("Select a real .mz5 file.")
     handle <- opener(path)
@@ -1223,37 +1227,11 @@ server <- function(input, output, session){
     times <- header$retentionTime[scans] / 60
     time_range <- range(times)
     if (diff(time_range) == 0) time_range <- c(max(0, time_range[1] - 1/120), time_range[2] + 1/120)
-    mz_range <- c(NA_real_, NA_real_)
-    range_source <- "scan metadata"
-    if (all(c("lowMZ", "highMZ") %in% names(header))) {
-      low <- header$lowMZ[scans]; high <- header$highMZ[scans]
-      good <- is.finite(low) & is.finite(high) & low >= 0 & high > low
-      if (any(good)) mz_range <- c(min(low[good]), max(high[good]))
-    }
-    # Check a small, evenly spaced sample: some converted files have missing
-    # or inconsistent header ranges. Only one sampled spectrum is held at a time.
-    sample_scans <- unique(scans[round(seq(1, length(scans), length.out = min(8L, length(scans))))])
-    observed <- c(Inf, -Inf)
-    for (index in sample_scans) {
-      scan <- investigate_clean_scan(read_peaks(handle, scans = index))
-      if (nrow(scan)) observed <- c(min(observed[1], scan[, 1]), max(observed[2], scan[, 1]))
-    }
-    if (all(is.finite(observed))) {
-      if (any(!is.finite(mz_range)) || observed[2] < mz_range[1] || observed[1] > mz_range[2]) {
-        mz_range <- observed
-        range_source <- "sampled MS1 measurements"
-      } else if (observed[1] < mz_range[1] || observed[2] > mz_range[2]) {
-        mz_range <- c(min(mz_range[1], observed[1]), max(mz_range[2], observed[2]))
-        range_source <- "scan metadata expanded to include sampled MS1 measurements"
-      }
-    }
-    if (any(!is.finite(mz_range))) stop("No finite m/z range was found in the metadata or sampled MS1 scans.")
-    if (diff(mz_range) == 0) mz_range <- mz_range + c(-0.01, 0.01)
-    mz_range[1] <- max(0, mz_range[1])
+    raw <- list(handle = handle, name = name, scans = scans, times = times,
+      time_range = time_range, read_peaks = read_peaks, closer = closer)
+    raw <- investigate_measure_sampling(raw, progress)
     ready <- TRUE
-    list(handle = handle, name = name, scans = scans, times = times,
-      time_range = time_range, mz_range = mz_range, range_source = range_source,
-      read_peaks = read_peaks, closer = closer)
+    raw
   }
 
   investigate_close_raw <- function(raw) {
@@ -1278,52 +1256,234 @@ server <- function(input, output, session){
     selected
   }
 
-  ######Matabo3.6.2 Binned 3D preview and exact m/z-window extraction######
-  investigate_bin_counts <- function(mz_bins, time_bins) {
-    valid <- function(value) is.numeric(value) && length(value) == 1L &&
-      is.finite(value) && value >= 2 && value <= 10000 && value == floor(value)
-    if (!valid(mz_bins) || !valid(time_bins)) {
-      stop("Enter whole bin counts between 2 and 10,000 for both axes.", call. = FALSE)
-    }
-    if (mz_bins * time_bins > 1e6) {
-      stop("The preview is too large: m/z bins × time bins must be at most 1,000,000.", call. = FALSE)
-    }
-    c(mz = as.integer(mz_bins), time = as.integer(time_bins))
-  }
-
-  investigate_bin_label <- function(mz_width, time_width) {
-    number <- function(x) format(signif(x, 6), trim = TRUE, scientific = FALSE)
-    paste0("Δm/z = ", number(mz_width), " Da; Δt = ", number(time_width),
-      " min (", number(time_width * 60), " s).")
-  }
-
-  investigate_build_grid <- function(raw, mz_range, time_range, mz_bins = 50L,
-                                      time_bins = 40L, progress = function(fraction) NULL) {
-    mz_range <- investigate_range(mz_range, "3D m/z range")
-    time_range <- investigate_range(time_range, "3D time range")
-    bins <- investigate_bin_counts(mz_bins, time_bins)
-    mz_bins <- bins[["mz"]]; time_bins <- bins[["time"]]
-    mz_edges <- seq(mz_range[1], mz_range[2], length.out = mz_bins + 1L)
-    time_edges <- seq(time_range[1], time_range[2], length.out = time_bins + 1L)
-    z <- matrix(NA_real_, nrow = time_bins, ncol = mz_bins)
-    points <- 0
-    selected <- investigate_walk_scans(raw, time_range, function(scan, index) {
-      scan <- scan[scan[, 1] >= mz_range[1] & scan[, 1] <= mz_range[2], , drop = FALSE]
-      if (!nrow(scan)) return()
-      points <<- points + nrow(scan)
-      mass_bin <- findInterval(scan[, 1], mz_edges, all.inside = TRUE)
-      time_bin <- findInterval(raw$times[index], time_edges, all.inside = TRUE)
-      maxima <- tapply(scan[, 2], mass_bin, max)
-      columns <- as.integer(names(maxima))
-      z[time_bin, columns] <<- pmax(z[time_bin, columns], as.numeric(maxima), na.rm = TRUE)
+  ######Matabo3.6.2 Native sampling, grouped means and exact median spectrum######
+  # Measure actual within-spectrum sampling once; do not confuse it with an
+  # instrument's resolving power or with the adjustable display/alignment grid.
+  investigate_measure_sampling <- function(raw, progress = function(fraction) NULL) {
+    reference <- NULL; shared <- TRUE; counts <- integer(length(raw$scans))
+    minimum <- Inf; observed <- c(Inf, -Inf); points <- 0
+    investigate_walk_scans(raw, raw$time_range, function(scan, index) {
+      axis <- unname(scan[, 1])
+      if (is.unsorted(axis, strictly = TRUE)) axis <- sort(unique(axis))
+      counts[index] <<- length(axis); points <<- points + nrow(scan)
+      if (!length(axis)) return()
+      observed <<- c(min(observed[1], axis[1]), max(observed[2], tail(axis, 1)))
+      if (length(axis) > 1L) minimum <<- min(minimum, diff(axis))
+      if (is.null(reference)) reference <<- axis else if (!identical(axis, reference)) shared <<- FALSE
     }, progress)
-    if (!points) stop("No m/z measurements fall inside the selected 3D ranges.", call. = FALSE)
-    z[is.na(z)] <- 0
-    list(mz = head(mz_edges, -1) + diff(mz_edges)/2,
-      time = head(time_edges, -1) + diff(time_edges)/2, z = z,
-      mz_range = mz_range, time_range = time_range,
-      mz_bin_width = diff(mz_range)/mz_bins, time_bin_width = diff(time_range)/time_bins,
-      points = points, scans = length(selected))
+    if (!length(reference)) stop("No finite MS1 measurements were found in this file.")
+    delta_time <- diff(sort(unique(raw$times)))
+    raw$sampling <- list(shared = shared, mz_axis = if (shared) reference else NULL,
+      mz_count_range = range(counts), mz_delta = if (is.finite(minimum)) minimum else NA_real_,
+      time_count = length(raw$times), time_unique = length(unique(raw$times)),
+      time_delta = if (length(delta_time)) min(delta_time) else NA_real_, points = points)
+    raw$mz_range <- observed
+    if (diff(raw$mz_range) == 0) raw$mz_range <- c(max(0, observed[1] - 0.01), observed[2] + 0.01)
+    raw$range_source <- "all valid MS1 measurements"
+    # Limit the default alignment axis to about 200,000 positions; this is an
+    # adjustable analysis grid, never reported as measured sampling spacing.
+    raw$alignment_width <- max(if (is.finite(minimum)) minimum else 0,
+      diff(raw$mz_range)/200000)
+    raw
+  }
+
+  investigate_mass_axis <- function(raw, mz_range, alignment_width = NULL) {
+    mz_range <- investigate_range(mz_range, "m/z range")
+    if (isTRUE(raw$sampling$shared)) {
+      axis <- raw$sampling$mz_axis
+      axis <- axis[axis >= mz_range[1] & axis <= mz_range[2]]
+      if (!length(axis)) stop("No recorded m/z positions fall inside the selected range.")
+      return(list(mz = axis, native = TRUE, mz_range = mz_range, width = NULL))
+    }
+    width <- if (is.null(alignment_width)) raw$alignment_width else alignment_width
+    if (!is.numeric(width) || length(width) != 1L || !is.finite(width) || width <= 0) {
+      stop("Enter a positive alignment-grid width in Da.")
+    }
+    count <- ceiling(diff(mz_range)/width - 16 * .Machine$double.eps * max(1, diff(mz_range)/width))
+    if (count < 1 || count > 2e6) stop("The alignment grid must have 1–2,000,000 positions. Increase its width or narrow the m/z range.")
+    edges <- mz_range[1] + seq.int(0, count) * width
+    edges[length(edges)] <- mz_range[2]
+    list(mz = head(edges, -1) + diff(edges)/2, edges = edges,
+      native = FALSE, mz_range = mz_range, width = width)
+  }
+
+  # One intensity per scan and mass position. Duplicate native points or
+  # multiple points in an alignment cell are averaged before time aggregation.
+  investigate_align_scan <- function(scan, axis) {
+    scan <- scan[scan[, 1] >= axis$mz_range[1] & scan[, 1] <= axis$mz_range[2], , drop = FALSE]
+    if (!nrow(scan)) return(list(columns = integer(), values = numeric(), points = 0L))
+    columns <- if (axis$native) match(scan[, 1], axis$mz) else
+      findInterval(scan[, 1], axis$edges, all.inside = TRUE)
+    if (anyNA(columns)) stop("The file's m/z coordinates changed after loading. Reload the raw file.")
+    if (!anyDuplicated(columns)) return(list(columns = columns, values = scan[, 2], points = nrow(scan)))
+    totals <- rowsum(cbind(value = scan[, 2], count = 1), columns, reorder = FALSE)
+    list(columns = as.integer(rownames(totals)), values = totals[, 1]/totals[, 2], points = nrow(scan))
+  }
+
+  investigate_group_factors <- function(mz_group, time_group) {
+    valid <- function(value) is.numeric(value) && length(value) == 1L &&
+      is.finite(value) && value >= 1 && value <= 1e9 && value == floor(value)
+    if (!valid(mz_group) || !valid(time_group)) stop("Enter positive whole grouping factors (1–1,000,000,000).")
+    c(mz = as.integer(mz_group), time = as.integer(time_group))
+  }
+
+  investigate_group_plan <- function(raw, mz_range, time_range, mz_group, time_group, alignment_width = NULL) {
+    factors <- investigate_group_factors(mz_group, time_group)
+    time_range <- investigate_range(time_range, "3D time range")
+    selected <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
+    if (!length(selected)) stop("No MS1 scans fall inside the selected time range.")
+    axis <- investigate_mass_axis(raw, mz_range, alignment_width)
+    counts <- c(mz = ceiling(length(axis$mz)/factors[1]), time = ceiling(length(selected)/factors[2]))
+    if (prod(counts) > 1e6) stop("The preview is too large (over 1,000,000 cells). Increase grouping factors or narrow the ranges.")
+    list(axis = axis, selected = selected, factors = factors, counts = counts, time_range = time_range)
+  }
+
+  investigate_build_grid <- function(raw, mz_range, time_range, mz_group = 1L,
+                                      time_group = 1L, alignment_width = NULL,
+                                      progress = function(fraction) NULL) {
+    plan <- investigate_group_plan(raw, mz_range, time_range, mz_group, time_group, alignment_width)
+    axis <- plan$axis; selected <- plan$selected
+    mass_groups <- (seq_along(axis$mz) - 1L) %/% plan$factors[1] + 1L
+    time_groups <- (seq_along(selected) - 1L) %/% plan$factors[2] + 1L
+    mass_counts <- tabulate(mass_groups); time_counts <- tabulate(time_groups)
+    z <- matrix(0, nrow = length(time_counts), ncol = length(mass_counts)); points <- 0
+    row_for_scan <- integer(length(raw$scans)); row_for_scan[selected] <- time_groups
+    investigate_walk_scans(raw, time_range, function(scan, index) {
+      aligned <- investigate_align_scan(scan, axis)
+      points <<- points + aligned$points
+      if (!length(aligned$columns)) return()
+      sums <- rowsum(aligned$values, mass_groups[aligned$columns], reorder = FALSE)
+      columns <- as.integer(rownames(sums)); row <- row_for_scan[index]
+      z[row, columns] <<- z[row, columns] + sums[, 1]
+    }, progress)
+    if (!points) stop("No m/z measurements fall inside the selected 3D ranges.")
+    # Include implicit zeros at missing positions and empty scans. Last groups
+    # use their actual size rather than the requested (possibly larger) factor.
+    z <- z / outer(time_counts, mass_counts)
+    list(mz = as.numeric(rowsum(axis$mz, mass_groups, reorder = FALSE))/mass_counts,
+      time = as.numeric(rowsum(raw$times[selected], time_groups, reorder = FALSE))/time_counts,
+      z = z, mz_range = axis$mz_range, time_range = time_range,
+      factors = plan$factors, mass_positions = length(axis$mz), native = axis$native,
+      alignment_width = axis$width, points = points, scans = length(selected))
+  }
+
+  # Exact median with implicit zeros. Partial sorting selects only the central
+  # ranks; it does not sort every time point at each mass position.
+  investigate_zero_median <- function(values, scans) {
+    values <- values[values != 0]
+    if (!length(values)) return(0)
+    zeros <- scans - length(values); negative <- sum(values < 0)
+    ranks <- c((scans + 1) %/% 2, (scans + 2) %/% 2)
+    in_zero <- ranks > negative & ranks <= negative + zeros
+    needed <- ranks[!in_zero] - ifelse(ranks[!in_zero] > negative, zeros, 0)
+    answer <- numeric(2)
+    if (length(needed)) answer[!in_zero] <- sort(values, partial = unique(needed))[needed]
+    mean(answer)
+  }
+
+  investigate_median_spectrum <- function(raw, mz_range, time_range, alignment_width = NULL,
+                                          progress = function(fraction) NULL, cache_bytes = 32 * 1024^2) {
+    time_range <- investigate_range(time_range, "Median time range")
+    selected <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
+    if (!length(selected)) stop("No MS1 scans fall inside the selected time range.")
+    axis <- investigate_mass_axis(raw, mz_range, alignment_width)
+    n <- length(selected); mass_count <- length(axis$mz)
+    positive <- negative <- numeric(mass_count); values <- numeric(mass_count)
+    cache <- vector("list", length(raw$scans)); cached <- TRUE; entries <- 0; points <- 0
+    # Budget includes vector/list/grouping overhead, not only the 12-byte pair.
+    capacity <- max(1, floor(cache_bytes/64))
+    investigate_walk_scans(raw, time_range, function(scan, index) {
+      aligned <- investigate_align_scan(scan, axis); points <<- points + aligned$points
+      keep <- aligned$values != 0; columns <- aligned$columns[keep]; intensity <- aligned$values[keep]
+      pos <- columns[intensity > 0]; neg <- columns[intensity < 0]
+      positive[pos] <<- positive[pos] + 1; negative[neg] <<- negative[neg] + 1
+      entries <<- entries + length(columns)
+      if (cached && entries > capacity) { cache <<- NULL; cached <<- FALSE }
+      if (cached) cache[[index]] <<- list(columns = columns, values = intensity)
+    }, function(fraction) progress(fraction * 0.6))
+    if (!points) stop("No m/z measurements fall inside the selected median ranges.")
+    candidates <- which(positive > floor((n - 1)/2) | negative > floor((n - 1)/2))
+    finish <- function(method) {
+      progress(1)
+      list(data = data.frame(mz = axis$mz, intensity = values), mz_range = axis$mz_range,
+        time_range = time_range, scans = n, native = axis$native,
+        alignment_width = axis$width, method = method)
+    }
+    # A signal seen in fewer than half the scans has an exact zero median.
+    # Most transient peaks need neither a dense matrix nor any sorting.
+    if (!length(candidates)) return(finish("implicit-zero counts"))
+    calculate <- function(columns, intensity) {
+      groups <- split(intensity, columns)
+      for (name in names(groups)) values[as.integer(name)] <<- investigate_zero_median(groups[[name]], n)
+    }
+    if (cached) {
+      chunks <- lapply(cache, function(chunk) {
+        keep <- chunk$columns %in% candidates
+        list(columns = chunk$columns[keep], values = chunk$values[keep])
+      })
+      calculate(unlist(lapply(chunks, `[[`, "columns"), use.names = FALSE),
+        unlist(lapply(chunks, `[[`, "values"), use.names = FALSE))
+      return(finish("cached sparse values"))
+    }
+    # Large data: one extra raw pass, then bounded temporary partitions. Never
+    # allocate scans × masses or reread the raw file once per mass. The files
+    # contain candidate nonzero values only and are removed even on failure.
+    counts <- positive[candidates] + negative[candidates]
+    target <- max(capacity, max(counts))
+    partition <- ceiling(cumsum(counts)/target)
+    partition <- match(partition, unique(partition))
+    file_for_mass <- integer(mass_count); file_for_mass[candidates] <- partition
+    sizes <- as.numeric(rowsum(counts, partition, reorder = FALSE))
+    directory <- tempfile("metabomeister-median-"); dir.create(directory)
+    paths <- file.path(directory, paste0(seq_along(sizes), ".bin"))
+    connections <- list(); recent <- integer()
+    on.exit({
+      for (connection in connections) try(close(connection), silent = TRUE)
+      unlink(directory, recursive = TRUE)
+    }, add = TRUE)
+    connection_for <- function(id) {
+      name <- as.character(id)
+      if (is.null(connections[[name]])) {
+        if (length(connections) >= 16L) {
+          old <- as.character(recent[1]); close(connections[[old]])
+          connections[[old]] <<- NULL; recent <<- recent[-1]
+        }
+        connections[[name]] <<- file(paths[id], "ab")
+      }
+      recent <<- c(recent[recent != id], id)
+      connections[[name]]
+    }
+    investigate_walk_scans(raw, time_range, function(scan, index) {
+      aligned <- investigate_align_scan(scan, axis)
+      keep <- aligned$values != 0 & file_for_mass[aligned$columns] > 0L
+      columns <- aligned$columns[keep]; intensity <- aligned$values[keep]
+      groups <- split(seq_along(columns), file_for_mass[columns])
+      for (name in names(groups)) {
+        take <- groups[[name]]; connection <- connection_for(as.integer(name))
+        writeBin(as.integer(length(take)), connection)
+        writeBin(as.integer(columns[take]), connection); writeBin(as.double(intensity[take]), connection)
+      }
+    }, function(fraction) progress(0.6 + fraction * 0.3))
+    for (connection in connections) close(connection)
+    connections <- list()
+    for (id in seq_along(paths)) {
+      columns <- integer(sizes[id]); intensity <- numeric(sizes[id]); position <- 0L
+      connection <- file(paths[id], "rb")
+      tryCatch({
+        repeat {
+          size <- readBin(connection, integer(), n = 1L)
+          if (!length(size)) break
+          take <- seq.int(position + 1L, position + size)
+          columns[take] <- readBin(connection, integer(), n = size)
+          intensity[take] <- readBin(connection, double(), n = size)
+          position <- position + size
+        }
+      }, finally = close(connection))
+      if (position != sizes[id]) stop("The median cache is incomplete. Please retry.")
+      calculate(columns, intensity)
+      unlink(paths[id]); progress(0.9 + 0.1 * id/length(paths))
+    }
+    finish("partitioned sparse values")
   }
 
   investigate_extract_slice <- function(raw, center, window, unit, time_range,
@@ -1424,13 +1584,22 @@ server <- function(input, output, session){
     transform <- if (logarithmic) function(x) log10(1 + pmax(x, 0)) else identity
     limits <- transform(grid$intensity_range)
     if (diff(limits) == 0) limits <- c(0, 1)
-    plot <- plotly::plot_ly(x = grid$mz, y = grid$time, z = transform(grid$z),
+    if (length(grid$mz) >= 2L && length(grid$time) >= 2L) {
+      plot <- plotly::plot_ly(x = grid$mz, y = grid$time, z = transform(grid$z),
       surfacecolor = grid$z, type = "surface",
       colorscale = list(list(0, "#dbeefe"), list(0.2, "#84cfef"), list(0.4, "#42c6b1"),
         list(0.6, "#f4db63"), list(0.8, "#f99a47"), list(1, "#e3483c")),
       lighting = list(ambient = 0.85, diffuse = 0.75, roughness = 0.8, specular = 0.05),
       source = "metabomeister_investigate", colorbar = list(title = "Ion counts"),
-      hovertemplate = "m/z: %{x:.5f}<br>Time: %{y:.4f} min<br>Intensity: %{surfacecolor:.4g}<extra></extra>")
+      hovertemplate = "m/z: %{x:.5f}<br>Time: %{y:.4f} min<br>Mean intensity: %{surfacecolor:.4g}<extra></extra>")
+    } else {
+      coordinates <- expand.grid(time = grid$time, mz = grid$mz)
+      plot <- plotly::plot_ly(x = coordinates$mz, y = coordinates$time,
+        z = as.numeric(transform(grid$z)), type = "scatter3d", mode = "lines+markers",
+        marker = list(color = "#249fc5", size = 4), line = list(color = "#249fc5"),
+        customdata = as.numeric(grid$z), source = "metabomeister_investigate",
+        hovertemplate = "m/z: %{x:.6f}<br>Time: %{y:.5f} min<br>Mean intensity: %{customdata:.5g}<extra></extra>")
+    }
     if (!is.null(time_band) && all(is.finite(time_band)) &&
         time_band[2] >= grid$time_range[1] && time_band[1] <= grid$time_range[2]) {
       time_band <- pmax(grid$time_range[1], pmin(grid$time_range[2], time_band))
@@ -1508,14 +1677,14 @@ server <- function(input, output, session){
 
   observe_action(input$investigate_clear, {
     investigate_close_raw(investigate_raw())
-    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL)
+    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL)
   })
   session$onSessionEnded(function() investigate_close_raw(isolate(investigate_raw())))
 
   observe_action(input$investigate_load, {
     with_action_error({
       investigate_close_raw(investigate_raw())
-      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL)
+      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL)
       if (identical(input$investigate_source, "upload")) {
         file <- input$investigate_raw_file
         if (is.null(file) || !nrow(file)) stop("Select the original .mz5 file in Investigate first.")
@@ -1526,13 +1695,20 @@ server <- function(input, output, session){
         if (!length(selected)) stop("No Engine raw upload is selected. Upload a .mz5 in Engine or select another file here.")
         path <- files$FilePath[selected[1]]; name <- files$FileName[selected[1]]
       }
-      raw <- investigate_open_raw(path, name)
+      raw <- shiny::withProgress(message = "Measuring native MS1 sampling (one pass)", value = 0, {
+        investigate_open_raw(path, name, progress = function(fraction) shiny::setProgress(value = fraction))
+      })
       investigate_raw(raw)
       defaults <- list(investigate_mz_min = raw$mz_range[1], investigate_mz_max = raw$mz_range[2],
         investigate_time_min = raw$time_range[1], investigate_time_max = raw$time_range[2],
         investigate_slice_time_min = raw$time_range[1], investigate_slice_time_max = raw$time_range[2],
         investigate_time_center = raw$times[ceiling(length(raw$times)/2)],
         investigate_spectrum_mz_min = raw$mz_range[1], investigate_spectrum_mz_max = raw$mz_range[2])
+      mass_count <- if (raw$sampling$shared) length(raw$sampling$mz_axis) else
+        ceiling(diff(raw$mz_range)/raw$alignment_width)
+      defaults$investigate_mz_group <- max(1, ceiling(mass_count/50))
+      defaults$investigate_time_group <- max(1, ceiling(length(raw$scans)/40))
+      defaults$investigate_alignment_width <- raw$alignment_width
       targets <- suppressWarnings(as.numeric(c(refMassListData()$mz, massData()$mz)))
       targets <- targets[is.finite(targets) & targets >= raw$mz_range[1] & targets <= raw$mz_range[2]]
       defaults$investigate_center <- if (length(targets)) targets[1] else mean(raw$mz_range)
@@ -1549,11 +1725,12 @@ server <- function(input, output, session){
       time_range <- investigate_range(c(input$investigate_time_min, input$investigate_time_max), "3D time range")
       limits <- if (isTRUE(input$investigate_auto_z)) NULL else investigate_range(
         c(input$investigate_z_min, input$investigate_z_max), "3D intensity range", nonnegative = FALSE)
-      key <- c(raw$name, mz_range, time_range, input$investigate_mz_bins, input$investigate_time_bins)
+      width <- if (raw$sampling$shared) NULL else input$investigate_alignment_width
+      key <- c(raw$name, mz_range, time_range, input$investigate_mz_group, input$investigate_time_group, width)
       grid <- if (!is.null(previous) && identical(previous$key, key)) previous else {
         shiny::withProgress(message = "Building raw 3D preview", value = 0, {
           investigate_build_grid(raw, mz_range, time_range,
-            input$investigate_mz_bins, input$investigate_time_bins,
+            input$investigate_mz_group, input$investigate_time_group, alignment_width = width,
             progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
@@ -1601,6 +1778,34 @@ server <- function(input, output, session){
     }, "Investigate: extract m/z cross-section")
   })
 
+  observe_action(input$investigate_draw_median, {
+    with_action_error({
+      raw <- investigate_raw()
+      if (is.null(raw)) stop("Load a raw .mz5 file first.")
+      mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "Median m/z range")
+      time_range <- investigate_range(c(input$investigate_time_min, input$investigate_time_max), "Median time range")
+      width <- if (raw$sampling$shared) NULL else input$investigate_alignment_width
+      key <- c(raw$name, mz_range, time_range, width)
+      previous <- investigate_median()
+      spectrum <- if (!is.null(previous) && identical(previous$key, key)) previous else {
+        investigate_median(NULL)
+        shiny::withProgress(message = "Exact median across selected MS1 scans", value = 0, {
+          investigate_median_spectrum(raw, mz_range, time_range, width,
+            progress = function(fraction) shiny::setProgress(value = fraction))
+        })
+      }
+      spectrum$key <- key
+      spectrum$intensity_range <- investigate_intensity_range(spectrum$data$intensity)
+      investigate_median(spectrum)
+    }, "Investigate: median spectrum")
+  })
+  observe_action(input$investigate_reset_median, {
+    req(investigate_median())
+    spectrum <- investigate_median()
+    plotly::plotlyProxy("investigate_median_plot", session) %>% plotly::plotlyProxyInvoke("relayout",
+      list("xaxis.range" = spectrum$mz_range, "yaxis.range" = spectrum$intensity_range))
+  })
+
   observe_action(input$investigate_reset_3d, {
     req(investigate_grid())
     grid <- investigate_grid()
@@ -1629,31 +1834,65 @@ server <- function(input, output, session){
   })
 
   ######Matabo3.6.4 Interactive plots and data provenance######
+  output$investigate_needs_alignment <- reactive({
+    raw <- investigate_raw()
+    !is.null(raw) && !isTRUE(raw$sampling$shared)
+  })
+  outputOptions(output, "investigate_needs_alignment", suspendWhenHidden = FALSE)
+  investigate_number <- function(x) {
+    if (length(x) != 1L || !is.finite(x)) "not available" else format(signif(x, 8), trim = TRUE, scientific = FALSE)
+  }
   output$investigate_status <- renderText({
     raw <- investigate_raw()
-    if (is.null(raw)) return("Load a raw file, set the ranges, then draw the 3D view or cross-section.")
-    paste0("Loaded: ", raw$name, " | ", length(raw$scans), " MS1 scans\n",
-      "m/z: ", paste(signif(raw$mz_range, 7), collapse = " to "), " | Time: ",
-      paste(signif(raw$time_range, 6), collapse = " to "), " min\n",
-      "Initial m/z range from ", raw$range_source, ".\n",
-      "Ready. Choose Draw / apply 3D ranges or Plot / apply cross-section.")
+    if (is.null(raw)) return("Load a raw file to measure native MS1 sampling once, then choose a plot.")
+    sampling <- raw$sampling
+    mass_count <- if (sampling$shared) paste0(length(sampling$mz_axis), " shared native m/z positions") else
+      paste0("m/z positions vary: ", paste(sampling$mz_count_range, collapse = "–"),
+        " per spectrum (including empty scans); no single shared native m/z axis")
+    paste0("Loaded: ", raw$name, " | ", sampling$time_count, " MS1 time slices (",
+      sampling$time_unique, " distinct times)\n",
+      "m/z: ", paste(signif(raw$mz_range, 8), collapse = " to "), " | Time: ",
+      paste(signif(range(raw$times), 8), collapse = " to "), " min\n",
+      mass_count, "\nMinimum positive native Δm/z within a spectrum: ",
+      investigate_number(sampling$mz_delta), " Da; minimum positive Δt: ",
+      investigate_number(sampling$time_delta), " min (", investigate_number(sampling$time_delta * 60), " s).\n",
+      "Measured across all valid MS1 readings; sampling spacing, not instrument resolving power.")
   })
   output$investigate_grid_status <- renderText({
     grid <- investigate_grid()
     if (is.null(grid)) return("No 3D preview drawn yet.")
-    paste(format(grid$points, big.mark = ","), "measurements from", grid$scans,
-      "MS1 scans;", ncol(grid$z), "m/z bins ×", nrow(grid$z), "time bins.",
-      "Drawn bin widths:", investigate_bin_label(grid$mz_bin_width, grid$time_bin_width),
-      "Raw, uncalibrated data.")
+    paste0(format(grid$points, big.mark = ","), " measurements; ", grid$mass_positions,
+      if (grid$native) " native m/z positions" else " aligned m/z positions",
+      " × ", grid$scans, " MS1 scans → ", ncol(grid$z), " × ", nrow(grid$z),
+      " grouped positions. Factors: m/z ", grid$factors[1], ", time ", grid$factors[2],
+      ". Mean intensity; missing positions contribute zero. Raw, uncalibrated data.")
   })
-  output$investigate_bin_widths <- renderText({
+  output$investigate_group_status <- renderText({
+    raw <- investigate_raw()
+    if (is.null(raw)) return("Grouping factors are initialized on Load for a preview of about 50 × 40 positions.")
     tryCatch({
-      bins <- investigate_bin_counts(input$investigate_mz_bins, input$investigate_time_bins)
-      mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "m/z range")
-      time_range <- investigate_range(c(input$investigate_time_min, input$investigate_time_max), "Time range")
-      paste("Selected bin widths:", investigate_bin_label(diff(mz_range)/bins[["mz"]],
-        diff(time_range)/bins[["time"]]))
+      plan <- investigate_group_plan(raw, c(input$investigate_mz_min, input$investigate_mz_max),
+        c(input$investigate_time_min, input$investigate_time_max), input$investigate_mz_group,
+        input$investigate_time_group, input$investigate_alignment_width)
+      paste0(length(plan$axis$mz), if (plan$axis$native) " native" else " aligned", " m/z positions × ",
+        length(plan$selected), " scans → ", plan$counts[1], " × ", plan$counts[2],
+        " display positions. Last groups can be smaller.",
+        if (!plan$axis$native) paste0(" Alignment width: ", investigate_number(plan$axis$width), " Da (not native spacing)."))
     }, error = function(e) conditionMessage(e))
+  })
+  output$investigate_median_status <- renderText({
+    spectrum <- investigate_median()
+    if (is.null(spectrum)) return("No median spectrum calculated yet. Uses the current 3D m/z and time range controls.")
+    raw <- investigate_raw()
+    current <- c(raw$name, input$investigate_mz_min, input$investigate_mz_max,
+      input$investigate_time_min, input$investigate_time_max,
+      if (!spectrum$native) input$investigate_alignment_width)
+    paste0("Median of ", spectrum$scans, " MS1 scans in ", paste(signif(spectrum$time_range, 8), collapse = "–"),
+      " min; ", nrow(spectrum$data), if (spectrum$native) " native m/z positions." else
+        paste0(" aligned positions (", investigate_number(spectrum$alignment_width), " Da)."),
+      " Missing signal contributes zero; independent of 3D grouping. ",
+      if (all(spectrum$data$intensity == 0)) "All medians are zero: no mass position has a nonzero central intensity. " else "",
+      if (!identical(current, spectrum$key)) "Ranges have changed; click Calculate median spectrum to update.")
   })
   output$investigate_slice_status <- renderText({
     trace <- investigate_trace()
@@ -1690,6 +1929,19 @@ server <- function(input, output, session){
     trace <- investigate_trace()
     shiny::validate(shiny::need(!is.null(trace), "Choose an m/z window and plot its cross-section."))
     investigate_plot_slice(trace)
+  })
+  output$investigate_median_plot <- plotly::renderPlotly({
+    spectrum <- investigate_median()
+    shiny::validate(shiny::need(!is.null(spectrum), "Click Calculate median spectrum."))
+    plotly::plot_ly(x = spectrum$data$mz, y = spectrum$data$intensity, type = "scattergl",
+      mode = if (nrow(spectrum$data) == 1L) "markers" else "lines",
+      line = list(color = "#198a71"), name = "Median MS1 intensity",
+      hovertemplate = "m/z: %{x:.7f}<br>Median intensity: %{y:.6g}<extra></extra>") %>%
+      plotly::layout(uirevision = paste(spectrum$key, collapse = ":"),
+        xaxis = list(title = "m/z", range = spectrum$mz_range),
+        yaxis = list(title = "Median intensity (ion counts)", range = spectrum$intensity_range),
+        margin = list(l = 70, r = 20, b = 55, t = 20)) %>%
+      plotly::config(scrollZoom = TRUE, displaylogo = FALSE)
   })
   #####Matabo3.6 End Investigate raw m/z, time and intensity#####
 
