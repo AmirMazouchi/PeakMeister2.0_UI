@@ -1,5 +1,7 @@
 # MetaboMeister adds Investigate between Engine and Visualization. It provides
 # a bounded 3D raw-MS1 preview and an exact m/z-window trace with range controls.
+# Custom bins default to 50 × 40 and show their widths. Time slices can combine
+# a window of scans or overlay original spectra in nearest-to-farthest order.
 # Original section headings are retained; new sections use the Matabo prefix.
 # Visualization has multi-step Undo/Redo and a history count. Peak edits create
 # a separate edited analysis copy; the original analysis remains available.
@@ -401,15 +403,20 @@ ui <- dashboardPage(
                 column(6, numericInput("investigate_z_min", "Intensity min", 0)),
                 column(6, numericInput("investigate_z_max", "Intensity max", 1000)))),
             fluidRow(
-              column(6, selectInput("investigate_mz_bins", "m/z bins", c(100, 200, 400), selected = 200)),
-              column(6, selectInput("investigate_time_bins", "Time bins", c(80, 160, 320), selected = 160))),
+              column(6, numericInput("investigate_mz_bins", "m/z bins", value = 50, min = 2, max = 10000, step = 1)),
+              column(6, numericInput("investigate_time_bins", "Time bins", value = 40, min = 2, max = 10000, step = 1))),
+            textOutput("investigate_bin_widths"),
             checkboxInput("investigate_log_z", "Show log10(1 + intensity)", FALSE),
             helpText("In log view, negative intensities are shown at zero height."),
             actionButton("investigate_draw_3d", "Draw / apply 3D ranges"),
             actionButton("investigate_reset_3d", "Reset 3D view"),
             helpText("Drag to rotate; use the toolbar to pan, zoom or reset the camera. Click the surface to select a centre m/z for the trace below."),
             tags$hr(),
-            h4("m/z cross-section"),
+            h4("Cross-section"),
+            radioButtons("investigate_slice_axis", "Slice along",
+              choices = c("m/z window → time trace" = "mz", "Time → mass spectrum" = "time"),
+              selected = "mz"),
+            conditionalPanel("input.investigate_slice_axis === 'mz'",
             numericInput("investigate_center", "Centre m/z", 100, min = 0),
             helpText("A 3D click selects a bin centre. For a precise ppm window, enter the exact m/z or narrow the 3D range first."),
             fluidRow(
@@ -419,7 +426,23 @@ ui <- dashboardPage(
               choices = c("Mean (matches current extraction)" = "mean", "Sum" = "sum", "Maximum" = "max")),
             fluidRow(
               column(6, numericInput("investigate_slice_time_min", "Time start (min)", 0, min = 0)),
-              column(6, numericInput("investigate_slice_time_max", "Time end (min)", 40, min = 0))),
+              column(6, numericInput("investigate_slice_time_max", "Time end (min)", 40, min = 0)))),
+            conditionalPanel("input.investigate_slice_axis === 'time'",
+              numericInput("investigate_time_center", "Slice time (min)", 20, min = 0, step = 0.01),
+              numericInput("investigate_time_window", "Time window (± seconds)", 5, min = 0, step = 1),
+              radioButtons("investigate_time_mode", "Time-slice display",
+                choices = c("Combine spectra (mean)" = "combine", "Overlay spectra: nearest to farthest" = "overlay"),
+                selected = "combine"),
+              conditionalPanel("input.investigate_time_mode === 'combine'",
+                numericInput("investigate_spectrum_bin_width", "Combined spectrum m/z bin width (Da)", 0.01, min = 0, step = 0.001),
+                helpText("Spectra are aligned to this m/z grid and averaged across scans; missing bins contribute zero.")),
+              conditionalPanel("input.investigate_time_mode === 'overlay'",
+                numericInput("investigate_spectrum_count", "Number of spectra", 5, min = 2, max = 20, step = 1),
+                helpText("Shows up to this many closest scans inside the time window at their original m/z resolution. Expand the window if fewer are available. Legend order is nearest to farthest; click an entry to hide/show it.")),
+              helpText("A 3D click selects a preview-bin time. Actual scan times and the number of spectra used are shown below."),
+              fluidRow(
+                column(6, numericInput("investigate_spectrum_mz_min", "Spectrum m/z min", 50, min = 0)),
+                column(6, numericInput("investigate_spectrum_mz_max", "Spectrum m/z max", 1000, min = 0)))),
             checkboxInput("investigate_auto_y", "Automatic trace intensity range", TRUE),
             conditionalPanel("!input.investigate_auto_y",
               fluidRow(
@@ -432,11 +455,11 @@ ui <- dashboardPage(
             h4("m/z × time × intensity"),
             textOutput("investigate_grid_status"),
             plotlyOutput("investigate_3d", height = "560px"),
-            helpText("The 3D preview shows the maximum measured intensity in each m/z/time bin; empty bins are zero. The orange band marks the selected m/z window. Narrow the display ranges for more detail."),
-            h4("Extracted m/z cross-section"),
+            helpText("The 3D preview shows the maximum measured intensity in each m/z/time bin; empty bins are zero. The orange marker shows the selected m/z window or time. Narrow the display ranges for more detail."),
+            h4("Cross-section"),
             textOutput("investigate_slice_status"),
             plotlyOutput("investigate_slice", height = "350px"),
-            helpText("This trace uses the original scans, not the binned surface. Set the centre and ± window, then click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range.")
+            helpText("Cross-sections use the original scans. Choose an m/z window for intensity versus time, or choose a time for an MS1 mass spectrum. Click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range.")
           )
         )
       ),

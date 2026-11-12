@@ -37,6 +37,29 @@ local({
   grid <- tasks$investigate_build_grid(raw, limits, raw$time_range, 100L, 80L)
   same(max(grid$z), max(c(0, unlist(values))))
   stopifnot(grid$scans == length(raw$scans), all(dim(grid$z) == c(80L, 100L)))
+  time_center <- raw$times[nonempty[1]]
+  time_window <- max(abs(raw$times - time_center)) * 60 + 1
+  combined <- tasks$investigate_extract_time_slice(raw, time_center, raw$mz_range,
+    mode = "combine", window_seconds = time_window, mz_bin_width = 1)
+  expected <- numeric(nrow(combined$data))
+  for (scan in cleaned) {
+    if (!nrow(scan)) next
+    bins <- pmin(length(expected), floor((scan[, 1] - raw$mz_range[1])/1) + 1L)
+    per_scan <- tapply(scan[, 2], bins, mean)
+    indices <- as.integer(names(per_scan))
+    expected[indices] <- expected[indices] + as.numeric(per_scan)
+  }
+  same(combined$data$intensity, expected/length(raw$scans))
+  overlays <- tasks$investigate_extract_time_slice(raw, time_center, raw$mz_range,
+    mode = "overlay", window_seconds = time_window, n_spectra = 5)
+  for (spectrum in overlays$spectra) {
+    original <- cleaned[[match(spectrum$scan, raw$scans)]]
+    original <- original[order(original[, 1]), , drop = FALSE]
+    same(spectrum$data$mz, original[, 1])
+    same(spectrum$data$intensity, original[, 2])
+  }
+  distances <- vapply(overlays$spectra, function(spectrum) spectrum$distance_seconds, numeric(1))
+  stopifnot(!is.unsorted(distances))
 })
 same(unname(tools::md5sum(fixture)), hash)
-cat("PASS: genuine mz5 file opened by mzR; metadata/time units/MS1 selection; exact mean/sum/max slices independently checked; bounded grid maxima; closed handle; original file unchanged.\n")
+cat("PASS: genuine mz5 MS1 metadata/reading; exact m/z traces; independently checked combined-spectrum averages and original nearest-first overlays; grid maxima, closed handle and unchanged raw file.\n")

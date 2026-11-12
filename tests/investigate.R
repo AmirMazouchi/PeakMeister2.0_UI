@@ -71,6 +71,16 @@ same(missing$data$intensity, c(0, 0))
 stopifnot(grepl("No MS1 scans", error_text(tasks$investigate_extract_slice(raw, 100, 10, "ppm", c(50, 51)))))
 grid <- tasks$investigate_build_grid(raw, c(99.9, 101), c(0, 10), 100L, 80L)
 same(dim(grid$z), c(80L, 100L))
+defaults <- tasks$investigate_build_grid(raw, c(99.9, 101), c(0, 10))
+same(dim(defaults$z), c(40L, 50L))
+custom <- tasks$investigate_build_grid(raw, c(99.9, 101), c(0, 10), 37, 19)
+same(dim(custom$z), c(19L, 37L))
+same(custom$mz_bin_width, diff(c(99.9, 101))/37)
+same(custom$time_bin_width, 10/19)
+stopifnot(grepl("whole bin counts", error_text(tasks$investigate_bin_counts(20.5, 40))),
+  grepl("whole bin counts", error_text(tasks$investigate_bin_counts(NA_real_, 40))),
+  grepl("whole bin counts", error_text(tasks$investigate_bin_counts(1, 40))),
+  grepl("too large", error_text(tasks$investigate_bin_counts(2000, 2000))))
 stopifnot(max(signals$batches) <= 8L, grid$scans == 11L,
           max(grid$z) == 1200, grid$z[80, 100] == 1200, grid$z[1, 1] == 1)
 stopifnot(grepl("No m/z measurements", error_text(tasks$investigate_build_grid(raw, c(200, 201), c(0, 10)))))
@@ -83,6 +93,26 @@ negative$read_peaks <- function(handle, scans) {
 negative_grid <- tasks$investigate_build_grid(negative, c(99.9, 101), c(0, 10), 100L, 80L)
 stopifnot(min(negative_grid$z) == -5)
 
+# Time-window means are calculated per scan before averaging, so differing
+# point counts do not give a spectrum extra weight; absent bins contribute zero.
+combined <- tasks$investigate_extract_time_slice(raw, 1, c(99.9, 101),
+  mode = "combine", window_seconds = 60, mz_bin_width = 0.01)
+stopifnot(combined$scan_count == 3L, combined$mode == "combine")
+# Independently locate occupied bins from the reported grid centres.
+mass_bin <- which.min(abs(combined$data$mz - 100.005))
+same(combined$data$intensity[mass_bin], 4)
+same(tail(combined$data$intensity, 1), 140)
+overlaid <- tasks$investigate_extract_time_slice(raw, 1.2, c(99.9, 101),
+  mode = "overlay", window_seconds = 120, n_spectra = 3)
+same(vapply(overlaid$spectra, function(s) s$time, numeric(1)), c(1, 2, 0))
+same(overlaid$spectra[[1]]$data$mz, sort(fixture_scans[[3]][1:4, 1]))
+stopifnot(grepl("No MS1 scans", error_text(tasks$investigate_extract_time_slice(raw, 1.5,
+  c(99.9, 101), window_seconds = 1))))
+stopifnot(grepl("positive", error_text(tasks$investigate_extract_time_slice(raw, 1,
+  c(99.9, 101), window_seconds = 0))))
+stopifnot(grepl("whole spectrum count", error_text(tasks$investigate_extract_time_slice(raw, 1,
+  c(99.9, 101), mode = "overlay", n_spectra = 4.5))))
+
 # Actual Plotly traces, orientation, range controls, logarithmic display and band.
 grid$key <- "fixture"; grid$intensity_range <- c(0, 1500)
 surface <- plotly_build(tasks$investigate_plot_grid(grid, c(99.999, 100.001)))
@@ -94,11 +124,22 @@ same(dim(surface$x$data[[1]]$z), dim(grid$z))
 same(as.numeric(surface$x$data[[1]]$z), as.numeric(grid$z))
 logged <- plotly_build(tasks$investigate_plot_grid(grid, logarithmic = TRUE))
 same(as.numeric(logged$x$data[[1]]$z), as.numeric(log10(1 + grid$z)))
+stopifnot(surface$x$data[[1]]$lighting$ambient >= 0.8,
+  any(grepl("dbeefe", unlist(surface$x$data[[1]]$colorscale), ignore.case = TRUE)))
 slice$key <- "fixture"; slice$intensity_range <- c(0, 40)
 trace <- plotly_build(tasks$investigate_plot_slice(slice))
 stopifnot(trace$x$data[[1]]$type == "scattergl")
 same(as.numeric(trace$x$data[[1]]$y), slice$data$intensity)
 same(trace$x$layout$yaxis$range, c(0, 40))
+combined$key <- "combined"; combined$intensity_range <- c(0, 150)
+combined_plot <- plotly_build(tasks$investigate_plot_slice(combined))
+stopifnot(combined_plot$x$layout$xaxis$title == "m/z")
+overlaid$key <- "overlay"; overlaid$intensity_range <- c(0, 400)
+overlay_plot <- plotly_build(tasks$investigate_plot_slice(overlaid))
+stopifnot(length(overlay_plot$x$data) == 3L,
+  length(unique(vapply(overlay_plot$x$data, function(s) s$line$color, character(1)))) == 3L)
+same(as.numeric(overlay_plot$x$data[[1]]$x), overlaid$spectra[[1]]$data$mz)
+same(as.numeric(overlay_plot$x$data[[1]]$y), overlaid$spectra[[1]]$data$intensity)
 tasks$investigate_close_raw(raw)
 
 # Harness runs the whole actual Matabo section, including all registrations.
@@ -131,7 +172,8 @@ testServer(investigate_harness, {
     investigate_mz_min = 99.9, investigate_mz_max = 101,
     investigate_time_min = 0, investigate_time_max = 10,
     investigate_slice_time_min = 0, investigate_slice_time_max = 10,
-    investigate_mz_bins = "100", investigate_time_bins = "80",
+    investigate_mz_bins = 100, investigate_time_bins = 80,
+    investigate_slice_axis = "mz",
     investigate_center = 100, investigate_window = 10, investigate_unit = "ppm",
     investigate_auto_z = TRUE, investigate_auto_y = TRUE, investigate_log_z = FALSE,
     investigate_aggregation = "mean")
@@ -152,8 +194,24 @@ testServer(investigate_harness, {
   stopifnot(length(signals$batches) == reads)
   same(investigate_grid()$intensity_range, c(0, 500))
   same(investigate_trace()$intensity_range, c(0, 50))
+  stopifnot(grepl("Δm/z", output$investigate_grid_status),
+    grepl("Δt", output$investigate_bin_widths))
   session$setInputs(`plotly_click-metabomeister_investigate` = '{"x":100.25,"y":1,"z":10,"curveNumber":0}')
   same(as.numeric(signals$input_updates$investigate_center$value), 100.25)
+  session$setInputs(investigate_slice_axis = "time", investigate_time_mode = "combine",
+    investigate_time_center = 1, investigate_time_window = 60,
+    investigate_spectrum_bin_width = 0.01, investigate_spectrum_count = 5,
+    investigate_spectrum_mz_min = 99.9, investigate_spectrum_mz_max = 101,
+    investigate_draw_slice = 3)
+  stopifnot(investigate_trace()$mode == "combine", investigate_trace()$scan_count == 3L)
+  session$setInputs(investigate_time_mode = "overlay", investigate_time_center = 1.2,
+    investigate_time_window = 120, investigate_spectrum_count = 3, investigate_draw_slice = 4)
+  same(vapply(investigate_trace()$spectra, function(s) s$time, numeric(1)), c(1, 2, 0))
+  reads <- length(signals$batches)
+  session$setInputs(investigate_y_max = 400, investigate_draw_slice = 5)
+  stopifnot(length(signals$batches) == reads)
+  session$setInputs(`plotly_click-metabomeister_investigate` = '{"x":100,"y":2,"z":20,"curveNumber":0}')
+  same(as.numeric(signals$input_updates$investigate_time_center$value), 2)
   session$setInputs(investigate_mz_max = 90, investigate_draw_3d = 4)
   stopifnot(is.null(investigate_grid()), !session$isClosed(), grepl("minimum < maximum", tail(signals$errors, 1)[[1]]$message))
   session$setInputs(investigate_mz_max = 101, investigate_draw_3d = 5)
@@ -168,7 +226,7 @@ testServer(investigate_harness, {
 })
 stopifnot(signals$opens == signals$closes)
 same(unname(tools::md5sum(fixture_path)), hash_before)
-cat("PASS: ppm/Da, inclusive boundaries, mean/sum/max, MS1-only and finite data; bounded batches/grid; real 3D/log/slice Plotly traces; actual GUI actions with masked progress functions, cache/range changes, click selection, recoverable errors, handle cleanup and unchanged raw input.\n")
+cat("PASS: exact m/z traces; custom/default bin counts and widths; light palette; combined time-window means and original spectra overlays in nearest-first colour order; bounded batches/grid; actual guarded GUI actions, masked progress functions, cached intensity updates, axis-aware clicks, recovery and handle cleanup.\n")
 
 # New UI IDs are unique, and the menu places Investigate between Engine and Visualization.
 suppressPackageStartupMessages({ library(shinydashboard); library(DT); library(shinyjs); library(waiter) })
@@ -186,4 +244,8 @@ walk_tags <- function(x) {
 all_ids <- vapply(Filter(function(tag) !is.null(tag$attribs$id), walk_tags(actual_ui)), function(tag) tag$attribs$id, character(1))
 investigate_ids <- all_ids[startsWith(all_ids, "investigate_")]
 stopifnot(length(investigate_ids) >= 30L, !anyDuplicated(investigate_ids))
+for (pair in list(c("investigate_mz_bins", "50"), c("investigate_time_bins", "40"))) {
+  control <- Filter(function(tag) identical(tag$attribs$id, pair[1]), walk_tags(actual_ui))[[1]]
+  stopifnot(as.character(control$attribs$value) == pair[2], control$name == "input")
+}
 cat("PASS: actual Investigate UI, sidebar order and unique control/output IDs.\n")

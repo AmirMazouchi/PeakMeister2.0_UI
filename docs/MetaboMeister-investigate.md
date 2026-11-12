@@ -37,19 +37,24 @@ Investigate's loaded-file status identifies the raw file being shown.
 - Optional log-intensity display makes small signals easier to see alongside
   large signals. Negative intensities are shown at zero height in log view;
   linear view retains their values.
-- Choose 100/200/400 m/z bins and 80/160/320 time bins. The preview contains at
-  most 128,000 cells, even for a very large raw file. It reports the number of
-  source measurements and MS1 scans represented.
+- Enter custom whole bin counts; defaults are **50 m/z bins × 40 time bins**.
+  Both counts must be at least 2. A preview can contain at most 1,000,000 cells
+  to keep browser rendering bounded. The controls show the selected m/z bin
+  width in Da and time bin width in minutes and seconds. The drawn preview
+  separately reports its actual bin widths, counts, source measurements and
+  represented MS1 scans.
+- The surface uses a light blue–cyan–yellow–orange–red palette with brighter
+  lighting, avoiding the previous dark purple low-intensity background.
 - Each cell shows the maximum measured intensity in that m/z/time bin;
   empty bins are zero. The grid is a display summary rather than a peak-area
   measurement. Narrowing ranges increases the detail available per bin.
-- Click the surface to populate **Centre m/z**. The orange band shows the
-  currently selected m/z window. Click **Plot / apply cross-section** to extract
-  the corresponding trace. A click uses the preview bin centre, not an exact
-  measured mass. Enter an exact centre m/z for a narrow ppm window, or narrow
-  the 3D display range first to obtain finer bins.
+- Click the surface to populate **Centre m/z** or **Slice time**, depending on
+  the active slice axis. The orange marker shows the selected m/z or time
+  window. Click **Plot / apply cross-section** to extract it. A click uses a
+  preview-bin centre, not an exact measured mass or scan time. Enter an exact
+  value for precise windows, or narrow the 3D display range for finer bins.
 
-## Exact cross-section
+## m/z-window cross-section
 
 The window is a centre m/z plus a **± half-width**, expressed in ppm or Da:
 
@@ -69,10 +74,39 @@ or select **Reset trace view** to restore the last applied ranges. Changing only
 intensity limits reuses the cached data. Changing the window, extraction time
 range or aggregation requires another extraction.
 
+## Time-window cross-sections
+
+Choose **Time → mass spectrum**, enter a centre time in minutes and a positive
+± window in seconds. The lower graph then plots intensity against m/z, with
+separate spectrum m/z-range controls and the existing intensity-range/reset
+controls. Only MS1 scans inside the inclusive time window are used.
+
+Two displays are available:
+
+1. **Combine spectra (mean):** align scans to an explicit m/z grid (default
+   bin width 0.01 Da). Compute each scan's mean intensity within each mass bin,
+   then average those bin intensities across all selected scans. A missing bin
+   in a scan contributes zero, so a scan with more raw points does not receive
+   extra weight. The status reports the number of scans and bin width. The last
+   mass bin can be narrower where it meets the requested m/z upper limit.
+2. **Overlay spectra:** choose the number of spectra, default 5 (4 is also
+   supported). Select up to that many closest scans inside the time window,
+   ordered by absolute distance from its centre; ties use the earlier time.
+   Each curve keeps its original m/z points and has a different colour. Legend
+   entries give actual acquisition times and time distances, nearest first.
+   Click a legend entry to hide/show a curve. Empty spectra in the chosen m/z
+   range are omitted and the status reports the selected and plotted counts.
+
+Combined spectra are averages on their own stated mass grid; they do not use
+the coarse 3D preview. Overlaid spectra are not mass-binned. Both are calculated
+from the original data with no smoothing, calibration or peak fitting. A
+combined spectrum is limited to 1,000,000 mass bins; narrow the m/z range or
+increase its bin width for a larger request.
+
 ## Resource handling and errors
 
 Spectra are read in batches of eight, rather than loading the full raw run into
-an MSnbase object. Only one preview and one exact trace are cached per session.
+an MSnbase object. Only one preview and the current cross-section are cached per session.
 File handles close when the loaded file is replaced, the investigation is
 cleared, or the session ends. Opening a file that cannot be read and invalid
 range requests use the existing guarded error handling, allowing retry.

@@ -1,4 +1,6 @@
 # MetaboMeister adds a read-only Investigate tab in section Matabo3.6.
+# Investigate reports bin widths, accepts custom counts (50 × 40 by default),
+# uses a light surface palette, and combines or overlays time-window spectra.
 # Investigate explicitly uses Shiny's progress functions so packages loaded
 # later cannot mask the numeric progress updates for either plot.
 # mzR reads raw MS1 scans in small batches; only a bounded grid is sent to the
@@ -1277,14 +1279,30 @@ server <- function(input, output, session){
   }
 
   ######Matabo3.6.2 Binned 3D preview and exact m/z-window extraction######
-  investigate_build_grid <- function(raw, mz_range, time_range, mz_bins = 200L,
-                                      time_bins = 160L, progress = function(fraction) NULL) {
+  investigate_bin_counts <- function(mz_bins, time_bins) {
+    valid <- function(value) is.numeric(value) && length(value) == 1L &&
+      is.finite(value) && value >= 2 && value <= 10000 && value == floor(value)
+    if (!valid(mz_bins) || !valid(time_bins)) {
+      stop("Enter whole bin counts between 2 and 10,000 for both axes.", call. = FALSE)
+    }
+    if (mz_bins * time_bins > 1e6) {
+      stop("The preview is too large: m/z bins × time bins must be at most 1,000,000.", call. = FALSE)
+    }
+    c(mz = as.integer(mz_bins), time = as.integer(time_bins))
+  }
+
+  investigate_bin_label <- function(mz_width, time_width) {
+    number <- function(x) format(signif(x, 6), trim = TRUE, scientific = FALSE)
+    paste0("Δm/z = ", number(mz_width), " Da; Δt = ", number(time_width),
+      " min (", number(time_width * 60), " s).")
+  }
+
+  investigate_build_grid <- function(raw, mz_range, time_range, mz_bins = 50L,
+                                      time_bins = 40L, progress = function(fraction) NULL) {
     mz_range <- investigate_range(mz_range, "3D m/z range")
     time_range <- investigate_range(time_range, "3D time range")
-    if (length(mz_bins) != 1L || length(time_bins) != 1L ||
-        !mz_bins %in% c(100L, 200L, 400L) || !time_bins %in% c(80L, 160L, 320L)) {
-      stop("Choose one of the available preview resolutions.")
-    }
+    bins <- investigate_bin_counts(mz_bins, time_bins)
+    mz_bins <- bins[["mz"]]; time_bins <- bins[["time"]]
     mz_edges <- seq(mz_range[1], mz_range[2], length.out = mz_bins + 1L)
     time_edges <- seq(time_range[1], time_range[2], length.out = time_bins + 1L)
     z <- matrix(NA_real_, nrow = time_bins, ncol = mz_bins)
@@ -1303,7 +1321,9 @@ server <- function(input, output, session){
     z[is.na(z)] <- 0
     list(mz = head(mz_edges, -1) + diff(mz_edges)/2,
       time = head(time_edges, -1) + diff(time_edges)/2, z = z,
-      mz_range = mz_range, time_range = time_range, points = points, scans = length(selected))
+      mz_range = mz_range, time_range = time_range,
+      mz_bin_width = diff(mz_range)/mz_bins, time_bin_width = diff(time_range)/time_bins,
+      points = points, scans = length(selected))
   }
 
   investigate_extract_slice <- function(raw, center, window, unit, time_range,
@@ -1317,9 +1337,78 @@ server <- function(input, output, session){
       values[index] <<- if (!length(intensity)) 0 else switch(aggregation,
         mean = mean(intensity), sum = sum(intensity), max = max(intensity))
     }, progress)
-    list(data = data.frame(time = raw$times[selected], intensity = values[selected]),
+    list(axis = "mz", data = data.frame(time = raw$times[selected], intensity = values[selected]),
       center = center, window = window, unit = unit, mz_range = mz_range,
       time_range = time_range, aggregation = aggregation)
+  }
+
+  # Matabo3.6.2 Time slices combine scans on an explicit mass grid or overlay
+  # original spectra, ordered by distance from the requested acquisition time.
+  investigate_extract_time_slice <- function(raw, center, mz_range,
+                                               mode = "combine", window_seconds = 5,
+                                               mz_bin_width = 0.01, n_spectra = 5,
+                                               progress = function(fraction) NULL) {
+    if (!is.numeric(center) || length(center) != 1L || !is.finite(center) ||
+        center < min(raw$times) || center > max(raw$times)) {
+      stop("Choose a slice time inside the loaded run's acquisition-time range.", call. = FALSE)
+    }
+    mz_range <- investigate_range(mz_range, "Spectrum m/z range")
+    if (!is.numeric(window_seconds) || length(window_seconds) != 1L ||
+        !is.finite(window_seconds) || window_seconds <= 0) stop("Enter a positive ± time window in seconds.")
+    if (length(mode) != 1L || !mode %in% c("combine", "overlay")) stop("Choose Combine or Overlay for the time slice.")
+    time_range <- c(max(0, center - window_seconds/60), center + window_seconds/60)
+    selected <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
+    if (!length(selected)) stop("No MS1 scans fall inside the selected time window. Increase the window or choose another time.")
+    if (mode == "overlay") {
+      if (!is.numeric(n_spectra) || length(n_spectra) != 1L || !is.finite(n_spectra) ||
+          n_spectra < 2 || n_spectra > 20 || n_spectra != floor(n_spectra)) stop("Enter a whole spectrum count between 2 and 20.")
+      selected <- head(selected[order(abs(raw$times[selected] - center), raw$times[selected])], n_spectra)
+      spectra <- vector("list", length(selected))
+    } else {
+      if (!is.numeric(mz_bin_width) || length(mz_bin_width) != 1L ||
+          !is.finite(mz_bin_width) || mz_bin_width <= 0) stop("Enter a positive combined-spectrum m/z bin width.")
+      bins <- ceiling(diff(mz_range)/mz_bin_width)
+      if (!is.finite(bins) || bins > 1e6) stop("The combined spectrum exceeds 1,000,000 m/z bins. Increase its bin width or narrow its m/z range.")
+      edges <- mz_range[1] + (0:bins) * mz_bin_width
+      tolerance <- 8 * .Machine$double.eps * max(1, abs(mz_range))
+      if (length(edges) > 2L && edges[length(edges) - 1L] >= mz_range[2] - tolerance) {
+        edges <- head(edges, -1L)
+        bins <- length(edges) - 1L
+      }
+      edges[length(edges)] <- mz_range[2]
+      totals <- numeric(bins)
+    }
+    view <- raw
+    view$scans <- raw$scans[selected]; view$times <- raw$times[selected]
+    points <- 0
+    investigate_walk_scans(view, time_range, function(scan, index) {
+      scan <- scan[scan[, 1] >= mz_range[1] & scan[, 1] <= mz_range[2], , drop = FALSE]
+      if (!nrow(scan)) return()
+      points <<- points + nrow(scan)
+      if (mode == "overlay") {
+        scan <- scan[order(scan[, 1]), , drop = FALSE]
+        spectra[[index]] <<- list(time = view$times[index], scan = view$scans[index],
+          distance_seconds = abs(view$times[index] - center) * 60,
+          data = data.frame(mz = scan[, 1], intensity = scan[, 2]))
+      } else {
+        mass_bin <- findInterval(scan[, 1], edges, all.inside = TRUE)
+        per_scan_mean <- tapply(scan[, 2], mass_bin, mean)
+        columns <- as.integer(names(per_scan_mean))
+        totals[columns] <<- totals[columns] + as.numeric(per_scan_mean)
+      }
+    }, progress)
+    if (!points) stop("No selected MS1 spectra have measurements inside the chosen m/z range.")
+    result <- list(axis = "time", mode = mode, requested_time = center,
+      window_seconds = window_seconds, time_range = time_range,
+      selected_times = view$times, scan_count = length(selected), mz_range = mz_range)
+    if (mode == "overlay") {
+      result$spectra <- Filter(Negate(is.null), spectra)
+    } else {
+      result$mz_bin_width <- mz_bin_width
+      result$data <- data.frame(mz = head(edges, -1) + diff(edges)/2,
+        intensity = totals/length(selected))
+    }
+    result
   }
 
   investigate_intensity_range <- function(values) {
@@ -1331,21 +1420,34 @@ server <- function(input, output, session){
 
   investigate_camera <- function() list(eye = list(x = 1.6, y = 1.6, z = 1.1))
 
-  investigate_plot_grid <- function(grid, band = NULL, logarithmic = FALSE) {
+  investigate_plot_grid <- function(grid, band = NULL, logarithmic = FALSE, time_band = NULL) {
     transform <- if (logarithmic) function(x) log10(1 + pmax(x, 0)) else identity
     limits <- transform(grid$intensity_range)
     if (diff(limits) == 0) limits <- c(0, 1)
     plot <- plotly::plot_ly(x = grid$mz, y = grid$time, z = transform(grid$z),
-      surfacecolor = grid$z, type = "surface", colorscale = "Viridis",
+      surfacecolor = grid$z, type = "surface",
+      colorscale = list(list(0, "#dbeefe"), list(0.2, "#84cfef"), list(0.4, "#42c6b1"),
+        list(0.6, "#f4db63"), list(0.8, "#f99a47"), list(1, "#e3483c")),
+      lighting = list(ambient = 0.85, diffuse = 0.75, roughness = 0.8, specular = 0.05),
       source = "metabomeister_investigate", colorbar = list(title = "Ion counts"),
       hovertemplate = "m/z: %{x:.5f}<br>Time: %{y:.4f} min<br>Intensity: %{surfacecolor:.4g}<extra></extra>")
-    if (!is.null(band) && band[2] >= grid$mz_range[1] && band[1] <= grid$mz_range[2]) {
+    if (!is.null(time_band) && all(is.finite(time_band)) &&
+        time_band[2] >= grid$time_range[1] && time_band[1] <= grid$time_range[2]) {
+      time_band <- pmax(grid$time_range[1], pmin(grid$time_range[2], time_band))
+      marker_x <- c(grid$mz_range[1], grid$mz_range[2], grid$mz_range[2], grid$mz_range[1])
+      marker_y <- c(time_band[1], time_band[1], time_band[2], time_band[2])
+      marker_name <- "Selected time"
+    } else if (!is.null(band) && band[2] >= grid$mz_range[1] && band[1] <= grid$mz_range[2]) {
       band <- pmax(grid$mz_range[1], pmin(grid$mz_range[2], band))
+      marker_x <- c(band[1], band[2], band[2], band[1])
+      marker_y <- c(grid$time_range[1], grid$time_range[1], grid$time_range[2], grid$time_range[2])
+      marker_name <- "Selected m/z window"
+    } else marker_name <- NULL
+    if (!is.null(marker_name)) {
       plot <- plotly::add_trace(plot, type = "mesh3d", inherit = FALSE,
-        x = c(band[1], band[2], band[2], band[1]),
-        y = c(grid$time_range[1], grid$time_range[1], grid$time_range[2], grid$time_range[2]),
+        x = marker_x, y = marker_y,
         z = rep(limits[1] + diff(limits) * 0.002, 4), i = c(0, 0), j = c(1, 2), k = c(2, 3),
-        color = I("#f59e0b"), opacity = 0.7, showscale = FALSE, hoverinfo = "skip", name = "Selected m/z window")
+        color = I("#f59e0b"), opacity = 0.7, showscale = FALSE, hoverinfo = "skip", name = marker_name)
     }
     plot <- plotly::layout(plot, uirevision = paste(grid$key, collapse = ":"),
       scene = list(xaxis = list(title = "m/z", range = grid$mz_range),
@@ -1357,12 +1459,38 @@ server <- function(input, output, session){
   }
 
   investigate_plot_slice <- function(trace) {
-    plotly::plot_ly(trace$data, x = ~time, y = ~intensity, type = "scattergl", mode = "lines",
-      line = list(color = "#24547b"), name = paste(trace$aggregation, "intensity"),
-      hovertemplate = "Time: %{x:.4f} min<br>Intensity: %{y:.5g}<extra></extra>") %>%
+    time_slice <- identical(trace$axis, "time")
+    x_range <- if (time_slice) trace$mz_range else trace$time_range
+    overlay <- time_slice && identical(trace$mode, "overlay")
+    y_title <- if (time_slice) {
+      if (overlay) "Intensity (ion counts)" else "Mean intensity (ion counts)"
+    } else paste(trace$aggregation, "intensity (ion counts)")
+    if (overlay) {
+      plot <- plotly::plot_ly()
+      palette <- grDevices::hcl.colors(max(3L, length(trace$spectra)), "Dark 3")
+      for (i in seq_along(trace$spectra)) {
+        spectrum <- trace$spectra[[i]]
+        label <- paste0(i, ": ", format(spectrum$time, digits = 7), " min (Δ",
+          format(signif(spectrum$distance_seconds, 4), trim = TRUE), " s)")
+        plot <- plotly::add_trace(plot, x = spectrum$data$mz, y = spectrum$data$intensity,
+          type = "scattergl", mode = if (nrow(spectrum$data) == 1L) "markers" else "lines",
+          name = label, line = list(color = palette[i]),
+          hovertemplate = paste0("Time: ", format(spectrum$time, digits = 7),
+            " min<br>m/z: %{x:.6f}<br>Intensity: %{y:.5g}<extra>%{fullData.name}</extra>"))
+      }
+    } else {
+      x <- if (time_slice) trace$data$mz else trace$data$time
+      plot <- plotly::plot_ly(x = x, y = trace$data$intensity, type = "scattergl",
+        mode = if (length(x) == 1L) "markers" else "lines",
+        line = list(color = "#24547b"), name = if (time_slice) "Combined MS1 spectrum" else paste(trace$aggregation, "intensity"),
+        hovertemplate = if (time_slice) "m/z: %{x:.6f}<br>Mean intensity: %{y:.5g}<extra></extra>" else
+          "Time: %{x:.4f} min<br>Intensity: %{y:.5g}<extra></extra>")
+    }
+    plot %>%
       plotly::layout(uirevision = paste(trace$key, collapse = ":"),
-        xaxis = list(title = "Time (min)", range = trace$time_range),
-        yaxis = list(title = paste(trace$aggregation, "intensity (ion counts)"), range = trace$intensity_range),
+        xaxis = list(title = if (time_slice) "m/z" else "Time (min)", range = x_range),
+        yaxis = list(title = y_title, range = trace$intensity_range),
+        showlegend = overlay, legend = list(title = list(text = "Nearest → farthest"), font = list(size = 11)),
         margin = list(l = 70, r = 20, b = 55, t = 20)) %>%
       plotly::config(scrollZoom = TRUE, displaylogo = FALSE)
   }
@@ -1402,7 +1530,9 @@ server <- function(input, output, session){
       investigate_raw(raw)
       defaults <- list(investigate_mz_min = raw$mz_range[1], investigate_mz_max = raw$mz_range[2],
         investigate_time_min = raw$time_range[1], investigate_time_max = raw$time_range[2],
-        investigate_slice_time_min = raw$time_range[1], investigate_slice_time_max = raw$time_range[2])
+        investigate_slice_time_min = raw$time_range[1], investigate_slice_time_max = raw$time_range[2],
+        investigate_time_center = raw$times[ceiling(length(raw$times)/2)],
+        investigate_spectrum_mz_min = raw$mz_range[1], investigate_spectrum_mz_max = raw$mz_range[2])
       targets <- suppressWarnings(as.numeric(c(refMassListData()$mz, massData()$mz)))
       targets <- targets[is.finite(targets) & targets >= raw$mz_range[1] & targets <= raw$mz_range[2]]
       defaults$investigate_center <- if (length(targets)) targets[1] else mean(raw$mz_range)
@@ -1423,7 +1553,7 @@ server <- function(input, output, session){
       grid <- if (!is.null(previous) && identical(previous$key, key)) previous else {
         shiny::withProgress(message = "Building raw 3D preview", value = 0, {
           investigate_build_grid(raw, mz_range, time_range,
-            as.integer(input$investigate_mz_bins), as.integer(input$investigate_time_bins),
+            input$investigate_mz_bins, input$investigate_time_bins,
             progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
@@ -1438,20 +1568,35 @@ server <- function(input, output, session){
       raw <- investigate_raw()
       if (is.null(raw)) stop("Load a raw .mz5 file first.")
       previous <- investigate_trace(); investigate_trace(NULL)
-      time_range <- investigate_range(c(input$investigate_slice_time_min, input$investigate_slice_time_max), "Cross-section time range")
       limits <- if (isTRUE(input$investigate_auto_y)) NULL else investigate_range(
         c(input$investigate_y_min, input$investigate_y_max), "Trace intensity range", nonnegative = FALSE)
-      key <- c(raw$name, input$investigate_center, input$investigate_window,
-        input$investigate_unit, time_range, input$investigate_aggregation)
+      time_slice <- identical(input$investigate_slice_axis, "time")
+      if (time_slice) {
+        mz_range <- investigate_range(c(input$investigate_spectrum_mz_min, input$investigate_spectrum_mz_max), "Spectrum m/z range")
+        key <- c("time", raw$name, input$investigate_time_center, mz_range,
+          input$investigate_time_mode, input$investigate_time_window,
+          if (identical(input$investigate_time_mode, "overlay")) input$investigate_spectrum_count else input$investigate_spectrum_bin_width)
+      } else {
+        time_range <- investigate_range(c(input$investigate_slice_time_min, input$investigate_slice_time_max), "Cross-section time range")
+        key <- c("mz", raw$name, input$investigate_center, input$investigate_window,
+          input$investigate_unit, time_range, input$investigate_aggregation)
+      }
       trace <- if (!is.null(previous) && identical(previous$key, key)) previous else {
         shiny::withProgress(message = "Extracting original MS1 scans", value = 0, {
-          investigate_extract_slice(raw, input$investigate_center, input$investigate_window,
-            input$investigate_unit, time_range, input$investigate_aggregation,
-            progress = function(fraction) shiny::setProgress(value = fraction))
+          if (time_slice) investigate_extract_time_slice(raw, input$investigate_time_center, mz_range,
+            mode = input$investigate_time_mode, window_seconds = input$investigate_time_window,
+            mz_bin_width = input$investigate_spectrum_bin_width, n_spectra = input$investigate_spectrum_count,
+            progress = function(fraction) shiny::setProgress(value = fraction)) else
+              investigate_extract_slice(raw, input$investigate_center, input$investigate_window,
+                input$investigate_unit, time_range, input$investigate_aggregation,
+                progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
       trace$key <- key
-      trace$intensity_range <- if (is.null(limits)) investigate_intensity_range(trace$data$intensity) else limits
+      intensities <- if (time_slice && identical(trace$mode, "overlay")) {
+        unlist(lapply(trace$spectra, function(spectrum) range(spectrum$data$intensity)), use.names = FALSE)
+      } else trace$data$intensity
+      trace$intensity_range <- if (is.null(limits)) investigate_intensity_range(intensities) else limits
       investigate_trace(trace)
     }, "Investigate: extract m/z cross-section")
   })
@@ -1470,13 +1615,16 @@ server <- function(input, output, session){
     req(investigate_trace())
     trace <- investigate_trace()
     plotly::plotlyProxy("investigate_slice", session) %>% plotly::plotlyProxyInvoke("relayout",
-      list("xaxis.range" = trace$time_range, "yaxis.range" = trace$intensity_range))
+      list("xaxis.range" = if (identical(trace$axis, "time")) trace$mz_range else trace$time_range,
+        "yaxis.range" = trace$intensity_range))
   })
   observe_action(plot_event_data("plotly_click", "metabomeister_investigate"), {
     click <- plot_event_data("plotly_click", "metabomeister_investigate")
     if (!is.null(click) && length(click$x) && is.finite(click$x[1]) &&
         (!"curveNumber" %in% names(click) || click$curveNumber[1] == 0L)) {
-      updateNumericInput(session, "investigate_center", value = as.numeric(click$x[1]))
+      if (identical(input$investigate_slice_axis, "time") && length(click$y) && is.finite(click$y[1])) {
+        updateNumericInput(session, "investigate_time_center", value = as.numeric(click$y[1]))
+      } else updateNumericInput(session, "investigate_center", value = as.numeric(click$x[1]))
     }
   })
 
@@ -1494,11 +1642,31 @@ server <- function(input, output, session){
     grid <- investigate_grid()
     if (is.null(grid)) return("No 3D preview drawn yet.")
     paste(format(grid$points, big.mark = ","), "measurements from", grid$scans,
-      "MS1 scans;", ncol(grid$z), "m/z bins ×", nrow(grid$z), "time bins. Raw, uncalibrated data.")
+      "MS1 scans;", ncol(grid$z), "m/z bins ×", nrow(grid$z), "time bins.",
+      "Drawn bin widths:", investigate_bin_label(grid$mz_bin_width, grid$time_bin_width),
+      "Raw, uncalibrated data.")
+  })
+  output$investigate_bin_widths <- renderText({
+    tryCatch({
+      bins <- investigate_bin_counts(input$investigate_mz_bins, input$investigate_time_bins)
+      mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "m/z range")
+      time_range <- investigate_range(c(input$investigate_time_min, input$investigate_time_max), "Time range")
+      paste("Selected bin widths:", investigate_bin_label(diff(mz_range)/bins[["mz"]],
+        diff(time_range)/bins[["time"]]))
+    }, error = function(e) conditionMessage(e))
   })
   output$investigate_slice_status <- renderText({
     trace <- investigate_trace()
     if (is.null(trace)) return("No cross-section extracted yet.")
+    if (identical(trace$axis, "time")) {
+      details <- if (identical(trace$mode, "overlay")) paste0(length(trace$spectra),
+        " original spectra shown nearest to farthest; ", trace$scan_count,
+        " scans selected. Colours identify actual acquisition times; no mass binning.") else
+          paste0(trace$scan_count, " MS1 spectra combined; m/z bin width ",
+            trace$mz_bin_width, " Da. Mean of per-scan bin intensities; absent bins contribute zero.")
+      return(paste0("Time: ", format(trace$requested_time, digits = 7), " ± ",
+        trace$window_seconds/60, " min (±", trace$window_seconds, " s). ", details))
+    }
     paste0("m/z ", format(trace$center, digits = 8), " ± ", trace$window, " ", trace$unit,
       " [", paste(format(trace$mz_range, digits = 9), collapse = ", "), "]; ",
       trace$aggregation, " intensity; ", nrow(trace$data), " original MS1 scans. No smoothing or peak fitting.")
@@ -1506,9 +1674,17 @@ server <- function(input, output, session){
   output$investigate_3d <- plotly::renderPlotly({
     grid <- investigate_grid()
     shiny::validate(shiny::need(!is.null(grid), "Load a raw file and draw the 3D preview."))
-    band <- tryCatch(investigate_window_limits(input$investigate_center,
+    time_band <- NULL; band <- NULL
+    if (identical(input$investigate_slice_axis, "time")) {
+      center <- input$investigate_time_center
+      window <- input$investigate_time_window
+      if (is.numeric(center) && length(center) == 1L && is.finite(center) &&
+          is.numeric(window) && length(window) == 1L && is.finite(window) && window > 0) {
+        time_band <- center + c(-1, 1) * window/60
+      }
+    } else band <- tryCatch(investigate_window_limits(input$investigate_center,
       input$investigate_window, input$investigate_unit), error = function(e) NULL)
-    investigate_plot_grid(grid, band, isTRUE(input$investigate_log_z))
+    investigate_plot_grid(grid, band, isTRUE(input$investigate_log_z), time_band = time_band)
   })
   output$investigate_slice <- plotly::renderPlotly({
     trace <- investigate_trace()
