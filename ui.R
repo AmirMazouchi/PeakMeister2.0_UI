@@ -2,8 +2,10 @@
 # a bounded 3D raw-MS1 preview and an exact m/z-window trace with range controls.
 # Native sampling spacing/counts are measured once. Positive whole factors
 # group adjacent mass readings and scans by mean; differing mass axes expose an
-# adjustable alignment grid. A separate exact median spectrum uses the selected
-# 3D time range independently of grouping. Time slices can combine or overlay.
+# adjustable alignment grid. A separate median spectrum uses its own
+# independently editable time range with an every-Nth-scan control. Grouping
+# defaults to 40/20 with Da/second equivalents; range bounds show three decimals.
+# Time slices can combine or overlay.
 # Original section headings are retained; new sections use the Matabo prefix.
 # Visualization has multi-step Undo/Redo and a history count. Peak edits create
 # a separate edited analysis copy; the original analysis remains available.
@@ -376,6 +378,25 @@ ui <- dashboardPage(
       
       #####Matabo5.1 Investigate raw mass spectra#####
       tabItem(tabName = "investigate",
+        # Matabo5.1 Keep editable range bounds compact on keyboard/paste edits.
+        tags$script(HTML("(function () {
+          var ids = ['mz_min', 'mz_max', 'time_min', 'time_max',
+            'slice_time_min', 'slice_time_max', 'spectrum_mz_min', 'spectrum_mz_max',
+            'median_time_min', 'median_time_max'].map(function (id) { return 'investigate_' + id; });
+          document.addEventListener('input', function (event) {
+            if (['investigate_median_time_min', 'investigate_median_time_max'].indexOf(event.target.id) >= 0) {
+              Shiny.setInputValue('investigate_median_time_edited', Date.now(), {priority: 'event'});
+            }
+          });
+          document.addEventListener('blur', function (event) {
+            var field = event.target;
+            if (ids.indexOf(field.id) < 0 || field.value === '') return;
+            var value = Number(field.value);
+            if (!Number.isFinite(value)) return;
+            var compact = String(Number(value.toFixed(3)));
+            if (field.value !== compact) { field.value = compact; $(field).trigger('change'); }
+          }, true);
+        })();")),
         h3("Investigate raw data"),
         p("Explore MS1 measurements without running peak detection. Time is shown in minutes."),
         radioButtons("investigate_source", "Raw file source",
@@ -394,20 +415,20 @@ ui <- dashboardPage(
           column(3,
             h4("3D display ranges"),
             fluidRow(
-              column(6, numericInput("investigate_mz_min", "m/z minimum", 50, min = 0)),
-              column(6, numericInput("investigate_mz_max", "m/z maximum", 1000, min = 0))),
+              column(6, numericInput("investigate_mz_min", "m/z minimum", 50, min = 0, step = 0.001)),
+              column(6, numericInput("investigate_mz_max", "m/z maximum", 1000, min = 0, step = 0.001))),
             fluidRow(
-              column(6, numericInput("investigate_time_min", "Time start (min)", 0, min = 0)),
-              column(6, numericInput("investigate_time_max", "Time end (min)", 40, min = 0))),
+              column(6, numericInput("investigate_time_min", "Time start (min)", 0, min = 0, step = 0.001)),
+              column(6, numericInput("investigate_time_max", "Time end (min)", 40, min = 0, step = 0.001))),
             checkboxInput("investigate_auto_z", "Automatic intensity range", TRUE),
             conditionalPanel("!input.investigate_auto_z",
               fluidRow(
                 column(6, numericInput("investigate_z_min", "Intensity min", 0)),
                 column(6, numericInput("investigate_z_max", "Intensity max", 1000)))),
             fluidRow(
-              column(6, numericInput("investigate_mz_group", "m/z grouping factor", value = 1, min = 1, max = 1e9, step = 1)),
-              column(6, numericInput("investigate_time_group", "Time grouping factor", value = 1, min = 1, max = 1e9, step = 1))),
-            helpText("1 keeps each position; 10 averages every 10 adjacent readings. Load initializes factors for about 50 × 40 display positions."),
+              column(6, numericInput("investigate_mz_group", "m/z grouping factor", value = 40, min = 1, max = 1e9, step = 1)),
+              column(6, numericInput("investigate_time_group", "Time grouping factor", value = 20, min = 1, max = 1e9, step = 1))),
+            textOutput("investigate_group_widths"),
             conditionalPanel("output.investigate_needs_alignment",
               numericInput("investigate_alignment_width", "Shared m/z alignment width (Da)", value = 0.01, min = 0, step = 0.001),
               helpText("Scans have different m/z coordinates. Align each scan by its mean intensity per cell, then group. Missing cells contribute zero. This width is separate from measured raw spacing.")),
@@ -431,8 +452,8 @@ ui <- dashboardPage(
             selectInput("investigate_aggregation", "Intensity within the m/z window",
               choices = c("Mean (matches current extraction)" = "mean", "Sum" = "sum", "Maximum" = "max")),
             fluidRow(
-              column(6, numericInput("investigate_slice_time_min", "Time start (min)", 0, min = 0)),
-              column(6, numericInput("investigate_slice_time_max", "Time end (min)", 40, min = 0)))),
+              column(6, numericInput("investigate_slice_time_min", "Time start (min)", 0, min = 0, step = 0.001)),
+              column(6, numericInput("investigate_slice_time_max", "Time end (min)", 40, min = 0, step = 0.001)))),
             conditionalPanel("input.investigate_slice_axis === 'time'",
               numericInput("investigate_time_center", "Slice time (min)", 20, min = 0, step = 0.01),
               numericInput("investigate_time_window", "Time window (± seconds)", 5, min = 0, step = 1),
@@ -447,8 +468,8 @@ ui <- dashboardPage(
                 helpText("Shows up to this many closest scans inside the time window at their original m/z resolution. Expand the window if fewer are available. Legend order is nearest to farthest; click an entry to hide/show it.")),
               helpText("A 3D click selects a preview-bin time. Actual scan times and the number of spectra used are shown below."),
               fluidRow(
-                column(6, numericInput("investigate_spectrum_mz_min", "Spectrum m/z min", 50, min = 0)),
-                column(6, numericInput("investigate_spectrum_mz_max", "Spectrum m/z max", 1000, min = 0)))),
+                column(6, numericInput("investigate_spectrum_mz_min", "Spectrum m/z min", 50, min = 0, step = 0.001)),
+                column(6, numericInput("investigate_spectrum_mz_max", "Spectrum m/z max", 1000, min = 0, step = 0.001)))),
             checkboxInput("investigate_auto_y", "Automatic trace intensity range", TRUE),
             conditionalPanel("!input.investigate_auto_y",
               fluidRow(
@@ -467,7 +488,11 @@ ui <- dashboardPage(
             plotlyOutput("investigate_slice", height = "350px"),
             helpText("Cross-sections use the original scans. Choose an m/z window for intensity versus time, or choose a time for an MS1 mass spectrum. Click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range."),
             h4("Median m/z spectrum"),
-            helpText("Uses all MS1 scans inside the current 3D time range and m/z limits above. Uses native m/z positions when shared, otherwise the adjustable alignment grid. Missing signal counts as zero; 3D grouping factors do not affect the median."),
+            fluidRow(
+              column(4, numericInput("investigate_median_time_min", "Median time start (min)", 0, min = 0, step = 0.001)),
+              column(4, numericInput("investigate_median_time_max", "Median time end (min)", 40, min = 0, step = 0.001)),
+              column(4, numericInput("investigate_median_step", "Keep every Nth scan", 10, min = 1, max = 1e9, step = 1))),
+            helpText("Time defaults follow the 3D range until you edit either median time field. A factor of 10 keeps the first scan, then every 10th scan within this window; skipped scans are not read. Uses the 3D m/z limits and alignment width. Missing signals in retained scans count as zero."),
             actionButton("investigate_draw_median", "Calculate median spectrum"),
             actionButton("investigate_reset_median", "Reset median view"),
             textOutput("investigate_median_status"),

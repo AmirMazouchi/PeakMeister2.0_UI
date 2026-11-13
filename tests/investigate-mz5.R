@@ -51,6 +51,12 @@ local({
     med <- tasks$investigate_median_spectrum(raw, raw$mz_range, raw$time_range, cache_bytes = budget)
     same(med$data$intensity, apply(full, 2, median))
   }
+  for (step in c(2, 10)) {
+    med <- tasks$investigate_median_spectrum(raw, raw$mz_range, raw$time_range, scan_step = step)
+    retained <- seq.int(1L, nrow(full), by = step)
+    same(med$data$intensity, apply(full[retained, , drop = FALSE], 2, median))
+    same(med$selected_scans, raw$scans[retained])
+  }
   time_center <- raw$times[nonempty[1]]
   time_window <- max(abs(raw$times - time_center)) * 60 + 1
   combined <- tasks$investigate_extract_time_slice(raw, time_center, raw$mz_range,

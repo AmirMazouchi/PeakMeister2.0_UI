@@ -1,7 +1,10 @@
 # MetaboMeister adds a read-only Investigate tab in section Matabo3.6.
 # Investigate measures native MS1 spacing/counts once, groups adjacent readings
 # by mean intensity, and computes an exact time-range median spectrum using
-# sparse values and bounded temporary partitions when needed. Shared native
+# sparse values and bounded temporary partitions when needed. Median time
+# controls are independent, with a scan stride that skips spectra before reading.
+# Display bounds use three decimals; grouping defaults to 40 m/z and 20 time
+# readings and reports their typical widths in Da/seconds. Shared native
 # mass coordinates are retained; differing axes use an adjustable alignment grid.
 # The light 3D palette and combined/overlaid time-window spectra are retained.
 # Investigate explicitly uses Shiny's progress functions so packages loaded
@@ -1182,6 +1185,7 @@ server <- function(input, output, session){
   investigate_grid <- reactiveVal(NULL)
   investigate_trace <- reactiveVal(NULL)
   investigate_median <- reactiveVal(NULL)
+  investigate_median_time_custom <- reactiveVal(FALSE)
 
   ######Matabo3.6.1 Raw-file metadata, validation and bounded scan reading######
   investigate_range <- function(values, label, nonnegative = TRUE) {
@@ -1382,18 +1386,27 @@ server <- function(input, output, session){
   }
 
   investigate_median_spectrum <- function(raw, mz_range, time_range, alignment_width = NULL,
-                                          progress = function(fraction) NULL, cache_bytes = 32 * 1024^2) {
+                                          progress = function(fraction) NULL, cache_bytes = 32 * 1024^2,
+                                          scan_step = 1L) {
     time_range <- investigate_range(time_range, "Median time range")
-    selected <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
-    if (!length(selected)) stop("No MS1 scans fall inside the selected time range.")
+    if (!is.numeric(scan_step) || length(scan_step) != 1L || !is.finite(scan_step) ||
+        scan_step < 1 || scan_step > 1e9 || scan_step != floor(scan_step)) {
+      stop("Enter a positive whole median scan factor (1–1,000,000,000).")
+    }
+    eligible <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
+    if (!length(eligible)) stop("No MS1 scans fall inside the selected time range.")
+    selected <- eligible[seq.int(1L, length(eligible), by = scan_step)]
+    # Subset metadata BEFORE both streaming passes, so skipped spectra are never
+    # read, aligned or added as implicit zeros to the sampled median.
+    view <- raw; view$scans <- raw$scans[selected]; view$times <- raw$times[selected]
     axis <- investigate_mass_axis(raw, mz_range, alignment_width)
     n <- length(selected); mass_count <- length(axis$mz)
     positive <- negative <- numeric(mass_count); values <- numeric(mass_count)
-    cache <- vector("list", length(raw$scans)); cached <- TRUE; entries <- 0; points <- 0
+    cache <- vector("list", length(view$scans)); cached <- TRUE; entries <- 0
     # Budget includes vector/list/grouping overhead, not only the 12-byte pair.
     capacity <- max(1, floor(cache_bytes/64))
-    investigate_walk_scans(raw, time_range, function(scan, index) {
-      aligned <- investigate_align_scan(scan, axis); points <<- points + aligned$points
+    investigate_walk_scans(view, time_range, function(scan, index) {
+      aligned <- investigate_align_scan(scan, axis)
       keep <- aligned$values != 0; columns <- aligned$columns[keep]; intensity <- aligned$values[keep]
       pos <- columns[intensity > 0]; neg <- columns[intensity < 0]
       positive[pos] <<- positive[pos] + 1; negative[neg] <<- negative[neg] + 1
@@ -1401,12 +1414,12 @@ server <- function(input, output, session){
       if (cached && entries > capacity) { cache <<- NULL; cached <<- FALSE }
       if (cached) cache[[index]] <<- list(columns = columns, values = intensity)
     }, function(fraction) progress(fraction * 0.6))
-    if (!points) stop("No m/z measurements fall inside the selected median ranges.")
     candidates <- which(positive > floor((n - 1)/2) | negative > floor((n - 1)/2))
     finish <- function(method) {
       progress(1)
       list(data = data.frame(mz = axis$mz, intensity = values), mz_range = axis$mz_range,
-        time_range = time_range, scans = n, native = axis$native,
+        time_range = time_range, scans = n, available_scans = length(eligible),
+        scan_step = scan_step, selected_scans = view$scans, selected_times = view$times, native = axis$native,
         alignment_width = axis$width, method = method)
     }
     # A signal seen in fewer than half the scans has an exact zero median.
@@ -1453,7 +1466,7 @@ server <- function(input, output, session){
       recent <<- c(recent[recent != id], id)
       connections[[name]]
     }
-    investigate_walk_scans(raw, time_range, function(scan, index) {
+    investigate_walk_scans(view, time_range, function(scan, index) {
       aligned <- investigate_align_scan(scan, axis)
       keep <- aligned$values != 0 & file_for_mass[aligned$columns] > 0L
       columns <- aligned$columns[keep]; intensity <- aligned$values[keep]
@@ -1664,6 +1677,11 @@ server <- function(input, output, session){
       plotly::config(scrollZoom = TRUE, displaylogo = FALSE)
   }
 
+  investigate_display_range <- function(limits) {
+    # Round outward to three decimals so no endpoint scan/mass is lost.
+    c(floor(limits[1] * 1000)/1000, ceiling(limits[2] * 1000)/1000)
+  }
+
   ######Matabo3.6.3 File selection, range controls and guarded GUI actions######
   observe_updates({
     files <- uploadedmz5()
@@ -1677,14 +1695,14 @@ server <- function(input, output, session){
 
   observe_action(input$investigate_clear, {
     investigate_close_raw(investigate_raw())
-    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL)
+    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_time_custom(FALSE)
   })
   session$onSessionEnded(function() investigate_close_raw(isolate(investigate_raw())))
 
   observe_action(input$investigate_load, {
     with_action_error({
       investigate_close_raw(investigate_raw())
-      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL)
+      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_time_custom(FALSE)
       if (identical(input$investigate_source, "upload")) {
         file <- input$investigate_raw_file
         if (is.null(file) || !nrow(file)) stop("Select the original .mz5 file in Investigate first.")
@@ -1699,21 +1717,37 @@ server <- function(input, output, session){
         investigate_open_raw(path, name, progress = function(fraction) shiny::setProgress(value = fraction))
       })
       investigate_raw(raw)
-      defaults <- list(investigate_mz_min = raw$mz_range[1], investigate_mz_max = raw$mz_range[2],
-        investigate_time_min = raw$time_range[1], investigate_time_max = raw$time_range[2],
-        investigate_slice_time_min = raw$time_range[1], investigate_slice_time_max = raw$time_range[2],
+      mz_bounds <- investigate_display_range(raw$mz_range)
+      time_bounds <- investigate_display_range(raw$time_range)
+      defaults <- list(investigate_mz_min = mz_bounds[1], investigate_mz_max = mz_bounds[2],
+        investigate_time_min = time_bounds[1], investigate_time_max = time_bounds[2],
+        investigate_median_time_min = time_bounds[1], investigate_median_time_max = time_bounds[2],
+        investigate_slice_time_min = time_bounds[1], investigate_slice_time_max = time_bounds[2],
         investigate_time_center = raw$times[ceiling(length(raw$times)/2)],
-        investigate_spectrum_mz_min = raw$mz_range[1], investigate_spectrum_mz_max = raw$mz_range[2])
-      mass_count <- if (raw$sampling$shared) length(raw$sampling$mz_axis) else
-        ceiling(diff(raw$mz_range)/raw$alignment_width)
-      defaults$investigate_mz_group <- max(1, ceiling(mass_count/50))
-      defaults$investigate_time_group <- max(1, ceiling(length(raw$scans)/40))
+        investigate_spectrum_mz_min = mz_bounds[1], investigate_spectrum_mz_max = mz_bounds[2])
+      defaults$investigate_mz_group <- 40
+      defaults$investigate_time_group <- 20
       defaults$investigate_alignment_width <- raw$alignment_width
       targets <- suppressWarnings(as.numeric(c(refMassListData()$mz, massData()$mz)))
       targets <- targets[is.finite(targets) & targets >= raw$mz_range[1] & targets <= raw$mz_range[2]]
       defaults$investigate_center <- if (length(targets)) targets[1] else mean(raw$mz_range)
       for (id in names(defaults)) updateNumericInput(session, id, value = defaults[[id]])
     }, "Investigate: load raw file")
+  })
+
+  # Only explicit typing/pasting in a median time field detaches its defaults.
+  # NumericInput update messages arrive asynchronously and must not count as edits.
+  observe_action(input$investigate_median_time_edited, {
+    investigate_median_time_custom(TRUE)
+  })
+  observe_updates({
+    req(investigate_raw())
+    limits <- c(input$investigate_time_min, input$investigate_time_max)
+    if (!is.numeric(limits) || length(limits) != 2L || any(!is.finite(limits))) return()
+    if (!isolate(investigate_median_time_custom())) {
+      updateNumericInput(session, "investigate_median_time_min", value = limits[1])
+      updateNumericInput(session, "investigate_median_time_max", value = limits[2])
+    }
   })
 
   observe_action(input$investigate_draw_3d, {
@@ -1783,14 +1817,14 @@ server <- function(input, output, session){
       raw <- investigate_raw()
       if (is.null(raw)) stop("Load a raw .mz5 file first.")
       mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "Median m/z range")
-      time_range <- investigate_range(c(input$investigate_time_min, input$investigate_time_max), "Median time range")
+      time_range <- investigate_range(c(input$investigate_median_time_min, input$investigate_median_time_max), "Median time range")
       width <- if (raw$sampling$shared) NULL else input$investigate_alignment_width
-      key <- c(raw$name, mz_range, time_range, width)
+      key <- c(raw$name, mz_range, time_range, width, input$investigate_median_step)
       previous <- investigate_median()
       spectrum <- if (!is.null(previous) && identical(previous$key, key)) previous else {
         investigate_median(NULL)
         shiny::withProgress(message = "Exact median across selected MS1 scans", value = 0, {
-          investigate_median_spectrum(raw, mz_range, time_range, width,
+          investigate_median_spectrum(raw, mz_range, time_range, width, scan_step = input$investigate_median_step,
             progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
@@ -1848,15 +1882,14 @@ server <- function(input, output, session){
     sampling <- raw$sampling
     mass_count <- if (sampling$shared) paste0(length(sampling$mz_axis), " shared native m/z positions") else
       paste0("m/z positions vary: ", paste(sampling$mz_count_range, collapse = "–"),
-        " per spectrum (including empty scans); no single shared native m/z axis")
+        " per spectrum; no single shared native m/z axis")
     paste0("Loaded: ", raw$name, " | ", sampling$time_count, " MS1 time slices (",
       sampling$time_unique, " distinct times)\n",
-      "m/z: ", paste(signif(raw$mz_range, 8), collapse = " to "), " | Time: ",
-      paste(signif(range(raw$times), 8), collapse = " to "), " min\n",
-      mass_count, "\nMinimum positive native Δm/z within a spectrum: ",
-      investigate_number(sampling$mz_delta), " Da; minimum positive Δt: ",
-      investigate_number(sampling$time_delta), " min (", investigate_number(sampling$time_delta * 60), " s).\n",
-      "Measured across all valid MS1 readings; sampling spacing, not instrument resolving power.")
+      "m/z: ", paste(round(raw$mz_range, 3), collapse = " to "), " | Time: ",
+      paste(round(range(raw$times), 3), collapse = " to "), " min\n",
+      mass_count, "\nMinimum native Δm/z within a spectrum: ",
+      investigate_number(sampling$mz_delta), " Da; minimum Δt: ",
+      investigate_number(sampling$time_delta), " min (", investigate_number(sampling$time_delta * 60), " s).")
   })
   output$investigate_grid_status <- renderText({
     grid <- investigate_grid()
@@ -1867,9 +1900,27 @@ server <- function(input, output, session){
       " grouped positions. Factors: m/z ", grid$factors[1], ", time ", grid$factors[2],
       ". Mean intensity; missing positions contribute zero. Raw, uncalibrated data.")
   })
+  output$investigate_group_widths <- renderText({
+    raw <- investigate_raw()
+    if (is.null(raw)) return("")
+    tryCatch({
+      factors <- investigate_group_factors(input$investigate_mz_group, input$investigate_time_group)
+      axis <- investigate_mass_axis(raw, c(input$investigate_mz_min, input$investigate_mz_max),
+        input$investigate_alignment_width)
+      mz_step <- if (axis$native && length(axis$mz) > 1L) median(diff(axis$mz)) else axis$width
+      times <- raw$times[raw$times >= input$investigate_time_min & raw$times <= input$investigate_time_max]
+      intervals <- diff(sort(unique(times))) * 60
+      time_step <- if (length(intervals)) median(intervals) else NA_real_
+      paste0("Per full group: m/z ", if (length(mz_step) && is.finite(mz_step))
+        paste0(if (axis$native) "≈ " else "", investigate_number(factors[1] * mz_step), " Da") else "width unavailable",
+        "; time ", if (is.finite(time_step)) paste0("≈ ", investigate_number(factors[2] * time_step), " s") else "width unavailable",
+        ". Time uses the typical scan interval", if (axis$native) "; m/z uses the typical native spacing" else "",
+        ". Last groups may be smaller.")
+    }, error = function(e) conditionMessage(e))
+  })
   output$investigate_group_status <- renderText({
     raw <- investigate_raw()
-    if (is.null(raw)) return("Grouping factors are initialized on Load for a preview of about 50 × 40 positions.")
+    if (is.null(raw)) return("Load a raw file to see the grouping widths in Da and seconds.")
     tryCatch({
       plan <- investigate_group_plan(raw, c(input$investigate_mz_min, input$investigate_mz_max),
         c(input$investigate_time_min, input$investigate_time_max), input$investigate_mz_group,
@@ -1882,17 +1933,18 @@ server <- function(input, output, session){
   })
   output$investigate_median_status <- renderText({
     spectrum <- investigate_median()
-    if (is.null(spectrum)) return("No median spectrum calculated yet. Uses the current 3D m/z and time range controls.")
+    if (is.null(spectrum)) return("No median spectrum calculated yet. Choose its time range and scan factor, then calculate.")
     raw <- investigate_raw()
     current <- c(raw$name, input$investigate_mz_min, input$investigate_mz_max,
-      input$investigate_time_min, input$investigate_time_max,
-      if (!spectrum$native) input$investigate_alignment_width)
-    paste0("Median of ", spectrum$scans, " MS1 scans in ", paste(signif(spectrum$time_range, 8), collapse = "–"),
+      input$investigate_median_time_min, input$investigate_median_time_max,
+      if (!spectrum$native) input$investigate_alignment_width, input$investigate_median_step)
+    paste0("Median of ", spectrum$scans, " / ", spectrum$available_scans, " MS1 scans (factor ", spectrum$scan_step,
+      ") in ", paste(round(spectrum$time_range, 3), collapse = "–"),
       " min; ", nrow(spectrum$data), if (spectrum$native) " native m/z positions." else
         paste0(" aligned positions (", investigate_number(spectrum$alignment_width), " Da)."),
       " Missing signal contributes zero; independent of 3D grouping. ",
       if (all(spectrum$data$intensity == 0)) "All medians are zero: no mass position has a nonzero central intensity. " else "",
-      if (!identical(current, spectrum$key)) "Ranges have changed; click Calculate median spectrum to update.")
+      if (!identical(current, spectrum$key)) "Ranges or scan factor have changed; click Calculate median spectrum to update.")
   })
   output$investigate_slice_status <- renderText({
     trace <- investigate_trace()

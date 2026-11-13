@@ -68,8 +68,12 @@ the alignment control is hidden and its value has no effect in that case.
 - Drag to rotate. The Plotly toolbar provides pan, zoom, camera reset and PNG
   export; scroll zoom is enabled. **Reset 3D view** restores the camera and the
   last applied axis ranges without rereading the file.
-- Set independent m/z, time and intensity display ranges. Intensity defaults
-  to an automatic range; turn that off to supply explicit limits.
+- Set independent m/z, time and intensity display ranges. m/z/time range
+  controls show at most three decimal places; initial bounds round outward to
+  retain the original endpoint measurements. Edited bounds round to three
+  decimals when leaving the field. Exact centre m/z and window tolerances retain
+  their precision. Intensity defaults to an automatic range; turn that off to
+  supply explicit limits.
 - Optional log-intensity display makes small signals easier to see alongside
   large signals. Negative intensities are shown at zero height in log view;
   linear view retains their values.
@@ -78,10 +82,15 @@ the alignment control is hidden and its value has no effect in that case.
   Time groups follow scan acquisition order rather than equal-duration bins.
   For varying m/z coordinates, mass grouping follows the aligned positions.
   The last group uses its actual size if it contains fewer than the factor.
-- Loading initializes factors to give roughly **50 × 40 display positions**
-  (or fewer for a small file), rather than fixed factors that could create a
-  huge plot. Both factors remain editable. The live summary shows source and
-  resulting position counts, while the drawn plot reports its applied factors.
+- Grouping defaults to **40 m/z readings** and **20 time scans**, including
+  after loading another file. Both remain editable. A live label reports the
+  equivalent Da and seconds per full group. Aligned mass cells use
+  `factor × alignment width`; native masses and time scans use
+  `factor × typical (median) adjacent spacing`. These are approximate for
+  irregular sampling; the last group may be smaller. For example, a 1-second
+  scan interval with time factor 20 corresponds to about 20 seconds per group.
+  The live summary shows source and resulting counts; the plot reports its
+  applied factors.
   A preview is limited to 1,000,000 cells; increase factors or narrow ranges
   for larger requests. A single resulting row/column uses 3D lines/markers
   because a surface requires at least two positions on each axis.
@@ -151,17 +160,32 @@ increase its bin width for a larger request.
 ## Median m/z spectrum
 
 Click **Calculate median spectrum** for a separate m/z-versus-intensity graph.
-It uses every MS1 scan inside the **current 3D time range controls**, including
-both endpoints, and the current 3D m/z limits. At each shared native m/z position
-(or aligned position if axes differ), there is one intensity per scan; missing
-signals and empty scans contribute zero. Multiple readings at the same
-position are averaged within that scan before taking the median across scans.
-No 3D grouping is applied to this graph, and changing only grouping factors
-does not invalidate its cache. A range/alignment change displays a reminder to
-recalculate; the status always identifies the plotted time range and scan count.
+Its own **Median time start/end** controls initially match the 3D time range and
+follow changes to it until either median time field is edited. A customized
+median time window stays independent when the 3D window changes. Loading a new
+file initializes both time ranges again. The current 3D m/z limits and shared
+alignment-width control still apply.
 
-The median is exact, including the mean of the two middle intensities for an
-even number of scans. Short-lived peaks can have **zero median** when absent
+**Keep every Nth scan** defaults to **10**. Within the inclusive median time
+window, retain the first MS1 scan, then every Nth scan after it: factor 10 uses
+positions 1, 11, 21, … within that window. Factor 1 uses every scan; a window with
+fewer than N scans still retains its first scan. Skipped scans are never read or
+aligned, even in the temporary-disk path, and do not contribute implicit zeros.
+The status reports retained/available scan counts and the applied factor.
+Subsampling reduces work and changes the sample used for the median; brief
+signals can be missed. Use factor 1 when all scans should contribute.
+
+At each shared native m/z position (or aligned position if axes differ), there
+is one intensity per **retained** scan. Missing signals and empty retained scans
+contribute zero. Multiple readings at the same position are averaged within
+that scan before taking the median across retained scans. No 3D grouping is
+applied. Changing only grouping factors, or changing the 3D time window after
+customizing the median window, reuses the cached median. Changes to median
+bounds, scan factor, m/z limits or alignment width display a reminder to
+recalculate and invalidate the cache key.
+
+The median is exact for the retained scans, including the mean of the two
+middle intensities for an even number of retained scans. Short-lived peaks can have **zero median** when absent
 from most scans; the status explains an all-zero result. This is expected for
 many transient signals and does not mean the original data have disappeared.
 Use the time-window combine/overlay views to inspect signals in shorter windows.
@@ -171,7 +195,7 @@ The implementation avoids allocating a dense scans-by-m/z matrix. It counts
 positive/negative observations with implicit zeros first, skipping value sorting
 where those counts already prove a zero median. Nonzero values are cached for
 small requests, and only the central ranks are selected rather than fully
-sorting every position. For larger requests it reads the selected scans once
+sorting every position. For larger requests it reads the retained scans once
 more and partitions only candidate nonzero values into temporary binary files.
 Partitions are processed individually with a limited number of open files;
 they are deleted on success or error. No new package or compiled extension is
@@ -200,7 +224,9 @@ Visualization. The original analysis functions are unchanged.
 
 `tests/investigate.R` checks native sampling, fixed/varying mass axes, adjacent
 grouped means, independently calculated exact medians (odd/even, signed, sparse,
-RAM and disk paths), MS1/ppm/Da boundaries, batch/grid limits, plots, caches,
+RAM and disk paths), independent median windows and scan strides (including
+checks that skipped scans are never read), compact ranges/physical grouping
+widths, MS1/ppm/Da boundaries, batch/grid limits, plots, caches,
 error recovery, temporary-file/handle cleanup and the actual GUI controls.
 Existing action-guard, startup and scientific equivalence checks also cover
 this branch.

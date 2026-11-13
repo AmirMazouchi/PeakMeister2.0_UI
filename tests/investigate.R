@@ -32,11 +32,12 @@ fixture_scans <- lapply(seq_len(nrow(fixture_header)), function(i) {
 fixture_scans[[4]] <- cbind(mz = c(99.9, 101), intensity = c(1, 20))
 fixture_scans[[5]] <- cbind(mz = c(100, 100.0008), intensity = c(NA, Inf))
 signals <- new.env(); signals$opens <- 0L; signals$closes <- 0L
-signals$batches <- integer(); signals$errors <- list(); signals$input_updates <- list()
+signals$read_scans <- integer(); signals$batches <- integer(); signals$errors <- list(); signals$input_updates <- list()
 fixture_opener <- function(path) { signals$opens <- signals$opens + 1L; new.env() }
 fixture_closer <- function(handle) { signals$closes <- signals$closes + 1L; invisible(NULL) }
 fixture_reader <- function(handle, scans) {
   signals$batches <- c(signals$batches, length(scans))
+  signals$read_scans <- c(signals$read_scans, scans)
   result <- fixture_scans[scans]
   if (length(scans) == 1L) result[[1]] else result
 }
@@ -126,6 +127,32 @@ median_crop <- tasks$investigate_median_spectrum(raw, c(99.9, 101), c(1, 2), wid
 same(median_crop$data$intensity, apply(matrix_oracle[2:3, , drop = FALSE], 2, median))
 stopifnot(median_crop$scans == 2L)
 
+# Subsampling is applied within the median's own time window BEFORE I/O.
+for (budget in c(64, 1e6)) {
+  read_before <- length(signals$read_scans)
+  sampled <- tasks$investigate_median_spectrum(raw, c(99.9, 101), c(1, 9), width,
+    cache_bytes = budget, scan_step = 3)
+  kept_rows <- c(2L, 5L, 8L)
+  same(sampled$data$intensity, apply(matrix_oracle[kept_rows, , drop = FALSE], 2, median))
+  same(sampled$selected_scans, raw$scans[kept_rows])
+  same(sampled$selected_times, c(1, 4, 7))
+  stopifnot(sampled$scans == 3, sampled$available_scans == 9, sampled$scan_step == 3)
+  read_scans <- signals$read_scans[seq.int(read_before + 1L, length(signals$read_scans))]
+  stopifnot(all(read_scans %in% sampled$selected_scans),
+    all(sampled$selected_scans %in% read_scans))
+}
+small_sample <- tasks$investigate_median_spectrum(raw, c(99.9, 101), c(0, 1), width, scan_step = 10)
+same(small_sample$data$intensity, as.numeric(matrix_oracle[1, ]))
+stopifnot(small_sample$scans == 1, small_sample$available_scans == 2)
+for (value in list(0, -1, 1.5, NA_real_, Inf)) {
+  stopifnot(grepl("median scan factor", error_text(tasks$investigate_median_spectrum(raw,
+    c(99.9, 101), c(0, 10), width, scan_step = value))))
+}
+# Bounds display at most three decimals and retain the original endpoints.
+bounds <- tasks$investigate_display_range(c(0.055433333, 49.99313333))
+same(bounds, c(0.055, 49.994))
+stopifnot(bounds[1] <= 0.055433333, bounds[2] >= 49.99313333)
+
 # Shared native coordinates need no alignment, including nonuniform axes,
 # missing whole scans, duplicate raw points, negative values and short groups.
 native_scans <- list(cbind(c(100, 100.1, 101, 103, 103), c(-4, 2, 6, 8, 12)),
@@ -146,6 +173,10 @@ for (budget in c(64, 1e6)) {
   med <- tasks$investigate_median_spectrum(native, c(99, 104), c(0, 5), cache_bytes = budget)
   same(med$data$intensity, apply(native_matrix, 2, median)); stopifnot(med$native)
 }
+# A retained empty scan contributes zeros, even if all other scans are skipped.
+empty_sample <- tasks$investigate_median_spectrum(native, c(99, 104), c(0.5, 5), scan_step = 10)
+stopifnot(empty_sample$scans == 1L, empty_sample$available_scans == 3L,
+  all(empty_sample$data$intensity == 0))
 # More than sixteen spill partitions exercises connection eviction/reopening.
 wide <- native; wide$scans <- 1:40; wide$times <- 0:39; wide$time_range <- c(0, 39)
 wide$read_peaks <- function(handle, scans) {
@@ -258,6 +289,7 @@ testServer(investigate_harness, {
   session$setInputs(investigate_source = "engine", investigate_engine_file = fixture_path,
     investigate_mz_min = 99.9, investigate_mz_max = 101,
     investigate_time_min = 0, investigate_time_max = 10,
+    investigate_median_time_min = 0, investigate_median_time_max = 10, investigate_median_step = 1,
     investigate_slice_time_min = 0, investigate_slice_time_max = 10,
     investigate_mz_group = 2, investigate_time_group = 3, investigate_alignment_width = 0.1,
     investigate_slice_axis = "mz",
@@ -268,6 +300,8 @@ testServer(investigate_harness, {
   stopifnot(is.null(investigate_grid()), tail(signals$errors, 1)[[1]]$action == "Investigate: draw 3D preview", !session$isClosed())
   session$setInputs(investigate_load = 1)
   stopifnot(investigate_raw()$name == "Fixture.mz5", is.null(investigate_grid()), is.null(investigate_trace()), is.null(investigate_median()))
+  same(as.numeric(signals$input_updates$investigate_mz_group$value), 40)
+  same(as.numeric(signals$input_updates$investigate_time_group$value), 20)
   session$setInputs(investigate_draw_3d = 2, investigate_draw_slice = 1)
   stopifnot(investigate_grid()$scans == 11L)
   same(investigate_trace()$data$intensity, c(3, 9, 0, 0, seq(18, 36, by = 3)))
@@ -283,8 +317,10 @@ testServer(investigate_harness, {
   same(investigate_trace()$intensity_range, c(0, 50))
   stopifnot(grepl("Mean intensity", output$investigate_grid_status),
     grepl("display positions", output$investigate_group_status),
-    grepl("Minimum positive native Δm/z", output$investigate_status),
-    grepl("minimum positive Δt", output$investigate_status))
+    grepl("Minimum native Δm/z", output$investigate_status),
+    grepl("minimum Δt", output$investigate_status))
+  stopifnot(!grepl("including empty scans|positive|Measured across", output$investigate_status),
+    grepl("Da; time ≈ 180 s", output$investigate_group_widths))
   session$setInputs(investigate_draw_median = 1)
   same(investigate_median()$data$intensity, median_ram$data$intensity)
   median_json <- jsonlite::fromJSON(output$investigate_median_plot, simplifyVector = FALSE)
@@ -293,10 +329,25 @@ testServer(investigate_harness, {
   session$setInputs(investigate_mz_group = 3, investigate_draw_median = 2)
   stopifnot(length(signals$batches) == reads)
   session$setInputs(investigate_time_max = 2)
-  stopifnot(grepl("Ranges have changed", output$investigate_median_status))
-  session$setInputs(investigate_draw_median = 3)
+  same(as.numeric(signals$input_updates$investigate_median_time_max$value), 2)
+  # Simulate receipt of the default update, then customize the median window.
+  session$setInputs(investigate_median_time_max = 2, investigate_draw_median = 3)
   stopifnot(investigate_median()$scans == 3L)
-  session$setInputs(investigate_time_max = 10)
+  session$setInputs(investigate_median_time_edited = 1, investigate_median_time_min = 1, investigate_median_time_max = 9,
+    investigate_median_step = 3)
+  stopifnot(grepl("Ranges or scan factor have changed", output$investigate_median_status))
+  session$setInputs(investigate_draw_median = 4)
+  same(investigate_median()$selected_times, c(1, 4, 7))
+  default_update <- signals$input_updates$investigate_median_time_max$value
+  reads <- length(signals$batches)
+  session$setInputs(investigate_time_max = 10, investigate_draw_median = 5)
+  # Changing 3D time cannot overwrite an independent median window or its cache.
+  same(signals$input_updates$investigate_median_time_max$value, default_update)
+  stopifnot(length(signals$batches) == reads, investigate_median()$scans == 3L)
+  session$setInputs(investigate_median_step = 0, investigate_draw_median = 6)
+  stopifnot(!session$isClosed(), grepl("median scan factor", tail(signals$errors, 1)[[1]]$message))
+  session$setInputs(investigate_median_step = 1, investigate_draw_median = 7)
+  stopifnot(investigate_median()$scans == 9L, !session$isClosed())
   session$setInputs(`plotly_click-metabomeister_investigate` = '{"x":100.25,"y":1,"z":10,"curveNumber":0}')
   same(as.numeric(signals$input_updates$investigate_center$value), 100.25)
   session$setInputs(investigate_slice_axis = "time", investigate_time_mode = "combine",
@@ -327,7 +378,7 @@ testServer(investigate_harness, {
 })
 stopifnot(signals$opens == signals$closes)
 same(unname(tools::md5sum(fixture_path)), hash_before)
-cat("PASS: exact m/z traces; native sampling; adjacent grouped means; exact selected-time medians including sparse-zero and disk-spill paths; light palette; combined time-window means and original spectra overlays in nearest-first colour order; bounded batches/grid; actual guarded GUI actions, masked progress functions, cached intensity updates, axis-aware clicks, recovery and handle cleanup.\n")
+cat("PASS: exact m/z traces; native sampling; adjacent grouped means; independent-window/subsampled medians with skipped-scan I/O checks, sparse-zero and disk-spill paths; three-decimal bounds and default grouping/physical widths; light palette; combined time-window means and original spectra overlays in nearest-first colour order; bounded batches/grid; actual guarded GUI actions, masked progress functions, cached intensity updates, axis-aware clicks, recovery and handle cleanup.\n")
 
 # New UI IDs are unique, and the menu places Investigate between Engine and Visualization.
 suppressPackageStartupMessages({ library(shinydashboard); library(DT); library(shinyjs); library(waiter) })
@@ -345,7 +396,7 @@ walk_tags <- function(x) {
 all_ids <- vapply(Filter(function(tag) !is.null(tag$attribs$id), walk_tags(actual_ui)), function(tag) tag$attribs$id, character(1))
 investigate_ids <- all_ids[startsWith(all_ids, "investigate_")]
 stopifnot(length(investigate_ids) >= 30L, !anyDuplicated(investigate_ids))
-for (pair in list(c("investigate_mz_group", "1"), c("investigate_time_group", "1"))) {
+for (pair in list(c("investigate_mz_group", "40"), c("investigate_time_group", "20"), c("investigate_median_step", "10"))) {
   control <- Filter(function(tag) identical(tag$attribs$id, pair[1]), walk_tags(actual_ui))[[1]]
   stopifnot(as.character(control$attribs$value) == pair[2], control$name == "input")
 }
