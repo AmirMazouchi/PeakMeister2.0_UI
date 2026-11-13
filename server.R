@@ -6,6 +6,9 @@
 # Display bounds use three decimals; grouping defaults to 40 m/z and 20 time
 # readings and reports their typical widths in Da/seconds. Shared native
 # mass coordinates are retained; differing axes use an adjustable alignment grid.
+# Independent 3D/median alignment widths default to 0.01 Da (four decimals).
+# Median alignment linearly fills internal empty bins between nonzero
+# neighbours before computing statistics; recorded zeros/outer gaps are retained.
 # The median uses a bounded SVG display with peak-preserving extrema and
 # cached full-detail zoom, avoiding WebGL dependence in RStudio's viewer.
 # The light 3D palette and combined/overlaid time-window spectra are retained.
@@ -1287,11 +1290,42 @@ server <- function(input, output, session){
     raw$mz_range <- observed
     if (diff(raw$mz_range) == 0) raw$mz_range <- c(max(0, observed[1] - 0.01), observed[2] + 0.01)
     raw$range_source <- "all valid MS1 measurements"
-    # Limit the default alignment axis to about 200,000 positions; this is an
-    # adjustable analysis grid, never reported as measured sampling spacing.
-    raw$alignment_width <- max(if (is.finite(minimum)) minimum else 0,
-      diff(raw$mz_range)/200000)
+    raw$alignment_width <- 0.01
     raw
+  }
+
+  investigate_alignment_value <- function(value) {
+    if (!is.numeric(value) || length(value) != 1L || !is.finite(value) || value <= 0) {
+      stop("Enter a positive alignment width in Da.")
+    }
+    value <- round(value, 4L)
+    if (value < 0.0001) stop("Alignment width must be at least 0.0001 Da.")
+    value
+  }
+
+  # Matabo3.6.2 Fill only unoccupied mass bins bracketed by nonzero neighbours.
+  # Use physical m/z distances, including a shortened final alignment cell.
+  # Recorded zeros, unbounded edge gaps and empty spectra remain unchanged.
+  investigate_interpolate_empty <- function(aligned, axis) {
+    columns <- aligned$columns; intensity <- aligned$values
+    if (length(columns) < 2L || length(columns) == length(axis$mz)) return(aligned)
+    if (is.unsorted(columns)) {
+      ordering <- order(columns)
+      columns <- columns[ordering]; intensity <- intensity[ordering]
+    }
+    missing <- diff(columns) - 1L
+    gaps <- which(missing > 0L & head(intensity, -1L) != 0 & tail(intensity, -1L) != 0)
+    if (!length(gaps)) return(aligned)
+    counts <- missing[gaps]
+    offsets <- seq_len(sum(counts)) - rep(c(0, head(cumsum(counts), -1L)), counts)
+    extra_columns <- as.integer(rep(columns[gaps], counts) + offsets)
+    extra_values <- stats::approx(x = axis$mz[columns], y = intensity,
+      xout = axis$mz[extra_columns], method = "linear", ties = "ordered", rule = 1)$y
+    all_columns <- c(columns, extra_columns)
+    ordering <- order(all_columns, method = "radix")
+    aligned$columns <- all_columns[ordering]
+    aligned$values <- c(intensity, extra_values)[ordering]
+    aligned
   }
 
   investigate_mass_axis <- function(raw, mz_range, alignment_width = NULL) {
@@ -1302,11 +1336,11 @@ server <- function(input, output, session){
       if (!length(axis)) stop("No recorded m/z positions fall inside the selected range.")
       return(list(mz = axis, native = TRUE, mz_range = mz_range, width = NULL))
     }
-    width <- if (is.null(alignment_width)) raw$alignment_width else alignment_width
-    if (!is.numeric(width) || length(width) != 1L || !is.finite(width) || width <= 0) {
-      stop("Enter a positive alignment-grid width in Da.")
-    }
-    count <- ceiling(diff(mz_range)/width - 16 * .Machine$double.eps * max(1, diff(mz_range)/width))
+    width <- investigate_alignment_value(if (is.null(alignment_width)) raw$alignment_width else alignment_width)
+    # Account for cancellation when subtracting nearby large m/z limits, e.g.
+    # m/z 922.1 minus 921.9. Avoid a zero-width extra cell at an exact multiple.
+    tolerance <- 16 * .Machine$double.eps * max(1, abs(mz_range))/width
+    count <- max(1, ceiling(diff(mz_range)/width - tolerance))
     if (count < 1 || count > 2e6) stop("The alignment grid must have 1–2,000,000 positions. Increase its width or narrow the m/z range.")
     edges <- mz_range[1] + seq.int(0, count) * width
     edges[length(edges)] <- mz_range[2]
@@ -1409,7 +1443,7 @@ server <- function(input, output, session){
     # Budget includes vector/list/grouping overhead, not only the 12-byte pair.
     capacity <- max(1, floor(cache_bytes/64))
     investigate_walk_scans(view, time_range, function(scan, index) {
-      aligned <- investigate_align_scan(scan, axis)
+      aligned <- investigate_interpolate_empty(investigate_align_scan(scan, axis), axis)
       keep <- aligned$values != 0; columns <- aligned$columns[keep]; intensity <- aligned$values[keep]
       pos <- columns[intensity > 0]; neg <- columns[intensity < 0]
       positive[pos] <<- positive[pos] + 1; negative[neg] <<- negative[neg] + 1
@@ -1470,7 +1504,7 @@ server <- function(input, output, session){
       connections[[name]]
     }
     investigate_walk_scans(view, time_range, function(scan, index) {
-      aligned <- investigate_align_scan(scan, axis)
+      aligned <- investigate_interpolate_empty(investigate_align_scan(scan, axis), axis)
       keep <- aligned$values != 0 & file_for_mass[aligned$columns] > 0L
       columns <- aligned$columns[keep]; intensity <- aligned$values[keep]
       groups <- split(seq_along(columns), file_for_mass[columns])
@@ -1799,7 +1833,8 @@ server <- function(input, output, session){
         investigate_spectrum_mz_min = mz_bounds[1], investigate_spectrum_mz_max = mz_bounds[2])
       defaults$investigate_mz_group <- 40
       defaults$investigate_time_group <- 20
-      defaults$investigate_alignment_width <- raw$alignment_width
+      defaults$investigate_alignment_width <- 0.01
+      defaults$investigate_median_alignment_width <- 0.01
       targets <- suppressWarnings(as.numeric(c(refMassListData()$mz, massData()$mz)))
       targets <- targets[is.finite(targets) & targets >= raw$mz_range[1] & targets <= raw$mz_range[2]]
       defaults$investigate_center <- if (length(targets)) targets[1] else mean(raw$mz_range)
@@ -1831,7 +1866,7 @@ server <- function(input, output, session){
       time_range <- investigate_range(c(input$investigate_time_min, input$investigate_time_max), "3D time range")
       limits <- if (isTRUE(input$investigate_auto_z)) NULL else investigate_range(
         c(input$investigate_z_min, input$investigate_z_max), "3D intensity range", nonnegative = FALSE)
-      width <- if (raw$sampling$shared) NULL else input$investigate_alignment_width
+      width <- if (raw$sampling$shared) NULL else investigate_alignment_value(input$investigate_alignment_width)
       key <- c(raw$name, mz_range, time_range, input$investigate_mz_group, input$investigate_time_group, width)
       grid <- if (!is.null(previous) && identical(previous$key, key)) previous else {
         shiny::withProgress(message = "Building raw 3D preview", value = 0, {
@@ -1890,7 +1925,7 @@ server <- function(input, output, session){
       if (is.null(raw)) stop("Load a raw .mz5 file first.")
       mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "Median m/z range")
       time_range <- investigate_range(c(input$investigate_median_time_min, input$investigate_median_time_max), "Median time range")
-      width <- if (raw$sampling$shared) NULL else input$investigate_alignment_width
+      width <- if (raw$sampling$shared) NULL else investigate_alignment_value(input$investigate_median_alignment_width)
       key <- c(raw$name, mz_range, time_range, width, input$investigate_median_step)
       previous <- investigate_median()
       spectrum <- if (!is.null(previous) && identical(previous$key, key)) previous else {
@@ -2009,21 +2044,7 @@ server <- function(input, output, session){
       paste0("Per full group: m/z ", if (length(mz_step) && is.finite(mz_step))
         paste0(if (axis$native) "≈ " else "", investigate_number(factors[1] * mz_step), " Da") else "width unavailable",
         "; time ", if (is.finite(time_step)) paste0("≈ ", investigate_number(factors[2] * time_step), " s") else "width unavailable",
-        ". Time uses the typical scan interval", if (axis$native) "; m/z uses the typical native spacing" else "",
-        ". Last groups may be smaller.")
-    }, error = function(e) conditionMessage(e))
-  })
-  output$investigate_group_status <- renderText({
-    raw <- investigate_raw()
-    if (is.null(raw)) return("Load a raw file to see the grouping widths in Da and seconds.")
-    tryCatch({
-      plan <- investigate_group_plan(raw, c(input$investigate_mz_min, input$investigate_mz_max),
-        c(input$investigate_time_min, input$investigate_time_max), input$investigate_mz_group,
-        input$investigate_time_group, input$investigate_alignment_width)
-      paste0(length(plan$axis$mz), if (plan$axis$native) " native" else " aligned", " m/z positions × ",
-        length(plan$selected), " scans → ", plan$counts[1], " × ", plan$counts[2],
-        " display positions. Last groups can be smaller.",
-        if (!plan$axis$native) paste0(" Alignment width: ", investigate_number(plan$axis$width), " Da (not native spacing)."))
+        ".")
     }, error = function(e) conditionMessage(e))
   })
   output$investigate_median_status <- renderText({
@@ -2032,12 +2053,12 @@ server <- function(input, output, session){
     raw <- investigate_raw()
     current <- c(raw$name, input$investigate_mz_min, input$investigate_mz_max,
       input$investigate_median_time_min, input$investigate_median_time_max,
-      if (!spectrum$native) input$investigate_alignment_width, input$investigate_median_step)
+      if (!spectrum$native) tryCatch(investigate_alignment_value(input$investigate_median_alignment_width), error = function(e) NA_real_), input$investigate_median_step)
     paste0("Median of ", spectrum$scans, " / ", spectrum$available_scans, " MS1 scans (factor ", spectrum$scan_step,
       ") in ", paste(round(spectrum$time_range, 3), collapse = "–"),
       " min; ", nrow(spectrum$data), if (spectrum$native) " native m/z positions." else
         paste0(" aligned positions (", investigate_number(spectrum$alignment_width), " Da)."),
-      " Missing signal contributes zero; independent of 3D grouping. ",
+      " Internal empty bins interpolated. ",
       if (all(spectrum$data$intensity == 0)) "All medians are zero: no mass position has a nonzero central intensity. " else "",
       if (!identical(current, spectrum$key)) "Ranges or scan factor have changed; click Calculate median spectrum to update.")
   })

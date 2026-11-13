@@ -49,18 +49,25 @@ there are not two distinct readings to compare. Invalid/nonfinite measurements
 are excluded. The bounds come from the actual valid MS1 data, including files
 with missing or inconsistent header ranges.
 
-When coordinates differ between scans, an adjustable **Shared m/z alignment
-width (Da)** appears. Each scan's readings in a grid cell are averaged first;
-missing cells contribute zero. Its initial width is at least the measured
-minimum spacing and gives at most about 200,000 initial positions. This is a
-chosen alignment grid, labelled separately from measured native spacing; it is
-not interpolation or a claim about instrument resolution. Its last cell can
-be narrower at the requested upper bound. It starts at the selected m/z lower
-limit, so changing that limit can change alignment. Narrow the m/z range or
-increase the width if a request exceeds 2,000,000 alignment positions.
+When coordinates differ between scans, separate **Shared m/z alignment width
+(Da)** controls appear for the 3D preview and the median spectrum. Both default
+to **0.01 Da**, including after loading another file. Entries are rounded to at
+most four decimal places; the smallest supported width is **0.0001 Da**.
+Changing either width does not change the other control or invalidate the
+other plot's cached data.
 
-Shared native coordinates are used directly, including nonuniform spacing;
-the alignment control is hidden and its value has no effect in that case.
+Each scan's readings in one grid cell are averaged first. Empty cells in the
+3D preview contribute zero. For the median, internal empty cells are filled by
+linear interpolation between adjacent occupied cells whose intensities are
+both nonzero, before calculating the median across retained scans. See below
+for the interpolation rules.
+
+A chosen alignment grid differs from measured native spacing. The last cell
+can be narrower at the requested upper bound. Grids begin at the selected 3D
+m/z lower limit; changing that limit can change alignment. Narrow the range or
+increase the width if a request exceeds 2,000,000 alignment positions. Shared
+native coordinates are used directly when they are identical across nonempty
+spectra; both alignment controls are hidden and unused in that case.
 
 ## Interactive 3D view
 
@@ -89,8 +96,7 @@ the alignment control is hidden and its value has no effect in that case.
   `factor × typical (median) adjacent spacing`. These are approximate for
   irregular sampling; the last group may be smaller. For example, a 1-second
   scan interval with time factor 20 corresponds to about 20 seconds per group.
-  The live summary shows source and resulting counts; the plot reports its
-  applied factors.
+  The plot reports its applied factors.
   A preview is limited to 1,000,000 cells; increase factors or narrow ranges
   for larger requests. A single resulting row/column uses 3D lines/markers
   because a surface requires at least two positions on each axis.
@@ -163,8 +169,8 @@ Click **Calculate median spectrum** for a separate m/z-versus-intensity graph.
 Its own **Median time start/end** controls initially match the 3D time range and
 follow changes to it until either median time field is edited. A customized
 median time window stays independent when the 3D window changes. Loading a new
-file initializes both time ranges again. The current 3D m/z limits and shared
-alignment-width control still apply.
+file initializes both time ranges again. The current 3D m/z limits apply;
+the median has its own alignment-width control, independent of the 3D width.
 
 **Keep every Nth scan** defaults to **10**. Within the inclusive median time
 window, retain the first MS1 scan, then every Nth scan after it: factor 10 uses
@@ -176,15 +182,21 @@ Subsampling reduces work and changes the sample used for the median; brief
 signals can be missed. Use factor 1 when all scans should contribute.
 
 At each shared native m/z position (or aligned position if axes differ), there
-is one intensity per **retained** scan. Missing signals and empty retained scans
-contribute zero. Multiple readings at the same position are averaged within
-that scan before taking the median across retained scans. No 3D grouping is
-applied. Changing only grouping factors, or changing the 3D time window after
+is one intensity per **retained** scan. Multiple readings at the same position
+are averaged within that scan. Only **unoccupied** internal mass cells between
+two adjacent occupied, nonzero cells are linearly interpolated using their
+actual m/z distances. For example, a missing cell halfway between intensities
+10 and 20 becomes 15. Recorded zeros are never replaced and prevent filling
+across them. Gaps outside the first/last anchors, single-anchor spectra and
+entirely empty scans remain zero. There is no additional maximum-gap cutoff.
+The median is then calculated across these aligned/interpolated retained
+spectra. The filled values are estimates; the original raw file is unchanged.
+No 3D grouping is applied. Changing only grouping factors, or changing the 3D time window after
 customizing the median window, reuses the cached median. Changes to median
 bounds, scan factor, m/z limits or alignment width display a reminder to
 recalculate and invalidate the cache key.
 
-The median is exact for the retained scans, including the mean of the two
+The median is exact for the aligned/interpolated retained scans, including the mean of the two
 middle intensities for an even number of retained scans. Short-lived peaks can have **zero median** when absent
 from most scans; the status explains an all-zero result. This is expected for
 many transient signals and does not mean the original data have disappeared.
@@ -248,7 +260,9 @@ Visualization. The original analysis functions are unchanged.
 
 `tests/investigate.R` checks native sampling, fixed/varying mass axes, adjacent
 grouped means, independently calculated exact medians (odd/even, signed, sparse,
-RAM and disk paths), independent median windows and scan strides (including
+RAM and disk paths), independent four-decimal 3D/median widths, per-scan linear
+gap filling against an independent oracle (recorded zeros, edge gaps and signed
+intensities), independent median windows and scan strides (including
 checks that skipped scans are never read), compact ranges/physical grouping
 widths, bounded peak-preserving median displays with full-detail cached zoom,
 MS1/ppm/Da boundaries, batch/grid limits, plots, caches,
