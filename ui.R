@@ -7,6 +7,7 @@
 # defaults to 40/20 with Da/second equivalents; range bounds show three decimals.
 # Separate 3D/median alignment widths default to 0.01 Da with four decimals.
 # Internal empty median bins use linear interpolation between nonzero neighbours.
+# The spectrum offers Median, Maximum and Minimum, with brief status text.
 # The median has an SVG display with cached zoom and a displayed-point count.
 # Time slices can combine or overlay.
 # Original section headings are retained; new sections use the Matabo prefix.
@@ -489,16 +490,17 @@ ui <- dashboardPage(
             textOutput("investigate_slice_status"),
             plotlyOutput("investigate_slice", height = "350px"),
             helpText("Cross-sections use the original scans. Choose an m/z window for intensity versus time, or choose a time for an MS1 mass spectrum. Click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range."),
-            h4("Median m/z spectrum"),
+            h4("m/z spectrum"),
+            selectInput("investigate_median_statistic", "Statistic",
+              choices = c("Median" = "median", "Maximum" = "max", "Minimum" = "min"), selected = "median"),
             fluidRow(
-              column(4, numericInput("investigate_median_time_min", "Median time start (min)", 0, min = 0, step = 0.001)),
-              column(4, numericInput("investigate_median_time_max", "Median time end (min)", 40, min = 0, step = 0.001)),
+              column(4, numericInput("investigate_median_time_min", "Time start (min)", 0, min = 0, step = 0.001)),
+              column(4, numericInput("investigate_median_time_max", "Time end (min)", 40, min = 0, step = 0.001)),
               column(4, numericInput("investigate_median_step", "Keep every Nth scan", 10, min = 1, max = 1e9, step = 1))),
             conditionalPanel("output.investigate_needs_alignment",
               numericInput("investigate_median_alignment_width", "Shared m/z alignment width (Da)", value = 0.01, min = 0.0001, step = 0.0001)),
-            helpText("Time defaults follow 3D until edited. N=10 uses scans 1, 11, 21, … in this window. Uses the 3D m/z limits."),
-            actionButton("investigate_draw_median", "Calculate median spectrum"),
-            actionButton("investigate_reset_median", "Reset median view"),
+            actionButton("investigate_draw_median", "Calculate spectrum"),
+            actionButton("investigate_reset_median", "Reset spectrum view"),
             textOutput("investigate_median_status"),
             textOutput("investigate_median_display_status"),
             plotlyOutput("investigate_median_plot", height = "350px")

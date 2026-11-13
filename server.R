@@ -6,6 +6,8 @@
 # Display bounds use three decimals; grouping defaults to 40 m/z and 20 time
 # readings and reports their typical widths in Da/seconds. Shared native
 # mass coordinates are retained; differing axes use an adjustable alignment grid.
+# The time-summary spectrum offers median, maximum and minimum; extrema use
+# a single streaming pass over the same aligned/interpolated retained scans.
 # Independent 3D/median alignment widths default to 0.01 Da (four decimals).
 # Median alignment linearly fills internal empty bins between nonzero
 # neighbours before computing statistics; recorded zeros/outer gaps are retained.
@@ -1266,7 +1268,7 @@ server <- function(input, output, session){
     selected
   }
 
-  ######Matabo3.6.2 Native sampling, grouped means and exact median spectrum######
+  ######Matabo3.6.2 Native sampling, grouped means and spectrum summaries######
   # Measure actual within-spectrum sampling once; do not confuse it with an
   # instrument's resolving power or with the adjustable display/alignment grid.
   investigate_measure_sampling <- function(raw, progress = function(fraction) NULL) {
@@ -1422,13 +1424,25 @@ server <- function(input, output, session){
     mean(answer)
   }
 
+  investigate_summary_statistic <- function(value) {
+    if (!is.character(value) || length(value) != 1L || is.na(value) ||
+        !value %in% c("median", "max", "min")) stop("Choose Median, Maximum or Minimum.")
+    value
+  }
+
+  investigate_summary_label <- function(statistic = "median") {
+    if (is.null(statistic)) statistic <- "median"
+    switch(investigate_summary_statistic(statistic), median = "Median", max = "Maximum", min = "Minimum")
+  }
+
   investigate_median_spectrum <- function(raw, mz_range, time_range, alignment_width = NULL,
                                           progress = function(fraction) NULL, cache_bytes = 32 * 1024^2,
-                                          scan_step = 1L) {
-    time_range <- investigate_range(time_range, "Median time range")
+                                          scan_step = 1L, statistic = "median") {
+    statistic <- investigate_summary_statistic(statistic)
+    time_range <- investigate_range(time_range, "Spectrum time range")
     if (!is.numeric(scan_step) || length(scan_step) != 1L || !is.finite(scan_step) ||
         scan_step < 1 || scan_step > 1e9 || scan_step != floor(scan_step)) {
-      stop("Enter a positive whole median scan factor (1–1,000,000,000).")
+      stop("Enter a positive whole scan factor (1–1,000,000,000).")
     }
     eligible <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
     if (!length(eligible)) stop("No MS1 scans fall inside the selected time range.")
@@ -1438,7 +1452,29 @@ server <- function(input, output, session){
     view <- raw; view$scans <- raw$scans[selected]; view$times <- raw$times[selected]
     axis <- investigate_mass_axis(raw, mz_range, alignment_width)
     n <- length(selected); mass_count <- length(axis$mz)
-    positive <- negative <- numeric(mass_count); values <- numeric(mass_count)
+    values <- numeric(mass_count)
+    finish <- function(method) {
+      progress(1)
+      list(data = data.frame(mz = axis$mz, intensity = values), mz_range = axis$mz_range,
+        time_range = time_range, scans = n, available_scans = length(eligible),
+        scan_step = scan_step, selected_scans = view$scans, selected_times = view$times, native = axis$native,
+        alignment_width = axis$width, statistic = statistic, method = method)
+    }
+    if (statistic != "median") {
+      values[] <- if (statistic == "max") -Inf else Inf
+      observed <- integer(mass_count)
+      reduce <- if (statistic == "max") pmax else pmin
+      investigate_walk_scans(view, time_range, function(scan, index) {
+        aligned <- investigate_interpolate_empty(investigate_align_scan(scan, axis), axis)
+        columns <- aligned$columns
+        values[columns] <<- reduce(values[columns], aligned$values)
+        observed[columns] <<- observed[columns] + 1L
+      }, progress)
+      missing <- observed < n
+      values[missing] <- reduce(values[missing], 0)
+      return(finish(paste("streaming", tolower(investigate_summary_label(statistic)))))
+    }
+    positive <- negative <- numeric(mass_count)
     cache <- vector("list", length(view$scans)); cached <- TRUE; entries <- 0
     # Budget includes vector/list/grouping overhead, not only the 12-byte pair.
     capacity <- max(1, floor(cache_bytes/64))
@@ -1452,13 +1488,6 @@ server <- function(input, output, session){
       if (cached) cache[[index]] <<- list(columns = columns, values = intensity)
     }, function(fraction) progress(fraction * 0.6))
     candidates <- which(positive > floor((n - 1)/2) | negative > floor((n - 1)/2))
-    finish <- function(method) {
-      progress(1)
-      list(data = data.frame(mz = axis$mz, intensity = values), mz_range = axis$mz_range,
-        time_range = time_range, scans = n, available_scans = length(eligible),
-        scan_step = scan_step, selected_scans = view$scans, selected_times = view$times, native = axis$native,
-        alignment_width = axis$width, method = method)
-    }
     # A signal seen in fewer than half the scans has an exact zero median.
     # Most transient peaks need neither a dense matrix nor any sorting.
     if (!length(candidates)) return(finish("implicit-zero counts"))
@@ -1565,7 +1594,8 @@ server <- function(input, output, session){
     rows <- sort(unique(c(context, inside)))
     list(data = spectrum$data[rows, , drop = FALSE], x_range = x_range, y_range = y_range,
       shown = sum(x[rows] >= x_range[1] & x[rows] <= x_range[2]), visible = visible,
-      total = n, key = spectrum$key)
+      total = n, key = spectrum$key,
+      statistic = if (is.null(spectrum$statistic)) "median" else spectrum$statistic)
   }
 
   investigate_median_zoom <- function(event, spectrum, view = NULL) {
@@ -1588,14 +1618,15 @@ server <- function(input, output, session){
   }
 
   investigate_plot_median <- function(display) {
+    label <- investigate_summary_label(if (is.null(display$statistic)) "median" else display$statistic)
     plot <- plotly::plot_ly(x = display$data$mz, y = display$data$intensity,
       type = "scatter", source = "metabomeister_median",
       mode = if (nrow(display$data) == 1L) "markers" else "lines",
-      line = list(color = "#198a71", simplify = FALSE), name = "Median MS1 intensity",
-      hovertemplate = "m/z: %{x:.7f}<br>Median intensity: %{y:.6g}<extra></extra>") %>%
+      line = list(color = "#198a71", simplify = FALSE), name = paste(label, "MS1 intensity"),
+      hovertemplate = paste0("m/z: %{x:.7f}<br>", label, " intensity: %{y:.6g}<extra></extra>")) %>%
       plotly::layout(uirevision = paste(display$key, collapse = ":"), dragmode = "zoom",
         xaxis = list(title = "m/z", range = display$x_range),
-        yaxis = list(title = "Median intensity (ion counts)", range = display$y_range),
+        yaxis = list(title = paste(label, "intensity (ion counts)"), range = display$y_range),
         margin = list(l = 70, r = 20, b = 55, t = 20)) %>%
       plotly::config(scrollZoom = TRUE, displaylogo = FALSE, displayModeBar = TRUE,
         modeBarButtonsToRemove = c("select2d", "lasso2d")) %>%
@@ -1923,22 +1954,23 @@ server <- function(input, output, session){
     with_action_error({
       raw <- investigate_raw()
       if (is.null(raw)) stop("Load a raw .mz5 file first.")
-      mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "Median m/z range")
-      time_range <- investigate_range(c(input$investigate_median_time_min, input$investigate_median_time_max), "Median time range")
+      mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "Spectrum m/z range")
+      time_range <- investigate_range(c(input$investigate_median_time_min, input$investigate_median_time_max), "Spectrum time range")
       width <- if (raw$sampling$shared) NULL else investigate_alignment_value(input$investigate_median_alignment_width)
-      key <- c(raw$name, mz_range, time_range, width, input$investigate_median_step)
+      statistic <- investigate_summary_statistic(input$investigate_median_statistic)
+      key <- c(raw$name, mz_range, time_range, width, input$investigate_median_step, statistic)
       previous <- investigate_median()
       spectrum <- if (!is.null(previous) && identical(previous$key, key)) previous else {
         investigate_median(NULL); investigate_median_view(NULL)
-        shiny::withProgress(message = "Exact median across selected MS1 scans", value = 0, {
-          investigate_median_spectrum(raw, mz_range, time_range, width, scan_step = input$investigate_median_step,
+        shiny::withProgress(message = paste(investigate_summary_label(statistic), "spectrum"), value = 0, {
+          investigate_median_spectrum(raw, mz_range, time_range, width, scan_step = input$investigate_median_step, statistic = statistic,
             progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
       spectrum$key <- key
       spectrum$intensity_range <- investigate_intensity_range(spectrum$data$intensity)
       investigate_median(spectrum)
-    }, "Investigate: median spectrum")
+    }, "Investigate: spectrum summary")
   })
   observe_action(input$investigate_reset_median, {
     req(investigate_median())
@@ -2049,18 +2081,18 @@ server <- function(input, output, session){
   })
   output$investigate_median_status <- renderText({
     spectrum <- investigate_median()
-    if (is.null(spectrum)) return("No median spectrum calculated yet. Choose its time range and scan factor, then calculate.")
+    if (is.null(spectrum)) return("No spectrum calculated yet.")
     raw <- investigate_raw()
     current <- c(raw$name, input$investigate_mz_min, input$investigate_mz_max,
       input$investigate_median_time_min, input$investigate_median_time_max,
-      if (!spectrum$native) tryCatch(investigate_alignment_value(input$investigate_median_alignment_width), error = function(e) NA_real_), input$investigate_median_step)
-    paste0("Median of ", spectrum$scans, " / ", spectrum$available_scans, " MS1 scans (factor ", spectrum$scan_step,
+      if (!spectrum$native) tryCatch(investigate_alignment_value(input$investigate_median_alignment_width), error = function(e) NA_real_), input$investigate_median_step, input$investigate_median_statistic)
+    paste0(investigate_summary_label(spectrum$statistic), " of ", spectrum$scans, " / ", spectrum$available_scans, " MS1 scans (factor ", spectrum$scan_step,
       ") in ", paste(round(spectrum$time_range, 3), collapse = "–"),
       " min; ", nrow(spectrum$data), if (spectrum$native) " native m/z positions." else
         paste0(" aligned positions (", investigate_number(spectrum$alignment_width), " Da)."),
       " Internal empty bins interpolated. ",
-      if (all(spectrum$data$intensity == 0)) "All medians are zero: no mass position has a nonzero central intensity. " else "",
-      if (!identical(current, spectrum$key)) "Ranges or scan factor have changed; click Calculate median spectrum to update.")
+      if (all(spectrum$data$intensity == 0)) "All intensities are zero. " else "",
+      if (!identical(current, spectrum$key)) "Settings changed; recalculate.")
   })
   output$investigate_slice_status <- renderText({
     trace <- investigate_trace()
@@ -2107,13 +2139,12 @@ server <- function(input, output, session){
     display <- investigate_median_display()
     if (is.null(display)) return("")
     paste0("Showing ", format(display$shown, big.mark = ","), " of ",
-      format(display$visible, big.mark = ","), " median positions in this view. ",
-      if (display$shown < display$visible) "Peak-preserving overview; zoom for full detail. " else "All points in this view are shown. ",
-      "Drag a rectangle to zoom; Reset median view restores the full range.")
+      format(display$visible, big.mark = ","), " positions in view.",
+      if (display$shown < display$visible) " Overview." else "")
   })
   output$investigate_median_plot <- plotly::renderPlotly({
     spectrum <- investigate_median()
-    shiny::validate(shiny::need(!is.null(spectrum), "Click Calculate median spectrum."))
+    shiny::validate(shiny::need(!is.null(spectrum), "Click Calculate spectrum."))
     investigate_plot_median(isolate(investigate_median_display()))
   })
   #####Matabo3.6 End Investigate raw m/z, time and intensity#####

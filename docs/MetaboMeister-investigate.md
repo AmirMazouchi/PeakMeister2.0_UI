@@ -163,10 +163,17 @@ from the original data with no smoothing, calibration or peak fitting. A
 combined spectrum is limited to 1,000,000 mass bins; narrow the m/z range or
 increase its bin width for a larger request.
 
-## Median m/z spectrum
+## Time-summary m/z spectrum
 
-Click **Calculate median spectrum** for a separate m/z-versus-intensity graph.
-Its own **Median time start/end** controls initially match the 3D time range and
+Choose **Median**, **Maximum** or **Minimum** in **Statistic**, then click
+**Calculate spectrum**. Median is the default. Each option summarizes the
+retained scans at each m/z position using the same alignment and interpolation.
+Maximum and Minimum use one streaming pass, with no dense matrix or disk cache.
+A missing observation contributes zero; fully observed negative maxima and
+positive minima retain their actual values. Changing the statistic invalidates
+the calculation cache and updates the plotted axis/hover labels after calculation.
+
+Its own **Time start/end** controls initially match the 3D time range and
 follow changes to it until either median time field is edited. A customized
 median time window stays independent when the 3D window changes. Loading a new
 file initializes both time ranges again. The current 3D m/z limits apply;
@@ -193,15 +200,15 @@ The median is then calculated across these aligned/interpolated retained
 spectra. The filled values are estimates; the original raw file is unchanged.
 No 3D grouping is applied. Changing only grouping factors, or changing the 3D time window after
 customizing the median window, reuses the cached median. Changes to median
-bounds, scan factor, m/z limits or alignment width display a reminder to
+bounds, scan factor, statistic, m/z limits or alignment width display a reminder to
 recalculate and invalidate the cache key.
 
-The median is exact for the aligned/interpolated retained scans, including the mean of the two
-middle intensities for an even number of retained scans. Short-lived peaks can have **zero median** when absent
+The median is exact for the aligned/interpolated retained scans, including the
+mean of the two middle intensities for an even number of retained scans. Short-lived peaks can have **zero median** when absent
 from most scans; the status explains an all-zero result. This is expected for
 many transient signals and does not mean the original data have disappeared.
 Use the time-window combine/overlay views to inspect signals in shorter windows.
-The graph supports zoom, pan, PNG export and **Reset median view**.
+The graph supports zoom, pan, PNG export and **Reset spectrum view**.
 
 The median display uses a lightweight **SVG 2D trace**, independent of the
 3D surface's WebGL renderer. This avoids relying on WebGL for median interaction
@@ -223,7 +230,7 @@ raw spectra or rerun the median calculation. Zoom/pan messages use a dedicated
 Plotly source, and identical/resize messages are ignored to prevent reset loops.
 Only the trace coordinates are updated during zoom; the widget is not rebuilt,
 so an arriving display update does not recreate its drag area. Hover is handled
-in the browser. **Reset median view** restores the full m/z and
+in the browser. **Reset spectrum view** restores the full m/z and
 intensity range and the bounded overview.
 
 The implementation avoids allocating a dense scans-by-m/z matrix. It counts
@@ -264,7 +271,8 @@ RAM and disk paths), independent four-decimal 3D/median widths, per-scan linear
 gap filling against an independent oracle (recorded zeros, edge gaps and signed
 intensities), independent median windows and scan strides (including
 checks that skipped scans are never read), compact ranges/physical grouping
-widths, bounded peak-preserving median displays with full-detail cached zoom,
+widths, single-pass signed/missing-value Maximum and Minimum summaries,
+statistic-aware cache/labels, bounded peak-preserving displays with cached zoom,
 MS1/ppm/Da boundaries, batch/grid limits, plots, caches,
 error recovery, temporary-file/handle cleanup and the actual GUI controls.
 Existing action-guard, startup and scientific equivalence checks also cover

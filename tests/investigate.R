@@ -184,9 +184,22 @@ small_sample <- tasks$investigate_median_spectrum(raw, c(99.9, 101), c(0, 1), wi
 same(small_sample$data$intensity, as.numeric(median_oracle[1, ]))
 stopifnot(small_sample$scans == 1, small_sample$available_scans == 2)
 for (value in list(0, -1, 1.5, NA_real_, Inf)) {
-  stopifnot(grepl("median scan factor", error_text(tasks$investigate_median_spectrum(raw,
+  stopifnot(grepl("scan factor", error_text(tasks$investigate_median_spectrum(raw,
     c(99.9, 101), c(0, 10), width, scan_step = value))))
 }
+# Extrema use one pass and the same selected/aligned/interpolated scans.
+for (statistic in c("max", "min")) {
+  before <- length(signals$read_scans)
+  result <- tasks$investigate_median_spectrum(raw, c(99.9, 101), c(1, 9), width,
+    scan_step = 3, statistic = statistic, cache_bytes = 64)
+  same(result$data$intensity, apply(median_oracle[c(2, 5, 8), , drop = FALSE], 2, get(statistic)))
+  same(result$statistic, statistic)
+  stopifnot(grepl("^streaming", result$method))
+  same(signals$read_scans[seq.int(before + 1L, length(signals$read_scans))], raw$scans[c(2, 5, 8)])
+}
+stopifnot(grepl("Choose Median", error_text(tasks$investigate_median_spectrum(raw,
+  c(99.9, 101), c(0, 10), width, statistic = "mean"))))
+
 # Bounds display at most three decimals and retain the original endpoints.
 bounds <- tasks$investigate_display_range(c(0.055433333, 49.99313333))
 same(bounds, c(0.055, 49.994))
@@ -216,6 +229,26 @@ for (budget in c(64, 1e6)) {
 empty_sample <- tasks$investigate_median_spectrum(native, c(99, 104), c(0.5, 5), scan_step = 10)
 stopifnot(empty_sample$scans == 1L, empty_sample$available_scans == 3L,
   all(empty_sample$data$intensity == 0))
+# Missing observations contribute zero; a fully observed negative maximum
+# stays negative and a fully observed positive minimum stays positive.
+signed_native <- native
+signed_matrix <- cbind(-(1:4), 1:4, rep(0, 4), c(-2, -4, -6, 0))
+signed_native$read_peaks <- function(handle, scans) {
+  answer <- lapply(scans, function(i) {
+    columns <- if (i == 4) 1:3 else 1:4
+    cbind(c(100, 100.1, 101, 103)[columns], signed_matrix[i, columns])
+  })
+  if (length(scans) == 1) answer[[1]] else answer
+}
+for (statistic in c("median", "max", "min")) {
+  result <- tasks$investigate_median_spectrum(signed_native, c(99, 104), c(0, 5), statistic = statistic)
+  same(result$data$intensity, apply(signed_matrix, 2, get(statistic)))
+  result$key <- statistic; result$intensity_range <- c(-10, 10)
+  built <- plotly::plotly_build(tasks$investigate_plot_median(tasks$investigate_median_view_data(result)))
+  label <- switch(statistic, median = "Median", max = "Maximum", min = "Minimum")
+  stopifnot(built$x$layout$yaxis$title == paste(label, "intensity (ion counts)"))
+}
+
 # More than sixteen spill partitions exercises connection eviction/reopening.
 wide <- native; wide$scans <- 1:40; wide$times <- 0:39; wide$time_range <- c(0, 39)
 wide$read_peaks <- function(handle, scans) {
@@ -358,7 +391,7 @@ testServer(investigate_harness, {
   session$setInputs(investigate_source = "engine", investigate_engine_file = fixture_path,
     investigate_mz_min = 99.9, investigate_mz_max = 101,
     investigate_time_min = 0, investigate_time_max = 10,
-    investigate_median_time_min = 0, investigate_median_time_max = 10, investigate_median_step = 1,
+    investigate_median_time_min = 0, investigate_median_time_max = 10, investigate_median_step = 1, investigate_median_statistic = "median",
     investigate_slice_time_min = 0, investigate_slice_time_max = 10,
     investigate_mz_group = 2, investigate_time_group = 3, investigate_alignment_width = 0.1, investigate_median_alignment_width = 0.1,
     investigate_slice_axis = "mz",
@@ -425,7 +458,7 @@ testServer(investigate_harness, {
   stopifnot(investigate_median()$scans == 3L)
   session$setInputs(investigate_median_time_edited = 1, investigate_median_time_min = 1, investigate_median_time_max = 9,
     investigate_median_step = 3)
-  stopifnot(grepl("Ranges or scan factor have changed", output$investigate_median_status))
+  stopifnot(grepl("Settings changed; recalculate.", output$investigate_median_status))
   session$setInputs(investigate_draw_median = 4)
   same(investigate_median()$selected_times, c(1, 4, 7))
   default_update <- signals$input_updates$investigate_median_time_max$value
@@ -435,9 +468,19 @@ testServer(investigate_harness, {
   same(signals$input_updates$investigate_median_time_max$value, default_update)
   stopifnot(length(signals$batches) == reads, investigate_median()$scans == 3L)
   session$setInputs(investigate_median_step = 0, investigate_draw_median = 6)
-  stopifnot(!session$isClosed(), grepl("median scan factor", tail(signals$errors, 1)[[1]]$message))
+  stopifnot(!session$isClosed(), grepl("scan factor", tail(signals$errors, 1)[[1]]$message))
   session$setInputs(investigate_median_step = 1, investigate_draw_median = 7)
   stopifnot(investigate_median()$scans == 9L, !session$isClosed())
+  for (statistic in c("max", "min")) {
+    session$setInputs(investigate_median_statistic = statistic)
+    stopifnot(grepl("Settings changed", output$investigate_median_status))
+    session$setInputs(investigate_draw_median = paste0("calculate-", statistic))
+    same(investigate_median()$statistic, statistic)
+    same(investigate_median()$data$intensity, apply(median_oracle[2:10, , drop = FALSE], 2, get(statistic)))
+    reads <- length(signals$batches)
+    session$setInputs(investigate_draw_median = paste0("repeat-", statistic))
+    stopifnot(length(signals$batches) == reads)
+  }
   session$setInputs(`plotly_click-metabomeister_investigate` = '{"x":100.25,"y":1,"z":10,"curveNumber":0}')
   same(as.numeric(signals$input_updates$investigate_center$value), 100.25)
   session$setInputs(investigate_slice_axis = "time", investigate_time_mode = "combine",
@@ -493,6 +536,11 @@ for (pair in list(c("investigate_mz_group", "40"), c("investigate_time_group", "
 cat("PASS: actual Investigate UI, sidebar order and unique control/output IDs.\n")
 
 ui_text <- as.character(htmltools::renderTags(actual_ui)$html)
-stopifnot(!grepl("Time is shown in minutes|Saved analyses do not contain|investigate_group_status", ui_text),
+stopifnot(!grepl("Time is shown in minutes|Saved analyses do not contain|investigate_group_status|Time defaults follow 3D|Drag a rectangle to zoom", ui_text),
   !grepl("Time uses the typical scan interval|Last groups may be smaller", ui_text))
-cat("PASS: requested redundant UI messages removed.\n")
+select_tag <- htmltools::tagQuery(actual_ui)$find("#investigate_median_statistic")$selectedTags()[[1]]
+select_markup <- htmltools::renderTags(select_tag)$html
+stopifnot(grepl('<option value="median" selected', select_markup, fixed = TRUE),
+  grepl('<option value="max"', select_markup, fixed = TRUE),
+  grepl('<option value="min"', select_markup, fixed = TRUE))
+cat("PASS: concise UI and Median/Maximum/Minimum choices with Median default.\n")

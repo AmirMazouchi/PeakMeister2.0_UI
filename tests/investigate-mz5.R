@@ -51,6 +51,11 @@ local({
     med <- tasks$investigate_median_spectrum(raw, raw$mz_range, raw$time_range, cache_bytes = budget)
     same(med$data$intensity, apply(full, 2, median))
   }
+  for (statistic in c("max", "min")) {
+    summary <- tasks$investigate_median_spectrum(raw, raw$mz_range, raw$time_range, statistic = statistic)
+    same(summary$data$intensity, apply(full, 2, get(statistic)))
+    same(summary$statistic, statistic)
+  }
   for (step in c(2, 10)) {
     med <- tasks$investigate_median_spectrum(raw, raw$mz_range, raw$time_range, scan_step = step)
     retained <- seq.int(1L, nrow(full), by = step)
