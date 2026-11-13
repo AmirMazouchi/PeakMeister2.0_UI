@@ -6,6 +6,8 @@
 # Display bounds use three decimals; grouping defaults to 40 m/z and 20 time
 # readings and reports their typical widths in Da/seconds. Shared native
 # mass coordinates are retained; differing axes use an adjustable alignment grid.
+# The median uses a bounded SVG display with peak-preserving extrema and
+# cached full-detail zoom, avoiding WebGL dependence in RStudio's viewer.
 # The light 3D palette and combined/overlaid time-window spectra are retained.
 # Investigate explicitly uses Shiny's progress functions so packages loaded
 # later cannot mask numeric progress updates for raw-data actions.
@@ -1185,6 +1187,7 @@ server <- function(input, output, session){
   investigate_grid <- reactiveVal(NULL)
   investigate_trace <- reactiveVal(NULL)
   investigate_median <- reactiveVal(NULL)
+  investigate_median_view <- reactiveVal(NULL)
   investigate_median_time_custom <- reactiveVal(FALSE)
 
   ######Matabo3.6.1 Raw-file metadata, validation and bounded scan reading######
@@ -1499,6 +1502,75 @@ server <- function(input, output, session){
     finish("partitioned sparse values")
   }
 
+  # Matabo3.6.2 Render a bounded SVG overview independently of WebGL. The
+  # full computed median remains cached; zoom selects its original points.
+  investigate_median_view_data <- function(spectrum, view = NULL, max_points = 4000L) {
+    if (is.null(view)) view <- list(x = spectrum$mz_range, y = spectrum$intensity_range)
+    x_range <- investigate_range(view$x, "Median view m/z range", nonnegative = FALSE)
+    y_range <- investigate_range(view$y, "Median view intensity range", nonnegative = FALSE)
+    x <- spectrum$data$mz; y <- spectrum$data$intensity; n <- length(x)
+    if (!is.numeric(max_points) || length(max_points) != 1L || !is.finite(max_points) ||
+        max_points < 4 || max_points != floor(max_points)) stop("Median display point limit must be a whole number of at least 4.")
+    # findInterval works on the sorted native/aligned mass axis. Include a
+    # neighbour at each boundary to keep lines continuous while panning.
+    first <- findInterval(x_range[1], x, left.open = TRUE) + 1L
+    last <- findInterval(x_range[2], x)
+    visible <- max(0L, last - first + 1L)
+    context <- c(if (first > 1L) min(n, first - 1L), if (last < n) max(1L, last + 1L))
+    inside <- if (visible) seq.int(first, last) else integer()
+    if (length(inside) > max_points - 2L) {
+      buckets <- floor((max_points - 2L)/2L)
+      cells <- findInterval(x[inside], seq(x_range[1], x_range[2], length.out = buckets + 1L), all.inside = TRUE)
+      # Retain both extrema at their actual mass positions, in original order.
+      # Do not average intensities or discard a narrow peak between stride points.
+      inside <- unlist(lapply(split(inside, cells), function(rows) {
+        values <- y[rows]
+        rows[c(which.min(values), which.max(values))]
+      }), use.names = FALSE)
+    }
+    rows <- sort(unique(c(context, inside)))
+    list(data = spectrum$data[rows, , drop = FALSE], x_range = x_range, y_range = y_range,
+      shown = sum(x[rows] >= x_range[1] & x[rows] <= x_range[2]), visible = visible,
+      total = n, key = spectrum$key)
+  }
+
+  investigate_median_zoom <- function(event, spectrum, view = NULL) {
+    if (is.null(view)) view <- list(x = spectrum$mz_range, y = spectrum$intensity_range)
+    read_axis <- function(axis, current, full) {
+      if (isTRUE(event[[paste0(axis, ".autorange")]])) return(full)
+      limits <- event[[paste0(axis, ".range")]]
+      if (is.null(limits)) {
+        lower <- event[[paste0(axis, ".range[0]")]]
+        upper <- event[[paste0(axis, ".range[1]")]]
+        if (is.null(lower) || is.null(upper)) return(current)
+        limits <- c(lower, upper)
+      }
+      limits <- unlist(limits, use.names = FALSE)
+      if (!is.numeric(limits) || length(limits) != 2L || any(!is.finite(limits)) || limits[1] >= limits[2]) return(current)
+      as.numeric(limits)
+    }
+    list(x = read_axis("xaxis", view$x, spectrum$mz_range),
+      y = read_axis("yaxis", view$y, spectrum$intensity_range))
+  }
+
+  investigate_plot_median <- function(display) {
+    plot <- plotly::plot_ly(x = display$data$mz, y = display$data$intensity,
+      type = "scatter", source = "metabomeister_median",
+      mode = if (nrow(display$data) == 1L) "markers" else "lines",
+      line = list(color = "#198a71", simplify = FALSE), name = "Median MS1 intensity",
+      hovertemplate = "m/z: %{x:.7f}<br>Median intensity: %{y:.6g}<extra></extra>") %>%
+      plotly::layout(uirevision = paste(display$key, collapse = ":"), dragmode = "zoom",
+        xaxis = list(title = "m/z", range = display$x_range),
+        yaxis = list(title = "Median intensity (ion counts)", range = display$y_range),
+        margin = list(l = 70, r = 20, b = 55, t = 20)) %>%
+      plotly::config(scrollZoom = TRUE, displaylogo = FALSE, displayModeBar = TRUE,
+        modeBarButtonsToRemove = c("select2d", "lasso2d")) %>%
+      plotly::event_register("plotly_relayout")
+    # Hover stays entirely in the browser; only view changes need an R response.
+    plot <- plotly::event_unregister(plot, "plotly_hover")
+    plotly::event_unregister(plot, "plotly_unhover")
+  }
+
   investigate_extract_slice <- function(raw, center, window, unit, time_range,
                                          aggregation = "mean", progress = function(fraction) NULL) {
     mz_range <- investigate_window_limits(center, window, unit)
@@ -1695,14 +1767,14 @@ server <- function(input, output, session){
 
   observe_action(input$investigate_clear, {
     investigate_close_raw(investigate_raw())
-    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_time_custom(FALSE)
+    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_view(NULL); investigate_median_time_custom(FALSE)
   })
   session$onSessionEnded(function() investigate_close_raw(isolate(investigate_raw())))
 
   observe_action(input$investigate_load, {
     with_action_error({
       investigate_close_raw(investigate_raw())
-      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_time_custom(FALSE)
+      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_view(NULL); investigate_median_time_custom(FALSE)
       if (identical(input$investigate_source, "upload")) {
         file <- input$investigate_raw_file
         if (is.null(file) || !nrow(file)) stop("Select the original .mz5 file in Investigate first.")
@@ -1822,7 +1894,7 @@ server <- function(input, output, session){
       key <- c(raw$name, mz_range, time_range, width, input$investigate_median_step)
       previous <- investigate_median()
       spectrum <- if (!is.null(previous) && identical(previous$key, key)) previous else {
-        investigate_median(NULL)
+        investigate_median(NULL); investigate_median_view(NULL)
         shiny::withProgress(message = "Exact median across selected MS1 scans", value = 0, {
           investigate_median_spectrum(raw, mz_range, time_range, width, scan_step = input$investigate_median_step,
             progress = function(fraction) shiny::setProgress(value = fraction))
@@ -1836,8 +1908,31 @@ server <- function(input, output, session){
   observe_action(input$investigate_reset_median, {
     req(investigate_median())
     spectrum <- investigate_median()
-    plotly::plotlyProxy("investigate_median_plot", session) %>% plotly::plotlyProxyInvoke("relayout",
+    investigate_median_view(NULL)
+    display <- investigate_median_view_data(spectrum)
+    proxy <- plotly::plotlyProxy("investigate_median_plot", session)
+    proxy %>% plotly::plotlyProxyInvoke("restyle",
+      list(x = list(display$data$mz), y = list(display$data$intensity)), list(0L))
+    proxy %>% plotly::plotlyProxyInvoke("relayout",
       list("xaxis.range" = spectrum$mz_range, "yaxis.range" = spectrum$intensity_range))
+  })
+
+  observe_action(plot_event_data("plotly_relayout", "metabomeister_median"), {
+    spectrum <- investigate_median()
+    req(spectrum)
+    current <- investigate_median_view()
+    next_view <- investigate_median_zoom(plot_event_data("plotly_relayout", "metabomeister_median"), spectrum, current)
+    effective <- if (is.null(current)) list(x = spectrum$mz_range, y = spectrum$intensity_range) else current
+    # Plotly may emit autosize/identical range messages after rendering. Ignore
+    # these to avoid a relayout/render loop and preserve the user's zoom.
+    if (!isTRUE(all.equal(next_view, effective, tolerance = 1e-12))) {
+      investigate_median_view(next_view)
+      display <- investigate_median_display()
+      # Replace trace coordinates only. Rebuilding the whole widget here can
+      # interrupt a second drag while the first zoom response is arriving.
+      plotly::plotlyProxy("investigate_median_plot", session) %>% plotly::plotlyProxyInvoke("restyle",
+        list(x = list(display$data$mz), y = list(display$data$intensity)), list(0L))
+    }
   })
 
   observe_action(input$investigate_reset_3d, {
@@ -1982,18 +2077,23 @@ server <- function(input, output, session){
     shiny::validate(shiny::need(!is.null(trace), "Choose an m/z window and plot its cross-section."))
     investigate_plot_slice(trace)
   })
+  investigate_median_display <- reactive({
+    spectrum <- investigate_median()
+    if (is.null(spectrum)) return(NULL)
+    investigate_median_view_data(spectrum, investigate_median_view())
+  })
+  output$investigate_median_display_status <- renderText({
+    display <- investigate_median_display()
+    if (is.null(display)) return("")
+    paste0("Showing ", format(display$shown, big.mark = ","), " of ",
+      format(display$visible, big.mark = ","), " median positions in this view. ",
+      if (display$shown < display$visible) "Peak-preserving overview; zoom for full detail. " else "All points in this view are shown. ",
+      "Drag a rectangle to zoom; Reset median view restores the full range.")
+  })
   output$investigate_median_plot <- plotly::renderPlotly({
     spectrum <- investigate_median()
     shiny::validate(shiny::need(!is.null(spectrum), "Click Calculate median spectrum."))
-    plotly::plot_ly(x = spectrum$data$mz, y = spectrum$data$intensity, type = "scattergl",
-      mode = if (nrow(spectrum$data) == 1L) "markers" else "lines",
-      line = list(color = "#198a71"), name = "Median MS1 intensity",
-      hovertemplate = "m/z: %{x:.7f}<br>Median intensity: %{y:.6g}<extra></extra>") %>%
-      plotly::layout(uirevision = paste(spectrum$key, collapse = ":"),
-        xaxis = list(title = "m/z", range = spectrum$mz_range),
-        yaxis = list(title = "Median intensity (ion counts)", range = spectrum$intensity_range),
-        margin = list(l = 70, r = 20, b = 55, t = 20)) %>%
-      plotly::config(scrollZoom = TRUE, displaylogo = FALSE)
+    investigate_plot_median(isolate(investigate_median_display()))
   })
   #####Matabo3.6 End Investigate raw m/z, time and intensity#####
 

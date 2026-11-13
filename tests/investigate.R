@@ -260,6 +260,36 @@ same(as.numeric(overlay_plot$x$data[[1]]$x), overlaid$spectra[[1]]$data$mz)
 same(as.numeric(overlay_plot$x$data[[1]]$y), overlaid$spectra[[1]]$data$intensity)
 tasks$investigate_close_raw(raw)
 
+# A large median is displayed as a bounded SVG overview. Keep actual extrema,
+# including a one-position positive spike next to a negative spike, unchanged.
+large <- list(data = data.frame(mz = seq(50, 1700, length.out = 200000), intensity = numeric(200000)),
+  mz_range = c(50, 1700), intensity_range = c(-100, 1000), key = "large-median")
+large$data$intensity[c(12345, 12346, 100500, 199990)] <- c(999, -99, 500, 750)
+overview <- tasks$investigate_median_view_data(large)
+stopifnot(nrow(overview$data) <= 4000L, overview$visible == 200000L,
+  overview$shown < overview$visible, max(overview$data$intensity) == 999,
+  min(overview$data$intensity) == -99)
+rows <- match(overview$data$mz, large$data$mz)
+same(overview$data$intensity, large$data$intensity[rows])
+svg <- plotly_build(tasks$investigate_plot_median(overview))
+stopifnot(svg$x$data[[1]]$type == "scatter", svg$x$layout$dragmode == "zoom",
+  svg$x$source == "metabomeister_median", isFALSE(svg$x$data[[1]]$line$simplify),
+  "plotly_relayout" %in% svg$x$shinyEvents, !"plotly_hover" %in% svg$x$shinyEvents)
+zoom <- list(x = large$data$mz[c(10001, 11000)], y = c(-10, 10))
+detail <- tasks$investigate_median_view_data(large, zoom)
+stopifnot(detail$visible == 1000, detail$shown == 1000)
+same(detail$data$mz, large$data$mz[10000:11001])
+same(detail$data$intensity, large$data$intensity[10000:11001])
+next_view <- tasks$investigate_median_zoom(list(`xaxis.range[0]` = zoom$x[1],
+  `xaxis.range[1]` = zoom$x[2], `yaxis.range` = zoom$y), large)
+same(next_view, zoom)
+same(tasks$investigate_median_zoom(list(autosize = TRUE), large, zoom), zoom)
+same(tasks$investigate_median_zoom(list(`xaxis.range` = c(NA, Inf)), large, zoom), zoom)
+same(tasks$investigate_median_zoom(list(`xaxis.autorange` = TRUE, `yaxis.autorange` = TRUE), large, zoom),
+  list(x = large$mz_range, y = large$intensity_range))
+blank <- tasks$investigate_median_view_data(large, list(x = c(1800, 1900), y = c(0, 1)))
+stopifnot(blank$visible == 0, blank$shown == 0)
+
 # Harness runs the whole actual Matabo section, including all registrations.
 guard_names <- c("action_label", "report_action_error", "with_action_error", "observe_action", "observe_updates", "plot_event_data")
 investigate_harness <- function(input, output, session) {
@@ -325,6 +355,20 @@ testServer(investigate_harness, {
   same(investigate_median()$data$intensity, median_ram$data$intensity)
   median_json <- jsonlite::fromJSON(output$investigate_median_plot, simplifyVector = FALSE)
   same(as.numeric(unlist(median_json$x$data[[1]]$y)), median_ram$data$intensity)
+  # Real relayout events zoom the display from the cached full median only.
+  reads <- length(signals$batches)
+  session$setInputs(`plotly_relayout-metabomeister_median` =
+    '{"xaxis.range[0]":99.99,"xaxis.range[1]":100.2,"yaxis.range[0]":0,"yaxis.range[1]":20}')
+  same(investigate_median_view(), list(x = c(99.99, 100.2), y = c(0, 20)))
+  stopifnot(investigate_median_display()$shown == 2L, length(signals$batches) == reads)
+  same(investigate_median()$data$intensity, median_ram$data$intensity)
+  plotted <- jsonlite::fromJSON(output$investigate_median_plot, simplifyVector = FALSE)
+  stopifnot(plotted$x$data[[1]]$type == "scatter", plotted$x$source == "metabomeister_median")
+  # View updates use trace-only proxy messages, never rebuild the widget.
+  same(plotted, median_json)
+  session$setInputs(investigate_reset_median = 1)
+  stopifnot(is.null(investigate_median_view()), investigate_median_display()$shown == 11L,
+    length(signals$batches) == reads)
   reads <- length(signals$batches)
   session$setInputs(investigate_mz_group = 3, investigate_draw_median = 2)
   stopifnot(length(signals$batches) == reads)
@@ -378,7 +422,7 @@ testServer(investigate_harness, {
 })
 stopifnot(signals$opens == signals$closes)
 same(unname(tools::md5sum(fixture_path)), hash_before)
-cat("PASS: exact m/z traces; native sampling; adjacent grouped means; independent-window/subsampled medians with skipped-scan I/O checks, sparse-zero and disk-spill paths; three-decimal bounds and default grouping/physical widths; light palette; combined time-window means and original spectra overlays in nearest-first colour order; bounded batches/grid; actual guarded GUI actions, masked progress functions, cached intensity updates, axis-aware clicks, recovery and handle cleanup.\n")
+cat("PASS: exact m/z traces; native sampling; adjacent grouped means; independent-window/subsampled medians with skipped-scan I/O checks, sparse-zero and disk-spill paths; three-decimal bounds and default grouping/physical widths; bounded peak-preserving SVG median with full-detail cached zoom/reset; light palette; combined time-window means and original spectra overlays in nearest-first colour order; bounded batches/grid; actual guarded GUI actions, masked progress functions, cached intensity updates, axis-aware clicks, recovery and handle cleanup.\n")
 
 # New UI IDs are unique, and the menu places Investigate between Engine and Visualization.
 suppressPackageStartupMessages({ library(shinydashboard); library(DT); library(shinyjs); library(waiter) })

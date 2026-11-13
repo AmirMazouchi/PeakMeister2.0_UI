@@ -191,6 +191,29 @@ many transient signals and does not mean the original data have disappeared.
 Use the time-window combine/overlay views to inspect signals in shorter windows.
 The graph supports zoom, pan, PNG export and **Reset median view**.
 
+The median display uses a lightweight **SVG 2D trace**, independent of the
+3D surface's WebGL renderer. This avoids relying on WebGL for median interaction
+inside RStudio's embedded viewer. Drag mode defaults to zoom and the toolbar is
+visible. There are no selection/lasso modes on this read-only graph.
+
+A broad view draws at most **4,000 original median points**, retaining the
+minimum and maximum in each horizontal m/z interval at their actual coordinates.
+This preserves narrow positive/negative peaks instead of averaging them or
+keeping a simple stride of display points. The plotted line is an overview;
+it can omit intermediate shape detail. The status reports shown/available
+median positions in the current view. The **full calculated median is unchanged**
+and remains cached in R.
+
+Zooming or panning selects the relevant original cached points again. Once the
+visible window is small enough, every median position in it is shown, plus
+boundary neighbours for line continuity. These display operations do not read
+raw spectra or rerun the median calculation. Zoom/pan messages use a dedicated
+Plotly source, and identical/resize messages are ignored to prevent reset loops.
+Only the trace coordinates are updated during zoom; the widget is not rebuilt,
+so an arriving display update does not recreate its drag area. Hover is handled
+in the browser. **Reset median view** restores the full m/z and
+intensity range and the bounded overview.
+
 The implementation avoids allocating a dense scans-by-m/z matrix. It counts
 positive/negative observations with implicit zeros first, skipping value sorting
 where those counts already prove a zero median. Nonzero values are cached for
@@ -207,7 +230,8 @@ does not promise instant processing of large files.
 
 Spectra are read in batches of eight, rather than loading the full raw run into
 an MSnbase object. Native sampling information, one preview, the current
-cross-section and one median result are cached per session.
+cross-section and one full median result are cached per session. Median view
+changes render only the bounded display subset.
 File handles close when the loaded file is replaced, the investigation is
 cleared, or the session ends. Opening a file that cannot be read and invalid
 range requests use the existing guarded error handling, allowing retry.
@@ -226,7 +250,8 @@ Visualization. The original analysis functions are unchanged.
 grouped means, independently calculated exact medians (odd/even, signed, sparse,
 RAM and disk paths), independent median windows and scan strides (including
 checks that skipped scans are never read), compact ranges/physical grouping
-widths, MS1/ppm/Da boundaries, batch/grid limits, plots, caches,
+widths, bounded peak-preserving median displays with full-detail cached zoom,
+MS1/ppm/Da boundaries, batch/grid limits, plots, caches,
 error recovery, temporary-file/handle cleanup and the actual GUI controls.
 Existing action-guard, startup and scientific equivalence checks also cover
 this branch.
@@ -237,4 +262,7 @@ The mzR integration check uses ProteoWizard's genuine HDF5/mz5 reference file,
 checked independently of the preview. Chromium checks cover actual WebGL
 rotation/reset, linked selection, grouping factors, independent time-range
 medians, ranges, tab switching and raw-file upload.
-Large laboratory files were not available for a performance benchmark.
+A synthetic browser stress check renders 200,000 median positions alongside a
+750,000-cell 3D surface and exercises actual drag rectangles, detailed zoom and
+reset. RStudio's embedded viewer was not available in the test environment;
+large laboratory files were not available for a performance benchmark.

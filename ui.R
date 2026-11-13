@@ -5,6 +5,7 @@
 # adjustable alignment grid. A separate median spectrum uses its own
 # independently editable time range with an every-Nth-scan control. Grouping
 # defaults to 40/20 with Da/second equivalents; range bounds show three decimals.
+# The median has an SVG display with cached zoom and a displayed-point count.
 # Time slices can combine or overlay.
 # Original section headings are retained; new sections use the Matabo prefix.
 # Visualization has multi-step Undo/Redo and a history count. Peak edits create
@@ -496,6 +497,7 @@ ui <- dashboardPage(
             actionButton("investigate_draw_median", "Calculate median spectrum"),
             actionButton("investigate_reset_median", "Reset median view"),
             textOutput("investigate_median_status"),
+            textOutput("investigate_median_display_status"),
             plotlyOutput("investigate_median_plot", height = "350px")
           )
         )
