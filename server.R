@@ -85,6 +85,7 @@ server <- function(input, output, session){
       massListParameters = "Load Parameters workbook", userMTI = "Load migration-index workbook",
       analysis_mode = "Change analysis mode", mz5Files = "Upload mz5 files",
       existing_run = "Open existing analysis", clearFiles = "Clear Files", initialize = "Initialize Run",
+      investigate_load_saved_spectra = "Load / plot saved spectra",
       results_folder = "Select saved analysis", confirm_migration = "Build saved-results database",
       file_selector = "Select visualization file", draw_mode = "Change plot interaction mode",
       plot_table_rows_selected = "Select plot", delete_peak = "Delete Selected Peaks",
@@ -1342,9 +1343,12 @@ server <- function(input, output, session){
     file.path(parent, c("max_mz_spec_dmz0.001.sqlite", "min_mz_spec_dmz0.001.sqlite"))
   }
 
-  investigate_cache_open <- function(parent, raw = NULL) {
+  investigate_cache_open <- function(parent, raw = NULL, strict = FALSE) {
     paths <- investigate_cache_paths(parent)
-    if (!all(file.exists(paths))) return(NULL)
+    if (!all(file.exists(paths))) {
+      if (strict) stop("Both saved Maximum and Minimum files are required in ", parent)
+      return(NULL)
+    }
     tryCatch({
       metadata <- lapply(paths, function(path) {
         con <- DBI::dbConnect(RSQLite::SQLite(), path, flags = RSQLite::SQLITE_RO)
@@ -1363,11 +1367,15 @@ server <- function(input, output, session){
             DBI::dbGetQuery(con, "PRAGMA quick_check")[[1]][1] != "ok") stop("Incomplete cache.")
         meta
       })
-      if (!identical(metadata[[1]], metadata[[2]])) return(NULL)
+      if (!identical(metadata[[1]], metadata[[2]])) stop("The saved Maximum and Minimum belong to different cache generations.")
       meta <- metadata[[1]]
-      if (!is.null(raw) && !identical(meta$settings, investigate_cache_settings(raw))) return(NULL)
+      if (!is.null(raw) && !identical(meta$settings, investigate_cache_settings(raw))) stop("The saved spectra do not match the loaded Engine data/settings.")
       list(paths = paths, meta = meta)
-    }, error = function(e) NULL)
+    }, error = function(e) {
+      if (strict) stop(e)
+      message("[MetaboMeister] Saved spectra not attached: ", conditionMessage(e))
+      NULL
+    })
   }
 
   investigate_cache_build <- function(raw, parent, progress = function(fraction) NULL) {
@@ -1431,7 +1439,9 @@ server <- function(input, output, session){
     }
     # A crash between renames leaves mismatched generations, rejected on reopen.
     for (i in 1:2) if (!file.rename(temporary[i], paths[i])) stop("Cannot publish the fine spectrum cache.")
-    investigate_cache_open(parent, raw)
+    # These committed files were produced together from the validated settings.
+    # Do not silently discard them through a second full-database reopen/scan.
+    list(paths = paths, meta = meta)
   }
 
   investigate_window_choices <- function(cache, width = "full") {
@@ -1445,7 +1455,8 @@ server <- function(input, output, session){
     cbind(breaks[pairs[, 1]], breaks[pairs[, 2]])[order(pairs[, 1]), , drop = FALSE]
   }
 
-  investigate_cache_spectrum <- function(cache, statistic, time_range, mz_range = NULL) {
+  investigate_cache_spectrum <- function(cache, statistic, time_range, mz_range = NULL,
+                                         progress = function(fraction) NULL) {
     if (!statistic %in% c("max", "min")) stop("The fine cache contains Maximum and Minimum only.")
     settings <- cache$meta$settings
     if (is.null(mz_range)) mz_range <- c(settings$first, settings$first + settings$bins)/1000
@@ -1463,26 +1474,39 @@ server <- function(input, output, session){
     if (nrow(current) != 1L || !identical(unserialize(current$payload[[1]]), cache$meta)) {
       stop("The run's spectrum cache changed. Reopen the run through Engine.")
     }
-    sql <- sprintf("SELECT slice,block,value FROM blocks WHERE slice IN (%s) AND block IN (%s) ORDER BY block,slice",
+    sql <- sprintf("SELECT slice,block,value FROM blocks WHERE slice IN (%s) AND block IN (%s) ORDER BY slice,block",
       paste(as.integer(slices), collapse = ","), paste(as.integer(blocks), collapse = ","))
-    result <- DBI::dbGetQuery(con, sql)
-    if (nrow(result) != length(slices) * length(blocks)) stop("The spectrum cache is incomplete; reload through Engine.")
+    cursor <- DBI::dbSendQuery(con, sql)
+    on.exit(DBI::dbClearResult(cursor), add = TRUE, after = FALSE)
     values <- rep(if (statistic == "max") -Inf else Inf, length(rows))
     reduce <- if (statistic == "max") pmax else pmin
-    for (i in seq_len(nrow(result))) {
-      selected <- which((rows - 1L) %/% settings$block == result$block[i])
-      block_values <- readBin(result$value[[i]], numeric(), n = settings$block, size = 8L, endian = "little")
-      offset <- rows[selected] - result$block[i] * settings$block
-      if (length(block_values) < max(offset)) stop("Truncated spectrum cache block.")
-      values[selected] <- reduce(values[selected], block_values[offset])
+    blocks_read <- 0L
+    repeat {
+      # At most 64 x 4096 doubles are fetched, even for multi-GB full-run caches.
+      result <- DBI::dbFetch(cursor, n = 64L)
+      if (!nrow(result)) break
+      blocks_read <- blocks_read + nrow(result)
+      for (i in seq_len(nrow(result))) {
+        block_start <- result$block[i] * settings$block
+        lo <- max(rows[1], block_start + 1L)
+        hi <- min(tail(rows, 1), block_start + settings$block)
+        selected <- seq.int(lo, hi) - rows[1] + 1L
+        offset <- seq.int(lo, hi) - block_start
+        block_values <- readBin(result$value[[i]], numeric(), n = settings$block, size = 8L, endian = "little")
+        if (length(block_values) < max(offset)) stop("Truncated spectrum cache block.")
+        values[selected] <- reduce(values[selected], block_values[offset])
+      }
+      progress(blocks_read/max(1L, length(slices) * length(blocks)))
     }
+    if (blocks_read != length(slices) * length(blocks)) stop("The spectrum cache is incomplete; reload through Engine.")
     if (!length(slices)) values[] <- NA_real_ # Empty window: a gap, never a false zero.
+    progress(1)
     list(data = data.frame(mz = centers, intensity = values),
       mz_range = c(settings$first, settings$first + settings$bins)/1000,
       time_range = time_range, scans = sum(cache$meta$counts[slices]),
       available_scans = sum(cache$meta$counts), scan_step = 1L, native = FALSE,
       alignment_width = 0.001, statistic = statistic, cached = TRUE,
-      key = c(settings$fingerprint, statistic), blocks_read = nrow(result))
+      key = c(settings$fingerprint, statistic), blocks_read = blocks_read)
   }
 
   investigate_alignment_value <- function(value) {
@@ -2147,6 +2171,44 @@ server <- function(input, output, session){
     }
   })
 
+  ######Matabo3.6.3a Recover and plot completed saved spectra######
+  investigate_saved_cache_runs <- function() {
+    if (!dir.exists("./Results")) return(character())
+    folders <- list.dirs("./Results", recursive = FALSE, full.names = TRUE)
+    folders <- folders[vapply(folders, function(folder) all(file.exists(investigate_cache_paths(folder))), logical(1))]
+    sort(basename(folders))
+  }
+  investigate_saved_caches <- reactivePoll(5000, session,
+    checkFunc = investigate_saved_cache_runs, valueFunc = investigate_saved_cache_runs)
+  observe_updates({
+    runs <- investigate_saved_caches()
+    current <- isolate(input$investigate_cache_run)
+    raw <- investigate_raw()
+    active <- if (is.null(raw)) "" else sub("\\.mz5$", "", raw$name, ignore.case = TRUE)
+    selected <- if (length(current) == 1L && current %in% runs) current else
+      if (active %in% runs) active else if (length(runs)) runs[1] else ""
+    updateSelectInput(session, "investigate_cache_run",
+      choices = c("Select a run" = "", stats::setNames(runs, runs)), selected = selected)
+  })
+  observe_action(input$investigate_load_saved_spectra, {
+    run <- input$investigate_cache_run
+    if (length(run) != 1L || !run %in% investigate_saved_cache_runs()) {
+      stop("Select a run with both saved Maximum and Minimum files.")
+    }
+    raw <- investigate_raw()
+    matching <- !is.null(raw) && identical(sub("\\.mz5$", "", raw$name, ignore.case = TRUE), run)
+    cache <- shiny::withProgress(message = "Loading saved spectra", value = 0, {
+      investigate_cache_open(file.path(".", "Results", run), if (matching) raw else NULL, strict = TRUE)
+    })
+    if (!matching) {
+      investigate_activate(cache$meta$raw, cache)
+      key <- paste0("cache:", run)
+      updateSelectInput(session, "investigate_engine_file",
+        choices = stats::setNames(key, cache$meta$raw$name), selected = key)
+    } else investigate_attach_cache(cache)
+    investigate_update_cached(rebuild = TRUE)
+  })
+
   observe_action(input$existing_run, {
     if (!identical(input$analysis_mode, "existing")) return()
     run <- input$existing_run
@@ -2273,10 +2335,20 @@ server <- function(input, output, session){
     index <- max(1L, min(nrow(windows), investigate_position()))
     interval <- as.numeric(windows[index, ])
     previous <- investigate_median()
-    spectrum <- investigate_cache_spectrum(cache, statistic, interval, if (!is.null(view)) view$x else NULL)
+    query_key <- list(cache$meta$generation, statistic, interval, if (!is.null(view)) view$x else NULL)
+    if (!is.null(previous) && identical(previous$query_key, query_key)) {
+      if (rebuild) investigate_plot_generation(isolate(investigate_plot_generation()) + 1L)
+      return(invisible(previous))
+    }
+    initial_plot <- rebuild || is.null(previous) || !isTRUE(previous$cached)
+    spectrum <- if (initial_plot) shiny::withProgress(message = paste("Plotting saved", investigate_summary_label(statistic)), value = 0, {
+      investigate_cache_spectrum(cache, statistic, interval, if (!is.null(view)) view$x else NULL,
+        progress = function(fraction) shiny::setProgress(value = fraction))
+    }) else investigate_cache_spectrum(cache, statistic, interval, if (!is.null(view)) view$x else NULL)
     # Keep the established full-run scale even when only a visible region is queried.
     spectrum$intensity_range <- if (!is.null(previous) && isTRUE(previous$cached)) previous$intensity_range else
       investigate_intensity_range(spectrum$data$intensity)
+    spectrum$query_key <- query_key
     investigate_median(spectrum)
     if (rebuild || is.null(previous) || !isTRUE(previous$cached)) {
       investigate_plot_generation(isolate(investigate_plot_generation()) + 1L)

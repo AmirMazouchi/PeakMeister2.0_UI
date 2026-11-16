@@ -64,4 +64,19 @@ with sync_playwright() as p:
     assert during['updates']>before_drag and during['live'] is not None,(during,result)
     assert not errors,errors
     print(json.dumps({'PASS':'Engine upload and live browser drag; unchanged SVG widget and x/y limits','during_drag':during,'result':result}))
+    # Fresh session: recover the saved files without uploading or reading mz5.
+    saved=browser.new_page(viewport={'width':1600,'height':1100})
+    saved.goto(args.url,wait_until='networkidle',timeout=120000)
+    saved.wait_for_function('window.Shiny && Shiny.shinyapp && Shiny.shinyapp.$socket.readyState === 1')
+    saved.locator('a[data-value="investigate"]').click()
+    run=Path(args.fixture).stem
+    saved.wait_for_function('(run) => !!document.querySelector("#investigate_cache_run").selectize.options[run]',arg=run,timeout=120000)
+    saved.locator('#investigate_cache_run').evaluate('(el,run) => el.selectize.setValue(run)',run)
+    saved.locator('#investigate_load_saved_spectra').click()
+    saved.wait_for_function('document.getElementById("investigate_median_plot")?.data?.length > 0',timeout=120000)
+    assert 'Saved cache:' in saved.locator('#investigate_status').inner_text()
+    assert saved.evaluate('Shiny.shinyapp.$inputValues.mz5Files == null')
+    saved.locator('#investigate_median_statistic').evaluate("el => el.selectize.setValue('min')")
+    saved.wait_for_function('document.getElementById("investigate_median_plot").data[0].name.includes("Minimum")',timeout=120000)
+    print('PASS: fresh-session saved Maximum/Minimum plotting without mz5 upload',flush=True)
     browser.close()

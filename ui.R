@@ -493,6 +493,8 @@ ui <- dashboardPage(
             selectInput("investigate_median_statistic", "Statistic",
               choices = c("Median" = "median", "Maximum" = "max", "Minimum" = "min"), selected = "max"),
             conditionalPanel("input.investigate_median_statistic !== 'median'",
+              selectInput("investigate_cache_run", "Saved spectra", choices = c("Select a run" = "")),
+              actionButton("investigate_load_saved_spectra", "Load / plot saved spectra"),
               selectInput("investigate_window_width", "Window width (min)", choices = c("Full run" = "full")),
               sliderInput("investigate_window_position", "Window position", min = 1, max = 2, value = 1, step = 1, ticks = FALSE),
               textOutput("investigate_window_interval")),

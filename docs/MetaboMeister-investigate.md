@@ -61,8 +61,16 @@ Results/<mz5 basename>/
   Results <date>/
 ```
 
+To recover existing completed files, use Investigate → **Saved spectra**, choose
+its run, then click **Load / plot saved spectra**. No mz5 upload or recalculation
+is required. Select Maximum or Minimum to switch the curve. Keep the two SQLite
+files in their existing `Results/<mz5 basename>/` directory. Validation failures
+are reported explicitly and do not replace the files.
+
 Each database stores indexed `(slice, mass-block)` records with binary double
-intensities in blocks of 4,096 cells. A selected region such as 162–165 m/z reads
+intensities in blocks of 4,096 cells. Queries fetch at most 64 blocks at a time
+and compute each block's offsets directly, avoiding both whole-cache allocation
+and repeated full-axis scans. Initial plotting shows progress. A selected region such as 162–165 m/z reads
 only its intersecting blocks and selected nonempty slices, plus line-continuity
 neighbors. It does not combine the entire mass range while zoomed in.
 
@@ -120,7 +128,14 @@ The fine 0.001 Da slice workflow does not apply to Median.
   checked trace/spectrum extraction. The fixture used is ProteoWizard's
   `example_data/tiny.pwiz.1.1.mz5`.
 
-A Chromium check uploads through Engine and drags the actual slider while zoomed
+The optional `tests/investigate-large-cache.R` scale check creates two approximately
+637 MiB caches, verifies independently calculated full-run Maximum/Minimum and a
+narrow m/z region, then reopens the completed files without raw spectra. The cloud
+check used about 345 MiB peak resident memory; full queries took approximately
+9–13 seconds, and the narrow query about 0.07 seconds. Times depend on hardware.
+
+A Chromium check also recovers completed caches in a fresh session with no mz5
+upload. It uploads through Engine and drags the actual slider while zoomed
 to 162–165 m/z and fixed intensity limits. It verifies updates before release,
 unchanged axes and the same SVG widget. Large laboratory files, full user-data
 analysis and RStudio's embedded viewer were not available for validation.

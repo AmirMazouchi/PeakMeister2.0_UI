@@ -163,6 +163,16 @@ testServer(harness,{
   session$setInputs(analysis_mode='existing',existing_run='Fixture',investigate_median_statistic='max')
   stopifnot(is.null(investigate_raw()$read_peaks),isTRUE(investigate_median()$cached),signals$reads==1L)
   same(investigate_median()$data$intensity,apply(oracle[times>=1.2,,drop=FALSE],2,max))
+  # Reproduce files-on-disk/empty-GUI state and recover without an mz5 read.
+  investigate_activate(NULL)
+  session$setInputs(investigate_cache_run='Fixture',investigate_median_statistic='max',
+    investigate_load_saved_spectra=1)
+  stopifnot(isTRUE(investigate_median()$cached),signals$reads==1L,
+    is.null(investigate_raw()$read_peaks))
+  same(investigate_median()$data$intensity,apply(oracle[times>=1.2,,drop=FALSE],2,max))
+  session$setInputs(investigate_median_statistic='min',investigate_load_saved_spectra=2)
+  same(investigate_median()$data$intensity,apply(oracle[times>=1.2,,drop=FALSE],2,min))
+  stopifnot(signals$reads==1L)
   # A new cache must not gate the filename/raw-data handshake. Run its deferred
   # callback with an intentional failure and verify that loaded data survives.
   assign('investigate_cache_open',function(...)NULL,envir=environment(engine_load_upload))
