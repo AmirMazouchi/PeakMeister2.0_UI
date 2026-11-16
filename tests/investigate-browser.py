@@ -20,6 +20,10 @@ with sync_playwright() as p:
     page.locator('a[data-value="engine"]').click()
     page.locator('#autorun').uncheck()
     page.locator('#mz5Files').set_input_files(args.fixture)
+    # Engine's filename must reach the still-hidden Investigate control before
+    # we wait for sampling/caches or visit that tab.
+    page.wait_for_function('(name) => document.querySelector("#investigate_engine_file").selectedOptions[0].textContent === name',
+                           arg=Path(args.fixture).name,timeout=120000)
     page.locator('a[data-value="investigate"]').click()
     page.wait_for_function('document.querySelector("#investigate_status").textContent.includes("Engine data:")',timeout=120000)
     selected_name=page.locator('#investigate_engine_file').evaluate('el => el.selectedOptions[0].textContent')

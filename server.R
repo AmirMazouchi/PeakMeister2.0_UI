@@ -771,9 +771,8 @@ server <- function(input, output, session){
     current <- current[current$Source == "upload", , drop = FALSE]
     uploadedmz5(rbind(current, newFiles))
     engine_publish_files(newFiles$FilePath[1])
-    # Matabo3.1 Share one Engine read with analysis and Investigate.
-    for (i in seq_len(nrow(newFiles))) engine_load_upload(newFiles$FilePath[i], newFiles$FileName[i])
-    if (isTRUE(input$autorun)) request_new_analysis()
+    # Matabo3.1 Flush the filename before reading/preparing a large upload.
+    engine_queue_uploads(newFiles, isTRUE(input$autorun))
   })
 
   observe_action(input$existing_run, {
@@ -1269,7 +1268,10 @@ server <- function(input, output, session){
   investigate_measure_sampling <- function(raw, progress = function(fraction) NULL) {
     reference <- NULL; shared <- TRUE; counts <- integer(length(raw$scans))
     minimum <- Inf; observed <- c(Inf, -Inf); points <- 0
+    scan_hashes <- character(length(raw$scans))
     investigate_walk_scans(raw, raw$time_range, function(scan, index) {
+      # Hash one numeric scan at a time, not a serialization of the entire run.
+      scan_hashes[index] <<- digest::digest(unname(scan), algo = "sha256")
       axis <- unname(scan[, 1])
       if (is.unsorted(axis, strictly = TRUE)) axis <- sort(unique(axis))
       counts[index] <<- length(axis); points <<- points + nrow(scan)
@@ -1288,31 +1290,38 @@ server <- function(input, output, session){
     if (diff(raw$mz_range) == 0) raw$mz_range <- c(max(0, observed[1] - 0.01), observed[2] + 0.01)
     raw$range_source <- "all valid MS1 measurements"
     raw$alignment_width <- 0.01
+    raw$fingerprint <- digest::digest(list(name = raw$name, times = raw$times, scans = scan_hashes), algo = "sha256")
     raw
   }
 
   ######Matabo3.6.2a Shared Engine snapshots and persistent fine extrema######
-  investigate_from_engine <- function(run_data, name) {
-    # Materialize numeric vectors before Engine can mutate its assayData environment.
+  investigate_from_engine <- function(run_data, name, progress = function(fraction) NULL) {
+    # Keep references to the original immutable Spectrum objects. Analysis owns
+    # a deep copy; do not allocate a second whole-run set of numeric matrices.
     spectra <- MSnbase::spectra(run_data)
+    progress(0.05)
     times <- vapply(spectra, function(s) s@rt / 60, numeric(1))
     keep <- which(vapply(spectra, function(s) s@msLevel == 1L, logical(1)) &
                     is.finite(times) & times >= 0)
     keep <- keep[order(times[keep])]
     if (!length(keep)) stop("No valid MS1 scans in the Engine upload.")
-    scans <- lapply(spectra[keep], function(s) cbind(mz = s@mz, intensity = s@intensity))
-    investigate_memory_raw(scans, times[keep], name)
+    investigate_memory_raw(spectra[keep], times[keep], name,
+      progress = function(fraction) progress(0.05 + 0.95 * fraction),
+      read_peaks = function(handle, scans) lapply(handle[scans], function(spectrum) {
+        cbind(mz = spectrum@mz, intensity = spectrum@intensity)
+      }))
   }
 
-  investigate_memory_raw <- function(spectra, times, name) {
+  investigate_memory_raw <- function(spectra, times, name, progress = function(fraction) NULL,
+                                      read_peaks = function(handle, scans) handle[scans]) {
     # This reader only indexes Engine's snapshot; it never touches the mz5 file.
     raw <- list(name = basename(name), scans = seq_along(times), times = times,
       time_range = range(times), handle = spectra,
-      read_peaks = function(handle, scans) handle[scans], closer = function(handle) NULL)
+      read_peaks = read_peaks, closer = function(handle) NULL)
     if (!length(times)) stop("No MS1 scans in the Engine upload.")
     if (diff(raw$time_range) == 0) raw$time_range <- raw$time_range + c(-1, 1)/120
-    raw <- investigate_measure_sampling(raw)
-    raw$fingerprint <- digest::digest(list(name = raw$name, times = times, spectra = spectra), algo = "sha256")
+    raw <- investigate_measure_sampling(raw, progress = progress)
+    progress(1)
     raw
   }
 
@@ -2046,6 +2055,28 @@ server <- function(input, output, session){
       choices = stats::setNames(files$FilePath, files$FileName), selected = selected)
   }
 
+  engine_queue_uploads <- function(files, autorun = FALSE) {
+    message("[MetaboMeister] Engine upload queued: ", paste(files$FileName, collapse = ", "))
+    investigate_loading(paste0("Preparing Engine upload: ", paste(files$FileName, collapse = ", ")))
+    # Input messages are buffered until a Shiny flush. Deferring only the fine
+    # cache is insufficient: snapshot/sampling can also be lengthy after readMSData.
+    session$onFlushed(function() {
+      later::later(function() {
+        if (session$isClosed()) return()
+        shiny::withReactiveDomain(session, isolate({
+          if (analysis_mode() != "new" || !all(files$FilePath %in% uploadedmz5()$FilePath)) return()
+          complete <- TRUE
+          for (i in seq_len(nrow(files))) {
+            entry <- with_action_error(engine_load_upload(files$FilePath[i], files$FileName[i]), "Load Engine spectra")
+            if (is.null(entry)) complete <- FALSE
+          }
+          if (complete && autorun) request_new_analysis()
+        }))
+      }, delay = 0.1)
+    }, once = TRUE)
+    invisible(NULL)
+  }
+
   engine_load_upload <- function(path, name) {
     # Matabo3.6.3 Publish the upload before slow sampling/cache work. A failed
     # reader must not leave a real Engine upload labelled "Upload in Engine".
@@ -2058,9 +2089,13 @@ server <- function(input, output, session){
       data <- shiny::withProgress(message = paste("Reading Engine upload:", name), value = 0, {
         read_mz5_data(path, 1)
       })
-      raw <- investigate_from_engine(data, name)
+      message("[MetaboMeister] Preparing original MS1 spectra: ", name)
+      raw <- shiny::withProgress(message = paste("Preparing original MS1 spectra:", name), value = 0, {
+        investigate_from_engine(data, name, progress = function(fraction) shiny::setProgress(value = fraction))
+      })
       entries[[path]] <- list(data = data, raw = raw)
       engine_loaded(entries)
+      message("[MetaboMeister] Original MS1 spectra ready: ", name)
     }
     raw <- entries[[path]]$raw
     # Expose spectra, ranges and counts before any fine-cache calculation.

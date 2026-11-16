@@ -12,7 +12,10 @@ for(expression in statements)if(is.call(expression)&&identical(expression[[1]],a
   is.call(expression[[3]])&&identical(expression[[3]][[1]],as.name('function')))eval(expression,tasks)
 run <- readMSData(raw_path,msLevel=1,mode='inMemory',verbose=FALSE)
 rlang::env_binding_unlock(run@assayData) # read_mz5_data() unlocks Engine's assayData.
-original <- tasks$investigate_from_engine(run,basename(raw_path))
+progress <- numeric()
+original <- tasks$investigate_from_engine(run,basename(raw_path),
+  progress=function(fraction)progress <<- c(progress,fraction))
+stopifnot(length(progress)>1L,all(diff(progress)>=0),tail(progress,1)==1)
 before <- serialize(run,NULL)
 raw_before <- serialize(original$handle,NULL)
 tasks$incProgress <- function(...)NULL
@@ -38,9 +41,15 @@ stopifnot(identical(error,'CALIBRATION_COPY_CHECKED'),identical(serialize(run,NU
   identical(serialize(original$handle,NULL),raw_before))
 stopifnot(length(original$times)==length(spectra(run)))
 ordered <- spectra(run)[order(rtime(run))]
+stopifnot(all(vapply(original$handle, function(x) is(x,"Spectrum1"), logical(1))))
 for(i in seq_along(original$times)) {
-  stopifnot(identical(unname(original$handle[[i]][,1]),unname(ordered[[i]]@mz)),
-    identical(unname(original$handle[[i]][,2]),unname(ordered[[i]]@intensity)))
+  scan <- original$read_peaks(original$handle,scans=i)[[1]]
+  stopifnot(identical(unname(scan[,1]),unname(ordered[[i]]@mz)),
+    identical(unname(scan[,2]),unname(ordered[[i]]@intensity)))
 }
+# The same numeric data has the same fingerprint through either reader adapter.
+matrices <- original$read_peaks(original$handle,scans=seq_along(original$times))
+numeric_raw <- tasks$investigate_memory_raw(matrices,original$times,basename(raw_path))
+stopifnot(identical(numeric_raw$fingerprint,original$fingerprint))
 unlink(folder,recursive=TRUE)
 cat('PASS: real Engine MSnbase snapshot; production analysis reuses loaded data without reading; calibration mutates only its own copy; original uncalibrated Investigate spectra remain identical.\n')

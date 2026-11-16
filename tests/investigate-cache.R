@@ -122,6 +122,15 @@ testServer(harness,{
     investigate_mz_min=162,investigate_mz_max=162.01,investigate_median_time_min=1.2,
     investigate_median_time_max=5.3,investigate_median_step=1,investigate_median_alignment_width=0.001,
     autorun=TRUE,mz5Files=data.frame(name='Fixture.mz5',datapath='one-engine-upload'))
+  # The filename/status must be flushed before even the Engine reader starts.
+  # This catches the reported "File Reading Complete" then blank picker stall.
+  stopifnot(signals$reads==0L,signals$autoruns==0L,
+    grepl('Fixture.mz5',signals$updates$investigate_engine_file$options,fixed=TRUE),
+    grepl('Preparing Engine upload: Fixture.mz5',output$investigate_status,fixed=TRUE))
+  for (attempt in 1:20) {
+    later::run_now(0.1);session$flushReact()
+    if (signals$autoruns==1L) break
+  }
   stopifnot(signals$reads==1L,signals$autoruns==1L,identical(investigate_raw()$fingerprint,raw$fingerprint),
     !is.null(investigate_cache()),isTRUE(investigate_median()$cached))
   same(as.numeric(signals$updates$investigate_time_min$value),1.2)
@@ -175,6 +184,11 @@ testServer(harness,{
   investigate_activate(NULL)
   assign('read_mz5_data',function(...)stop('reader regression fixture'),envir=environment(engine_load_upload))
   session$setInputs(analysis_mode='new',mz5Files=data.frame(name='Broken.mz5',datapath='broken-upload'))
+  stopifnot(grepl('Broken.mz5',signals$updates$investigate_engine_file$options,fixed=TRUE))
+  for (attempt in 1:20) {
+    later::run_now(0.1);session$flushReact()
+    if (length(signals$errors)) break
+  }
   stopifnot(grepl('Broken.mz5',signals$updates$investigate_engine_file$options,fixed=TRUE),
     grepl('Could not load Broken.mz5',output$investigate_status,fixed=TRUE),
     identical(tail(signals$errors,1)[[1]],'reader regression fixture'))

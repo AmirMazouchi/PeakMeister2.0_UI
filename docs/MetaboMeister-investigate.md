@@ -7,13 +7,18 @@ remain self-contained in these files and use the existing application packages.
 
 Upload `.mz5` files in Engine. Each upload is read once into memory. Investigate
 automatically selects that file and populates its ranges, sampling counts,
-controls and status before fine-cache calculation starts. Cache preparation runs
-after the initial UI update; its failure leaves the Engine filename and spectra
-available. A reader failure displays the filename and an explicit error status.
+controls and status before fine-cache calculation starts. The upload handler first
+flushes the filename and a preparing status to the browser, then queues Engine's
+read and sampling work. Preparation reports progress after `File Reading Complete`.
+Cache preparation also runs after the UI update; its failure leaves the Engine
+filename and spectra available. A reader failure displays the filename and an explicit error status.
 There is no Investigate upload or raw-file-open button.
 Selecting another already loaded Engine file reuses its memory snapshot.
 
-Engine retains the original uncalibrated object. Analysis receives a deep copy
+Engine retains the original uncalibrated object. Investigate references its Spectrum
+objects and materializes only bounded scan batches; it does not duplicate the full
+run into numeric matrices. Source fingerprints are calculated per scan during
+sampling, avoiding a second whole-run serialization. Analysis receives a deep copy
 of its mutable assay-data environment, so mass calibration and extraction cannot
 change Investigate's original spectra. Cross-sections, 3D previews and Median
 read the in-memory snapshot, not the original file again.
