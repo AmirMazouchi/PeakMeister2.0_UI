@@ -110,12 +110,13 @@ testServer(function(input, output, session) {
   manual_peak_integration <- function(...) stop("invalid integration fixture")
   regenerate_metabolite_peak_areas <- function() stop("must not continue after integration failure")
   analysis_mode <- function() "new"
+  engine_loaded <- function() list()
   uploadedmz5 <- function() data.frame(FileName = "Run01.mz5", FilePath = raw, Source = "upload")
   create_results_folder <- function(...) work
   prepare_analysis_parameters <- function(...) list(mi_df = data.frame())
   prepare_results_folder <- function(...) invisible(NULL)
   massData <- refMassListData <- parametersData <- userMTI <- function() data.frame()
-  process_mz5_file <- function(raw_path, filename, file_name, config, timing) {
+  process_mz5_file <- function(raw_path, filename, file_name, config, timing, shared_data = NULL) {
     withProgress(message = "Reading fixture", value = 0, {
       timing$stage("Read mz5 into memory", filename)
       stop("raw reading fixture")

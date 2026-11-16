@@ -1,16 +1,7 @@
-# MetaboMeister adds Investigate between Engine and Visualization. It provides
-# a bounded 3D raw-MS1 preview and an exact m/z-window trace with range controls.
-# Native sampling spacing/counts are measured once. Positive whole factors
-# group adjacent mass readings and scans by mean; differing mass axes expose an
-# adjustable alignment grid. A separate median spectrum uses its own
-# independently editable time range with an every-Nth-scan control. Grouping
-# defaults to 40/20 with Da/second equivalents; range bounds show three decimals.
-# Separate 3D/median alignment widths default to 0.01 Da with four decimals.
-# Internal empty median bins use linear interpolation between nonzero neighbours.
-# The spectrum offers Median, Maximum and Minimum, with brief status text.
-# The median has an SVG display with cached zoom and a displayed-point count.
-# Time slices can combine or overlay.
-# Original section headings are retained; new sections use the Matabo prefix.
+# MetaboMeister Investigate reuses Engine's original MS1 data.
+# Maximum is the default; paired fine-grid caches support live time windows.
+# Median retains independent controls. The SVG overview, zoom/reset and 3D
+# grouping remain available. New sections use the Matabo prefix.
 # Visualization has multi-step Undo/Redo and a history count. Peak edits create
 # a separate edited analysis copy; the original analysis remains available.
 # Visualization's unused .RData upload and Clear uploaded data controls are
@@ -347,7 +338,7 @@ ui <- dashboardPage(
                    conditionalPanel("input.analysis_mode === 'new'",
                      tags$h4(style = "text-decoration: underline;", "File Uploads for Initializing Data Preprocessing"),
                      fileInput("mz5Files", "Upload .mz5 Files", accept = c(".mz5"), multiple = TRUE),
-                     checkboxInput("autorun", "Start run automatically after upload", value = FALSE)
+                     checkboxInput("autorun", "Start run automatically after upload", value = TRUE)
                    ),
                    conditionalPanel("input.analysis_mode === 'existing'",
                      tags$h4("Open existing analysis"),
@@ -402,17 +393,26 @@ ui <- dashboardPage(
             if (field.value !== compact) { field.value = compact; $(field).trigger('change'); }
           }, true);
         })();")),
+        # Matabo5.1 Send positions while dragging; the ordinary slider binding commits on release.
+        tags$script(HTML("$(document).on('shiny:bound', function(event) {
+          if (event.target.id !== 'investigate_window_position') return;
+          var element = $(event.target), slider = element.data('ionRangeSlider');
+          if (!slider || slider.metaboLive) return;
+          slider.metaboLive = true;
+          var previous = slider.options.onChange, finish = slider.options.onFinish, last = 0;
+          slider.update({onChange: function(data) {
+            if (previous) previous(data);
+            if (Date.now() - last < 75) return;
+            last = Date.now();
+            Shiny.setInputValue('investigate_window_live', data.from, {priority: 'event'});
+          }, onFinish: function(data) {
+            if (finish) finish(data);
+            Shiny.setInputValue('investigate_window_live', data.from, {priority: 'event'});
+          }});
+        });")),
         h3("Investigate raw data"),
-        p("Explore MS1 measurements without running peak detection."),
-        radioButtons("investigate_source", "Raw file source",
-          choices = c("Use an Engine upload" = "engine", "Select another .mz5 file" = "upload"),
-          selected = "engine", inline = TRUE),
-        conditionalPanel("input.investigate_source === 'engine'",
-          selectInput("investigate_engine_file", "Raw .mz5 uploaded in Engine:",
-            choices = c("Select a raw upload" = ""))),
-        conditionalPanel("input.investigate_source === 'upload'",
-          fileInput("investigate_raw_file", "Select raw .mz5 for investigation:", accept = ".mz5")),
-        actionButton("investigate_load", "Load raw file"),
+        p("Original, uncalibrated Engine spectra."),
+        selectInput("investigate_engine_file", "Engine file:", choices = c("Upload in Engine" = "")),
         actionButton("investigate_clear", "Clear investigation"),
         verbatimTextOutput("investigate_status"),
         fluidRow(
@@ -422,7 +422,7 @@ ui <- dashboardPage(
               column(6, numericInput("investigate_mz_min", "m/z minimum", 50, min = 0, step = 0.001)),
               column(6, numericInput("investigate_mz_max", "m/z maximum", 1000, min = 0, step = 0.001))),
             fluidRow(
-              column(6, numericInput("investigate_time_min", "Time start (min)", 0, min = 0, step = 0.001)),
+              column(6, numericInput("investigate_time_min", "Time start (min)", 1.2, min = 0, step = 0.001)),
               column(6, numericInput("investigate_time_max", "Time end (min)", 40, min = 0, step = 0.001))),
             checkboxInput("investigate_auto_z", "Automatic intensity range", TRUE),
             conditionalPanel("!input.investigate_auto_z",
@@ -489,17 +489,21 @@ ui <- dashboardPage(
             h4("Cross-section"),
             textOutput("investigate_slice_status"),
             plotlyOutput("investigate_slice", height = "350px"),
-            helpText("Cross-sections use the original scans. Choose an m/z window for intensity versus time, or choose a time for an MS1 mass spectrum. Click Plot / apply cross-section. Drag to zoom; double-click or use Reset trace view to restore the displayed range."),
             h4("m/z spectrum"),
             selectInput("investigate_median_statistic", "Statistic",
-              choices = c("Median" = "median", "Maximum" = "max", "Minimum" = "min"), selected = "median"),
-            fluidRow(
-              column(4, numericInput("investigate_median_time_min", "Time start (min)", 0, min = 0, step = 0.001)),
-              column(4, numericInput("investigate_median_time_max", "Time end (min)", 40, min = 0, step = 0.001)),
-              column(4, numericInput("investigate_median_step", "Keep every Nth scan", 10, min = 1, max = 1e9, step = 1))),
-            conditionalPanel("output.investigate_needs_alignment",
-              numericInput("investigate_median_alignment_width", "Shared m/z alignment width (Da)", value = 0.01, min = 0.0001, step = 0.0001)),
-            actionButton("investigate_draw_median", "Calculate spectrum"),
+              choices = c("Median" = "median", "Maximum" = "max", "Minimum" = "min"), selected = "max"),
+            conditionalPanel("input.investigate_median_statistic !== 'median'",
+              selectInput("investigate_window_width", "Window width (min)", choices = c("Full run" = "full")),
+              sliderInput("investigate_window_position", "Window position", min = 1, max = 2, value = 1, step = 1, ticks = FALSE),
+              textOutput("investigate_window_interval")),
+            conditionalPanel("input.investigate_median_statistic === 'median'",
+              fluidRow(
+                column(4, numericInput("investigate_median_time_min", "Time start (min)", 0, min = 0, step = 0.001)),
+                column(4, numericInput("investigate_median_time_max", "Time end (min)", 40, min = 0, step = 0.001)),
+                column(4, numericInput("investigate_median_step", "Keep every Nth scan", 10, min = 1, max = 1e9, step = 1))),
+              conditionalPanel("output.investigate_needs_alignment",
+                numericInput("investigate_median_alignment_width", "Shared m/z alignment width (Da)", value = 0.01, min = 0.0001, step = 0.0001)),
+              actionButton("investigate_draw_median", "Calculate Median")),
             actionButton("investigate_reset_median", "Reset spectrum view"),
             textOutput("investigate_median_status"),
             textOutput("investigate_median_display_status"),

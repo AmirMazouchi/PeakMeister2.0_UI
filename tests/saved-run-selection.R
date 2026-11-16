@@ -15,7 +15,7 @@ first<-which(vapply(statements,is_assign,logical(1),name='empty_mz5_files'))
 last<-which(vapply(statements,is_event,logical(1),name='initialize'))
 engine<-statements[first:(last-1)]
 engine<-Filter(function(x)!grepl('^output\\$fileTable',text(x)),engine)
-guard_names<-c('action_label','report_action_error','with_action_error','observe_action','observe_updates')
+guard_names<-c('action_label','report_action_error','with_action_error','observe_action','observe_updates','plot_event_data')
 extra_names<-c('plot_list_data_values','run_metadata','previous_metadata','modified_peak_plots','plot_render_trigger','get_db_path','db_exists','list_results_folders','selected_results_filename','results_folders_reactive','last_results_filename','latest_results_folder','last_visualization_filename','db_con','editing_context','edit_history_trigger','analysis_folder_choices','clear_loaded_analysis','peak_areas_data','migration_times_data')
 extras<-lapply(extra_names,get_assign)
 selector<-Filter(function(x)is.call(x)&&identical(x[[1]],as.name('observe_action'))&&grepl('^list\\(selected_results_filename\\(\\), results_folders_reactive\\(\\)\\)',text(x[[2]])),statements)
@@ -32,6 +32,7 @@ mode_server<-function(input,output,session){
  eval(block,envir=environment())
  reset_raw_selection<-function()NULL
  request_new_analysis<-function()NULL
+ engine_load_upload<-function(...)NULL # Raw sharing is exercised by investigate-cache.R.
 }
 readMSData<-function(...)stop('Existing analysis must never read raw data')
 run_saved_selection_checks<-function(){

@@ -362,156 +362,10 @@ same(tasks$investigate_median_zoom(list(`xaxis.autorange` = TRUE, `yaxis.autoran
 blank <- tasks$investigate_median_view_data(large, list(x = c(1800, 1900), y = c(0, 1)))
 stopifnot(blank$visible == 0, blank$shown == 0)
 
-# Harness runs the whole actual Matabo section, including all registrations.
-guard_names <- c("action_label", "report_action_error", "with_action_error", "observe_action", "observe_updates", "plot_event_data")
-investigate_harness <- function(input, output, session) {
-  uploadedmz5 <- reactiveVal(data.frame(FileName = "Fixture.mz5", FilePath = fixture_path, Source = "upload"))
-  massData <- reactiveVal(data.frame(mz = 100)); refMassListData <- reactiveVal(data.frame(mz = 100))
-  for (name in guard_names) eval(assignment(name), environment())
-  report_action_error <- function(action, error) {
-    signals$errors[[length(signals$errors) + 1L]] <- list(action = action, message = conditionMessage(error))
-  }
-  # Reproduce packages loaded after Shiny masking its progress updater. Calling
-  # this S3 generic with a numeric fraction matches the reported runtime error.
-  setProgress <- function(value, ...) UseMethod("setProgress")
-  withProgress <- function(...) stop("A masked withProgress() was called.")
-  eval(investigate_block, environment())
-  investigate_open_raw <- open_fixture
-  if (inherits(session, "MockShinySession")) {
-    old_send <- session$sendInputMessage
-    session$sendInputMessage <- function(id, message) {
-      signals$input_updates[[id]] <- message
-      old_send(id, message)
-    }
-  }
-}
-hash_before <- unname(tools::md5sum(fixture_path))
-signals$errors <- list()
-testServer(investigate_harness, {
-  session$setInputs(investigate_source = "engine", investigate_engine_file = fixture_path,
-    investigate_mz_min = 99.9, investigate_mz_max = 101,
-    investigate_time_min = 0, investigate_time_max = 10,
-    investigate_median_time_min = 0, investigate_median_time_max = 10, investigate_median_step = 1, investigate_median_statistic = "median",
-    investigate_slice_time_min = 0, investigate_slice_time_max = 10,
-    investigate_mz_group = 2, investigate_time_group = 3, investigate_alignment_width = 0.1, investigate_median_alignment_width = 0.1,
-    investigate_slice_axis = "mz",
-    investigate_center = 100, investigate_window = 10, investigate_unit = "ppm",
-    investigate_auto_z = TRUE, investigate_auto_y = TRUE, investigate_log_z = FALSE,
-    investigate_aggregation = "mean")
-  session$setInputs(investigate_draw_3d = 1)
-  stopifnot(is.null(investigate_grid()), tail(signals$errors, 1)[[1]]$action == "Investigate: draw 3D preview", !session$isClosed())
-  session$setInputs(investigate_load = 1)
-  stopifnot(investigate_raw()$name == "Fixture.mz5", is.null(investigate_grid()), is.null(investigate_trace()), is.null(investigate_median()))
-  same(as.numeric(signals$input_updates$investigate_mz_group$value), 40)
-  same(as.numeric(signals$input_updates$investigate_time_group$value), 20)
-  same(as.numeric(signals$input_updates$investigate_alignment_width$value), 0.01)
-  same(as.numeric(signals$input_updates$investigate_median_alignment_width$value), 0.01)
-  session$setInputs(investigate_draw_3d = 2, investigate_draw_slice = 1)
-  stopifnot(investigate_grid()$scans == 11L)
-  same(investigate_trace()$data$intensity, c(3, 9, 0, 0, seq(18, 36, by = 3)))
-  built <- jsonlite::fromJSON(output$investigate_3d)
-  stopifnot(built$x$source == "metabomeister_investigate")
-  session$flushReact()
-  reads <- length(signals$batches)
-  session$setInputs(investigate_auto_z = FALSE, investigate_z_min = 0, investigate_z_max = 500,
-    investigate_auto_y = FALSE, investigate_y_min = 0, investigate_y_max = 50,
-    investigate_draw_3d = 3, investigate_draw_slice = 2)
-  stopifnot(length(signals$batches) == reads)
-  same(investigate_grid()$intensity_range, c(0, 500))
-  same(investigate_trace()$intensity_range, c(0, 50))
-  stopifnot(grepl("Mean intensity", output$investigate_grid_status),
-    grepl("Minimum native Δm/z", output$investigate_status),
-    grepl("minimum Δt", output$investigate_status))
-  stopifnot(!grepl("including empty scans|positive|Measured across", output$investigate_status),
-    grepl("Da; time ≈ 180 s", output$investigate_group_widths))
-  session$setInputs(investigate_draw_median = 1)
-  same(investigate_median()$data$intensity, median_ram$data$intensity)
-  median_json <- jsonlite::fromJSON(output$investigate_median_plot, simplifyVector = FALSE)
-  same(as.numeric(unlist(median_json$x$data[[1]]$y)), median_ram$data$intensity)
-  # Real relayout events zoom the display from the cached full median only.
-  reads <- length(signals$batches)
-  session$setInputs(`plotly_relayout-metabomeister_median` =
-    '{"xaxis.range[0]":99.99,"xaxis.range[1]":100.2,"yaxis.range[0]":0,"yaxis.range[1]":20}')
-  same(investigate_median_view(), list(x = c(99.99, 100.2), y = c(0, 20)))
-  stopifnot(investigate_median_display()$shown == 2L, length(signals$batches) == reads)
-  same(investigate_median()$data$intensity, median_ram$data$intensity)
-  plotted <- jsonlite::fromJSON(output$investigate_median_plot, simplifyVector = FALSE)
-  stopifnot(plotted$x$data[[1]]$type == "scatter", plotted$x$source == "metabomeister_median")
-  # View updates use trace-only proxy messages, never rebuild the widget.
-  same(plotted, median_json)
-  session$setInputs(investigate_reset_median = 1)
-  stopifnot(is.null(investigate_median_view()), investigate_median_display()$shown == 11L,
-    length(signals$batches) == reads)
-  reads <- length(signals$batches)
-  session$setInputs(investigate_mz_group = 3, investigate_alignment_width = 0.2, investigate_draw_median = 2)
-  stopifnot(length(signals$batches) == reads)
-  same(investigate_median()$alignment_width, 0.1)
-  old_grid <- investigate_grid()
-  session$setInputs(investigate_median_alignment_width = 0.05, investigate_draw_median = 20)
-  same(investigate_median()$alignment_width, 0.05)
-  same(investigate_grid(), old_grid)
-  session$setInputs(investigate_median_alignment_width = 0.1)
-  session$setInputs(investigate_time_max = 2)
-  same(as.numeric(signals$input_updates$investigate_median_time_max$value), 2)
-  # Simulate receipt of the default update, then customize the median window.
-  session$setInputs(investigate_median_time_max = 2, investigate_draw_median = 3)
-  stopifnot(investigate_median()$scans == 3L)
-  session$setInputs(investigate_median_time_edited = 1, investigate_median_time_min = 1, investigate_median_time_max = 9,
-    investigate_median_step = 3)
-  stopifnot(grepl("Settings changed; recalculate.", output$investigate_median_status))
-  session$setInputs(investigate_draw_median = 4)
-  same(investigate_median()$selected_times, c(1, 4, 7))
-  default_update <- signals$input_updates$investigate_median_time_max$value
-  reads <- length(signals$batches)
-  session$setInputs(investigate_time_max = 10, investigate_draw_median = 5)
-  # Changing 3D time cannot overwrite an independent median window or its cache.
-  same(signals$input_updates$investigate_median_time_max$value, default_update)
-  stopifnot(length(signals$batches) == reads, investigate_median()$scans == 3L)
-  session$setInputs(investigate_median_step = 0, investigate_draw_median = 6)
-  stopifnot(!session$isClosed(), grepl("scan factor", tail(signals$errors, 1)[[1]]$message))
-  session$setInputs(investigate_median_step = 1, investigate_draw_median = 7)
-  stopifnot(investigate_median()$scans == 9L, !session$isClosed())
-  for (statistic in c("max", "min")) {
-    session$setInputs(investigate_median_statistic = statistic)
-    stopifnot(grepl("Settings changed", output$investigate_median_status))
-    session$setInputs(investigate_draw_median = paste0("calculate-", statistic))
-    same(investigate_median()$statistic, statistic)
-    same(investigate_median()$data$intensity, apply(median_oracle[2:10, , drop = FALSE], 2, get(statistic)))
-    reads <- length(signals$batches)
-    session$setInputs(investigate_draw_median = paste0("repeat-", statistic))
-    stopifnot(length(signals$batches) == reads)
-  }
-  session$setInputs(`plotly_click-metabomeister_investigate` = '{"x":100.25,"y":1,"z":10,"curveNumber":0}')
-  same(as.numeric(signals$input_updates$investigate_center$value), 100.25)
-  session$setInputs(investigate_slice_axis = "time", investigate_time_mode = "combine",
-    investigate_time_center = 1, investigate_time_window = 60,
-    investigate_spectrum_bin_width = 0.01, investigate_spectrum_count = 5,
-    investigate_spectrum_mz_min = 99.9, investigate_spectrum_mz_max = 101,
-    investigate_draw_slice = 3)
-  stopifnot(investigate_trace()$mode == "combine", investigate_trace()$scan_count == 3L)
-  session$setInputs(investigate_time_mode = "overlay", investigate_time_center = 1.2,
-    investigate_time_window = 120, investigate_spectrum_count = 3, investigate_draw_slice = 4)
-  same(vapply(investigate_trace()$spectra, function(s) s$time, numeric(1)), c(1, 2, 0))
-  reads <- length(signals$batches)
-  session$setInputs(investigate_y_max = 400, investigate_draw_slice = 5)
-  stopifnot(length(signals$batches) == reads)
-  session$setInputs(`plotly_click-metabomeister_investigate` = '{"x":100,"y":2,"z":20,"curveNumber":0}')
-  same(as.numeric(signals$input_updates$investigate_time_center$value), 2)
-  session$setInputs(investigate_mz_max = 90, investigate_draw_3d = 4)
-  stopifnot(is.null(investigate_grid()), !session$isClosed(), grepl("minimum < maximum", tail(signals$errors, 1)[[1]]$message))
-  session$setInputs(investigate_mz_max = 101, investigate_draw_3d = 5)
-  stopifnot(!is.null(investigate_grid()), !session$isClosed())
-  closed <- signals$closes
-  session$setInputs(investigate_load = 2)
-  stopifnot(signals$closes == closed + 1L, is.null(investigate_grid()), is.null(investigate_trace()), is.null(investigate_median()))
-  session$setInputs(investigate_clear = 1)
-  stopifnot(is.null(investigate_raw()), signals$closes == closed + 2L)
-  session$setInputs(investigate_load = 3)
-  stopifnot(!is.null(investigate_raw()))
-})
-stopifnot(signals$opens == signals$closes)
-same(unname(tools::md5sum(fixture_path)), hash_before)
-cat("PASS: independent fixed 0.01/four-decimal 3D/median widths; per-scan linear filling against an independent oracle, recorded zeros/edges preserved; exact m/z traces; native sampling; adjacent grouped means; independent-window/subsampled medians with skipped-scan I/O checks, sparse-zero and disk-spill paths; three-decimal bounds and default grouping/physical widths; bounded peak-preserving SVG median with full-detail cached zoom/reset; light palette; combined time-window means and original spectra overlays in nearest-first colour order; bounded batches/grid; actual guarded GUI actions, masked progress functions, cached intensity updates, axis-aware clicks, recovery and handle cleanup.\n")
+# Shared Engine loading and persistent extrema replace the old independent
+# raw-upload GUI. Keep the numerical coverage above and exercise the new GUI
+# handlers plus persistent caches in their dedicated test environment.
+local(source("tests/investigate-cache.R", local = TRUE))
 
 # New UI IDs are unique, and the menu places Investigate between Engine and Visualization.
 suppressPackageStartupMessages({ library(shinydashboard); library(DT); library(shinyjs); library(waiter) })
@@ -540,7 +394,7 @@ stopifnot(!grepl("Time is shown in minutes|Saved analyses do not contain|investi
   !grepl("Time uses the typical scan interval|Last groups may be smaller", ui_text))
 select_tag <- htmltools::tagQuery(actual_ui)$find("#investigate_median_statistic")$selectedTags()[[1]]
 select_markup <- htmltools::renderTags(select_tag)$html
-stopifnot(grepl('<option value="median" selected', select_markup, fixed = TRUE),
+stopifnot(grepl('<option value="max" selected', select_markup, fixed = TRUE),
   grepl('<option value="max"', select_markup, fixed = TRUE),
   grepl('<option value="min"', select_markup, fixed = TRUE))
-cat("PASS: concise UI and Median/Maximum/Minimum choices with Median default.\n")
+cat("PASS: concise UI and Median/Maximum/Minimum choices with Maximum default.\n")

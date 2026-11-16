@@ -1,25 +1,10 @@
-# MetaboMeister adds a read-only Investigate tab in section Matabo3.6.
-# Investigate measures native MS1 spacing/counts once, groups adjacent readings
-# by mean intensity, and computes an exact time-range median spectrum using
-# sparse values and bounded temporary partitions when needed. Median time
-# controls are independent, with a scan stride that skips spectra before reading.
-# Display bounds use three decimals; grouping defaults to 40 m/z and 20 time
-# readings and reports their typical widths in Da/seconds. Shared native
-# mass coordinates are retained; differing axes use an adjustable alignment grid.
-# The time-summary spectrum offers median, maximum and minimum; extrema use
-# a single streaming pass over the same aligned/interpolated retained scans.
-# Independent 3D/median alignment widths default to 0.01 Da (four decimals).
-# Median alignment linearly fills internal empty bins between nonzero
-# neighbours before computing statistics; recorded zeros/outer gaps are retained.
-# The median uses a bounded SVG display with peak-preserving extrema and
-# cached full-detail zoom, avoiding WebGL dependence in RStudio's viewer.
-# The light 3D palette and combined/overlaid time-window spectra are retained.
-# Investigate explicitly uses Shiny's progress functions so packages loaded
-# later cannot mask numeric progress updates for raw-data actions.
-# mzR reads raw MS1 scans in small batches; only a bounded grid is sent to the
-# 3D plot. Cross-sections use the original scans, not that preview grid.
-# Raw handles close on Clear, replacement or session end. Analysis code and
-# original numbered section comments are preserved.
+# MetaboMeister: Engine reads each upload once and retains uncalibrated spectra.
+# Investigate reuses that snapshot. Maximum/Minimum share a fixed 0.001 Da grid
+# and paired indexed SQLite slice caches under Results/<mz5 basename>/.
+# Cached windows update only SVG curve coordinates, preserving both view axes.
+# Median keeps its independent range, stride, alignment and sparse exact method.
+# Existing scientific processing uses a deep copy of the Engine object.
+# Original numbered section comments and their order are preserved.
 # Original numbered section comments are restored in their original order.
 # Reorganized tasks include pointers to their current function implementations;
 # the removed pseudo-file section is retained as a comment-only historical marker.
@@ -646,6 +631,7 @@ server <- function(input, output, session){
                stringsAsFactors = FALSE)
   }
   uploadedmz5 <- reactiveVal(empty_mz5_files())
+  engine_loaded <- reactiveVal(list())
   selected_saved_run <- reactiveVal(character())
   analysis_mode <- reactive({
     if (identical(input$analysis_mode, "existing")) "existing" else "new"
@@ -784,6 +770,8 @@ server <- function(input, output, session){
     current <- uploadedmz5()
     current <- current[current$Source == "upload", , drop = FALSE]
     uploadedmz5(rbind(current, newFiles))
+    # Matabo3.1 Share one Engine read with analysis and Investigate.
+    for (i in seq_len(nrow(newFiles))) engine_load_upload(newFiles$FilePath[i], newFiles$FileName[i])
     if (isTRUE(input$autorun)) request_new_analysis()
   })
 
@@ -1186,14 +1174,18 @@ server <- function(input, output, session){
   }
 
   #####Matabo3.6 Investigate raw m/z, time and intensity#####
-  # This independent, read-only workflow uses an Engine upload or its own raw
-  # upload. It never starts analysis, calibrates spectra or writes result files.
+  # Engine owns the raw read. Investigate uses immutable uncalibrated spectra.
+  # Fine extrema caches are shared by every dated analysis of the same run.
   investigate_raw <- reactiveVal(NULL)
   investigate_grid <- reactiveVal(NULL)
   investigate_trace <- reactiveVal(NULL)
   investigate_median <- reactiveVal(NULL)
   investigate_median_view <- reactiveVal(NULL)
   investigate_median_time_custom <- reactiveVal(FALSE)
+  investigate_cache <- reactiveVal(NULL)
+  investigate_plot_generation <- reactiveVal(0L)
+  investigate_activation <- reactiveVal(0L)
+  investigate_width <- reactiveVal("full")
 
   ######Matabo3.6.1 Raw-file metadata, validation and bounded scan reading######
   investigate_range <- function(values, label, nonnegative = TRUE) {
@@ -1254,6 +1246,7 @@ server <- function(input, output, session){
   }
 
   investigate_walk_scans <- function(raw, time_range, callback, progress = function(fraction) NULL) {
+    if (is.null(raw$read_peaks)) stop("Load the original mz5 through Engine for raw spectra.")
     selected <- which(raw$times >= time_range[1] & raw$times <= time_range[2])
     if (!length(selected)) stop("No MS1 scans fall inside the selected time range.", call. = FALSE)
     # Eight spectra at a time bounds memory independently of total file size.
@@ -1294,6 +1287,191 @@ server <- function(input, output, session){
     raw$range_source <- "all valid MS1 measurements"
     raw$alignment_width <- 0.01
     raw
+  }
+
+  ######Matabo3.6.2a Shared Engine snapshots and persistent fine extrema######
+  investigate_from_engine <- function(run_data, name) {
+    # Materialize numeric vectors before Engine can mutate its assayData environment.
+    spectra <- MSnbase::spectra(run_data)
+    times <- vapply(spectra, function(s) s@rt / 60, numeric(1))
+    keep <- which(vapply(spectra, function(s) s@msLevel == 1L, logical(1)) &
+                    is.finite(times) & times >= 0)
+    keep <- keep[order(times[keep])]
+    if (!length(keep)) stop("No valid MS1 scans in the Engine upload.")
+    scans <- lapply(spectra[keep], function(s) cbind(mz = s@mz, intensity = s@intensity))
+    investigate_memory_raw(scans, times[keep], name)
+  }
+
+  investigate_memory_raw <- function(spectra, times, name) {
+    # This reader only indexes Engine's snapshot; it never touches the mz5 file.
+    raw <- list(name = basename(name), scans = seq_along(times), times = times,
+      time_range = range(times), handle = spectra,
+      read_peaks = function(handle, scans) handle[scans], closer = function(handle) NULL)
+    if (!length(times)) stop("No MS1 scans in the Engine upload.")
+    if (diff(raw$time_range) == 0) raw$time_range <- raw$time_range + c(-1, 1)/120
+    raw <- investigate_measure_sampling(raw)
+    raw$fingerprint <- digest::digest(list(name = raw$name, times = times, spectra = spectra), algo = "sha256")
+    raw
+  }
+
+  investigate_cache_settings <- function(raw) {
+    end <- max(raw$times)
+    # A single grid anchored at zero, including complete equal-width edge cells.
+    first <- floor(raw$mz_range[1] * 1000)
+    last <- max(first + 1, ceiling(raw$mz_range[2] * 1000))
+    if (last - first > 2e6) stop("The fine spectrum grid exceeds 2,000,000 bins.")
+    breaks <- if (end > 1.2) sort(unique(c(1.2, seq.int(2, max(2, ceiling(end)))[seq.int(2, max(2, ceiling(end))) < end], end))) else numeric()
+    list(version = 1L, fingerprint = raw$fingerprint, name = raw$name,
+      dmz = 0.001, first = first, bins = as.integer(last - first), block = 4096L,
+      breaks = breaks, times = raw$times, interpolation = "internal-nonzero-neighbours-v1",
+      alignment = "per-scan-bin-mean;zero-outer-gaps;half-open-time-final-inclusive")
+  }
+
+  investigate_cache_paths <- function(parent) {
+    file.path(parent, c("max_mz_spec_dmz0.001.sqlite", "min_mz_spec_dmz0.001.sqlite"))
+  }
+
+  investigate_cache_open <- function(parent, raw = NULL) {
+    paths <- investigate_cache_paths(parent)
+    if (!all(file.exists(paths))) return(NULL)
+    tryCatch({
+      metadata <- lapply(paths, function(path) {
+        con <- DBI::dbConnect(RSQLite::SQLite(), path, flags = RSQLite::SQLITE_RO)
+        on.exit(DBI::dbDisconnect(con))
+        row <- DBI::dbGetQuery(con, "SELECT payload FROM metadata WHERE id=1")
+        if (nrow(row) != 1L) stop("Missing cache metadata.")
+        meta <- unserialize(row$payload[[1]])
+        if (!isTRUE(meta$complete) || meta$settings$version != 1L ||
+            !identical(meta$settings$dmz, 0.001) ||
+            !identical(meta$settings$interpolation, "internal-nonzero-neighbours-v1") ||
+            !identical(meta$settings$alignment, "per-scan-bin-mean;zero-outer-gaps;half-open-time-final-inclusive") ||
+            !identical(meta$settings$block, 4096L) ||
+            !identical(meta$settings, investigate_cache_settings(meta$raw))) stop("Outdated cache settings.")
+        expected <- sum(meta$counts > 0L) * ceiling(meta$settings$bins/meta$settings$block)
+        if (DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM blocks")$n != expected ||
+            DBI::dbGetQuery(con, "PRAGMA quick_check")[[1]][1] != "ok") stop("Incomplete cache.")
+        meta
+      })
+      if (!identical(metadata[[1]], metadata[[2]])) return(NULL)
+      meta <- metadata[[1]]
+      if (!is.null(raw) && !identical(meta$settings, investigate_cache_settings(raw))) return(NULL)
+      list(paths = paths, meta = meta)
+    }, error = function(e) NULL)
+  }
+
+  investigate_cache_build <- function(raw, parent, progress = function(fraction) NULL) {
+    existing <- investigate_cache_open(parent, raw)
+    if (!is.null(existing)) return(existing)
+    settings <- investigate_cache_settings(raw)
+    if (length(settings$breaks) < 2L) stop("No recorded run interval after 1.2 minutes.")
+    dir.create(parent, recursive = TRUE, showWarnings = FALSE)
+    paths <- investigate_cache_paths(parent)
+    temporary <- vapply(paths, function(path) tempfile(paste0(basename(path), "-"), parent), character(1))
+    connections <- list()
+    on.exit({
+      for (con in connections) if (DBI::dbIsValid(con)) DBI::dbDisconnect(con)
+      unlink(temporary)
+    }, add = TRUE)
+    for (path in temporary) {
+      con <- DBI::dbConnect(RSQLite::SQLite(), path)
+      connections[[length(connections) + 1L]] <- con
+      DBI::dbExecute(con, "CREATE TABLE metadata (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)")
+      DBI::dbExecute(con, "CREATE TABLE blocks (slice INTEGER, block INTEGER, value BLOB NOT NULL, PRIMARY KEY(slice,block)) WITHOUT ROWID")
+      DBI::dbBegin(con)
+    }
+    edges <- (settings$first + seq.int(0, settings$bins))/1000
+    axis <- list(mz = head(edges, -1) + 0.0005, edges = edges,
+      native = FALSE, mz_range = range(edges), width = 0.001)
+    membership <- findInterval(raw$times, settings$breaks, rightmost.closed = TRUE)
+    eligible <- which(raw$times >= 1.2 & raw$times <= tail(settings$breaks, 1))
+    counts <- integer(length(settings$breaks) - 1L)
+    completed <- 0L
+    for (slice in seq_along(counts)) {
+      selected <- eligible[membership[eligible] == slice]
+      counts[slice] <- length(selected)
+      if (!length(selected)) next # An empty slice is absent, never a zero observation.
+      minimum <- rep(Inf, settings$bins); maximum <- rep(-Inf, settings$bins)
+      for (index in selected) {
+        scan <- raw$read_peaks(raw$handle, scans = raw$scans[index])
+        if (is.list(scan)) scan <- scan[[1]]
+        aligned <- investigate_interpolate_empty(investigate_align_scan(investigate_clean_scan(scan), axis), axis)
+        values <- numeric(settings$bins)
+        values[aligned$columns] <- aligned$values
+        minimum <- pmin(minimum, values); maximum <- pmax(maximum, values)
+        completed <- completed + 1L
+        progress(completed/length(eligible))
+      }
+      for (start in seq.int(1L, settings$bins, by = settings$block)) {
+        rows <- seq.int(start, min(settings$bins, start + settings$block - 1L))
+        block <- (start - 1L) %/% settings$block
+        for (i in 1:2) DBI::dbExecute(connections[[i]],
+          "INSERT INTO blocks VALUES (?, ?, ?)", params = list(slice, block,
+            list(writeBin(if (i == 1L) maximum[rows] else minimum[rows], raw(), size = 8L, endian = "little"))))
+      }
+    }
+    # Both files carry identical source/settings/generation metadata, written last.
+    saved_raw <- raw[c("name", "times", "scans", "time_range", "mz_range", "sampling", "alignment_width", "range_source", "fingerprint")]
+    meta <- list(settings = settings, counts = counts, raw = saved_raw,
+      generation = basename(tempfile("extrema-")), complete = TRUE)
+    for (con in connections) {
+      DBI::dbExecute(con, "INSERT INTO metadata VALUES (1, ?)", params = list(list(serialize(meta, NULL))))
+      DBI::dbCommit(con)
+      DBI::dbDisconnect(con)
+    }
+    # A crash between renames leaves mismatched generations, rejected on reopen.
+    for (i in 1:2) if (!file.rename(temporary[i], paths[i])) stop("Cannot publish the fine spectrum cache.")
+    investigate_cache_open(parent, raw)
+  }
+
+  investigate_window_choices <- function(cache, width = "full") {
+    breaks <- cache$meta$settings$breaks
+    if (identical(as.character(width), "full")) return(matrix(range(breaks), nrow = 1L))
+    width <- suppressWarnings(as.numeric(width))
+    if (length(width) != 1L || !is.finite(width) || width <= 0) stop("Choose a positive window width.")
+    ends <- outer(breaks, breaks, function(a, b) abs(b - a - width) < 1e-8)
+    pairs <- which(ends, arr.ind = TRUE)
+    if (!nrow(pairs)) stop("No saved boundaries match this window width.")
+    cbind(breaks[pairs[, 1]], breaks[pairs[, 2]])[order(pairs[, 1]), , drop = FALSE]
+  }
+
+  investigate_cache_spectrum <- function(cache, statistic, time_range, mz_range = NULL) {
+    if (!statistic %in% c("max", "min")) stop("The fine cache contains Maximum and Minimum only.")
+    settings <- cache$meta$settings
+    if (is.null(mz_range)) mz_range <- c(settings$first, settings$first + settings$bins)/1000
+    # Read only intersecting mass blocks, retaining one neighbour for line continuity.
+    first <- max(1, min(settings$bins, ceiling(mz_range[1] * 1000 - settings$first + 0.5) - 1))
+    last <- max(first, min(settings$bins, floor(mz_range[2] * 1000 - settings$first + 0.5) + 1))
+    rows <- seq.int(first, last)
+    centers <- (settings$first + rows - 0.5)/1000
+    blocks <- unique((rows - 1L) %/% settings$block)
+    slices <- which(head(settings$breaks, -1) >= time_range[1] - 1e-9 &
+      tail(settings$breaks, -1) <= time_range[2] + 1e-9 & cache$meta$counts > 0L)
+    con <- DBI::dbConnect(RSQLite::SQLite(), cache$paths[if (statistic == "max") 1L else 2L], flags = RSQLite::SQLITE_RO)
+    on.exit(DBI::dbDisconnect(con))
+    current <- DBI::dbGetQuery(con, "SELECT payload FROM metadata WHERE id=1")
+    if (nrow(current) != 1L || !identical(unserialize(current$payload[[1]]), cache$meta)) {
+      stop("The run's spectrum cache changed. Reopen the run through Engine.")
+    }
+    sql <- sprintf("SELECT slice,block,value FROM blocks WHERE slice IN (%s) AND block IN (%s) ORDER BY block,slice",
+      paste(as.integer(slices), collapse = ","), paste(as.integer(blocks), collapse = ","))
+    result <- DBI::dbGetQuery(con, sql)
+    if (nrow(result) != length(slices) * length(blocks)) stop("The spectrum cache is incomplete; reload through Engine.")
+    values <- rep(if (statistic == "max") -Inf else Inf, length(rows))
+    reduce <- if (statistic == "max") pmax else pmin
+    for (i in seq_len(nrow(result))) {
+      selected <- which((rows - 1L) %/% settings$block == result$block[i])
+      block_values <- readBin(result$value[[i]], numeric(), n = settings$block, size = 8L, endian = "little")
+      offset <- rows[selected] - result$block[i] * settings$block
+      if (length(block_values) < max(offset)) stop("Truncated spectrum cache block.")
+      values[selected] <- reduce(values[selected], block_values[offset])
+    }
+    if (!length(slices)) values[] <- NA_real_ # Empty window: a gap, never a false zero.
+    list(data = data.frame(mz = centers, intensity = values),
+      mz_range = c(settings$first, settings$first + settings$bins)/1000,
+      time_range = time_range, scans = sum(cache$meta$counts[slices]),
+      available_scans = sum(cache$meta$counts), scan_step = 1L, native = FALSE,
+      alignment_width = 0.001, statistic = statistic, cached = TRUE,
+      key = c(settings$fingerprint, statistic), blocks_read = nrow(result))
   }
 
   investigate_alignment_value <- function(value) {
@@ -1595,6 +1773,7 @@ server <- function(input, output, session){
     list(data = spectrum$data[rows, , drop = FALSE], x_range = x_range, y_range = y_range,
       shown = sum(x[rows] >= x_range[1] & x[rows] <= x_range[2]), visible = visible,
       total = n, key = spectrum$key,
+      cached = isTRUE(spectrum$cached),
       statistic = if (is.null(spectrum$statistic)) "median" else spectrum$statistic)
   }
 
@@ -1626,7 +1805,7 @@ server <- function(input, output, session){
       hovertemplate = paste0("m/z: %{x:.7f}<br>", label, " intensity: %{y:.6g}<extra></extra>")) %>%
       plotly::layout(uirevision = paste(display$key, collapse = ":"), dragmode = "zoom",
         xaxis = list(title = "m/z", range = display$x_range),
-        yaxis = list(title = paste(label, "intensity (ion counts)"), range = display$y_range),
+        yaxis = list(title = if (isTRUE(display$cached)) "Intensity (ion counts)" else paste(label, "intensity (ion counts)"), range = display$y_range),
         margin = list(l = 70, r = 20, b = 55, t = 20)) %>%
       plotly::config(scrollZoom = TRUE, displaylogo = FALSE, displayModeBar = TRUE,
         modeBarButtonsToRemove = c("select2d", "lasso2d")) %>%
@@ -1820,57 +1999,90 @@ server <- function(input, output, session){
   }
 
   ######Matabo3.6.3 File selection, range controls and guarded GUI actions######
-  observe_updates({
-    files <- uploadedmz5()
-    files <- files[files$Source == "upload" & !is.na(files$FilePath) & file.exists(files$FilePath), , drop = FALSE]
-    current <- isolate(input$investigate_engine_file)
-    paths <- files$FilePath
+  investigate_activate <- function(raw, cache = NULL) {
+    investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL)
+    investigate_median_view(NULL); investigate_median_time_custom(FALSE)
+    investigate_raw(raw); investigate_cache(cache)
+    investigate_width("full")
+    investigate_activation(isolate(investigate_activation()) + 1L)
+    if (is.null(raw)) return(invisible(NULL))
+    mz_bounds <- investigate_display_range(raw$mz_range)
+    time_bounds <- investigate_display_range(raw$time_range)
+    defaults <- list(investigate_mz_min = mz_bounds[1], investigate_mz_max = mz_bounds[2],
+      investigate_time_min = 1.2, investigate_time_max = time_bounds[2],
+      investigate_median_time_min = time_bounds[1], investigate_median_time_max = time_bounds[2],
+      investigate_slice_time_min = time_bounds[1], investigate_slice_time_max = time_bounds[2],
+      investigate_time_center = raw$times[ceiling(length(raw$times)/2)],
+      investigate_spectrum_mz_min = mz_bounds[1], investigate_spectrum_mz_max = mz_bounds[2],
+      investigate_mz_group = 40, investigate_time_group = 20,
+      investigate_alignment_width = 0.01, investigate_median_alignment_width = 0.01)
+    targets <- suppressWarnings(as.numeric(c(refMassListData()$mz, massData()$mz)))
+    targets <- targets[is.finite(targets) & targets >= raw$mz_range[1] & targets <= raw$mz_range[2]]
+    defaults$investigate_center <- if (length(targets)) targets[1] else mean(raw$mz_range)
+    for (id in names(defaults)) updateNumericInput(session, id, value = defaults[[id]])
+    if (!is.null(cache)) {
+      breaks <- cache$meta$settings$breaks
+      widths <- sort(unique(round(as.vector(outer(breaks, breaks, "-")), 9)))
+      widths <- widths[widths > 0 & widths < diff(range(breaks)) - 1e-8]
+      updateSelectInput(session, "investigate_window_width", choices = c("Full run" = "full",
+        stats::setNames(as.character(widths), paste(format(widths, trim = TRUE), "min"))), selected = "full")
+    }
+    investigate_position(1L)
+    updateSliderInput(session, "investigate_window_position", min = 1, max = 2, value = 1, step = 1)
+    shinyjs::disable("investigate_window_position")
+    updateSelectInput(session, "investigate_median_statistic", selected = "max")
+    invisible(raw)
+  }
+
+  engine_load_upload <- function(path, name) {
+    entries <- isolate(engine_loaded())
+    if (is.null(entries[[path]])) {
+      data <- shiny::withProgress(message = paste("Reading Engine upload:", name), value = 0, {
+        read_mz5_data(path, 1)
+      })
+      raw <- investigate_from_engine(data, name)
+      entries[[path]] <- list(data = data, raw = raw)
+      engine_loaded(entries)
+    }
+    raw <- entries[[path]]$raw
+    cache <- NULL
+    if (max(raw$times) > 1.2) {
+      cache <- with_action_error({
+        shiny::withProgress(message = "Caching Maximum and Minimum spectra", value = 0, {
+          investigate_cache_build(raw, mz5_result_parent(name),
+            progress = function(fraction) shiny::setProgress(value = fraction))
+        })
+      }, "Investigate: cache fine spectra")
+    }
+    investigate_activate(raw, cache)
     updateSelectInput(session, "investigate_engine_file",
-      choices = c("Select a raw upload" = "", stats::setNames(paths, files$FileName)),
-      selected = if (length(current) == 1L && current %in% paths) current else if (length(paths)) paths[1] else "")
+      choices = stats::setNames(names(entries), vapply(entries, function(x) x$raw$name, character(1))), selected = path)
+    invisible(entries[[path]])
+  }
+
+  observe_action(input$investigate_engine_file, {
+    path <- input$investigate_engine_file
+    if (length(path) != 1L || is.na(path) || !nzchar(path)) return()
+    entry <- engine_loaded()[[path]]
+    if (!is.null(entry) && !identical(investigate_raw()$fingerprint, entry$raw$fingerprint)) {
+      investigate_activate(entry$raw, investigate_cache_open(mz5_result_parent(entry$raw$name), entry$raw))
+    }
+  })
+
+  observe_action(input$existing_run, {
+    if (!identical(input$analysis_mode, "existing")) return()
+    run <- input$existing_run
+    if (length(run) != 1L || is.na(run) || !nzchar(run) ||
+        run %in% c(".", "..") || grepl("[/\\\\]", run)) return()
+    cache <- investigate_cache_open(file.path(".", "Results", run))
+    if (!is.null(cache) && identical(sub("\\.mz5$", "", cache$meta$raw$name, ignore.case = TRUE), run)) {
+      investigate_activate(cache$meta$raw, cache)
+      updateSelectInput(session, "investigate_engine_file", choices = stats::setNames("", cache$meta$raw$name), selected = "")
+    } else investigate_activate(NULL)
   })
 
   observe_action(input$investigate_clear, {
-    investigate_close_raw(investigate_raw())
-    investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_view(NULL); investigate_median_time_custom(FALSE)
-  })
-  session$onSessionEnded(function() investigate_close_raw(isolate(investigate_raw())))
-
-  observe_action(input$investigate_load, {
-    with_action_error({
-      investigate_close_raw(investigate_raw())
-      investigate_raw(NULL); investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL); investigate_median_view(NULL); investigate_median_time_custom(FALSE)
-      if (identical(input$investigate_source, "upload")) {
-        file <- input$investigate_raw_file
-        if (is.null(file) || !nrow(file)) stop("Select the original .mz5 file in Investigate first.")
-        path <- file$datapath[1]; name <- file$name[1]
-      } else {
-        files <- uploadedmz5()
-        selected <- which(files$Source == "upload" & files$FilePath == input$investigate_engine_file)
-        if (!length(selected)) stop("No Engine raw upload is selected. Upload a .mz5 in Engine or select another file here.")
-        path <- files$FilePath[selected[1]]; name <- files$FileName[selected[1]]
-      }
-      raw <- shiny::withProgress(message = "Measuring native MS1 sampling (one pass)", value = 0, {
-        investigate_open_raw(path, name, progress = function(fraction) shiny::setProgress(value = fraction))
-      })
-      investigate_raw(raw)
-      mz_bounds <- investigate_display_range(raw$mz_range)
-      time_bounds <- investigate_display_range(raw$time_range)
-      defaults <- list(investigate_mz_min = mz_bounds[1], investigate_mz_max = mz_bounds[2],
-        investigate_time_min = time_bounds[1], investigate_time_max = time_bounds[2],
-        investigate_median_time_min = time_bounds[1], investigate_median_time_max = time_bounds[2],
-        investigate_slice_time_min = time_bounds[1], investigate_slice_time_max = time_bounds[2],
-        investigate_time_center = raw$times[ceiling(length(raw$times)/2)],
-        investigate_spectrum_mz_min = mz_bounds[1], investigate_spectrum_mz_max = mz_bounds[2])
-      defaults$investigate_mz_group <- 40
-      defaults$investigate_time_group <- 20
-      defaults$investigate_alignment_width <- 0.01
-      defaults$investigate_median_alignment_width <- 0.01
-      targets <- suppressWarnings(as.numeric(c(refMassListData()$mz, massData()$mz)))
-      targets <- targets[is.finite(targets) & targets >= raw$mz_range[1] & targets <= raw$mz_range[2]]
-      defaults$investigate_center <- if (length(targets)) targets[1] else mean(raw$mz_range)
-      for (id in names(defaults)) updateNumericInput(session, id, value = defaults[[id]])
-    }, "Investigate: load raw file")
+    investigate_activate(NULL)
   })
 
   # Only explicit typing/pasting in a median time field detaches its defaults.
@@ -1950,32 +2162,106 @@ server <- function(input, output, session){
     }, "Investigate: extract m/z cross-section")
   })
 
+  investigate_position <- reactiveVal(1L)
+  investigate_window <- reactive({
+    cache <- investigate_cache()
+    req(cache)
+    tryCatch(investigate_window_choices(cache, investigate_width()),
+      error = function(e) investigate_window_choices(cache, "full"))
+  })
+  observe_action(input$investigate_window_width, {
+    req(investigate_cache())
+    investigate_width(input$investigate_window_width)
+    windows <- investigate_window()
+    investigate_position(1L)
+    updateSliderInput(session, "investigate_window_position", min = 1, max = max(2, nrow(windows)), value = 1, step = 1)
+    if (nrow(windows) == 1L) shinyjs::disable("investigate_window_position") else shinyjs::enable("investigate_window_position")
+  })
+  observe_action(input$investigate_window_position, {
+    req(input$investigate_window_position)
+    investigate_position(as.integer(input$investigate_window_position))
+  })
+  observe_action(input$investigate_window_live, {
+    req(input$investigate_window_live)
+    investigate_position(as.integer(input$investigate_window_live))
+  })
+
+  investigate_update_cached <- function(view = isolate(investigate_median_view()), rebuild = FALSE) {
+    cache <- investigate_cache()
+    req(cache)
+    statistic <- if (is.null(input$investigate_median_statistic)) "max" else input$investigate_median_statistic
+    if (!statistic %in% c("max", "min")) return(invisible(NULL))
+    windows <- investigate_window()
+    index <- max(1L, min(nrow(windows), investigate_position()))
+    interval <- as.numeric(windows[index, ])
+    previous <- investigate_median()
+    spectrum <- investigate_cache_spectrum(cache, statistic, interval, if (!is.null(view)) view$x else NULL)
+    # Keep the established full-run scale even when only a visible region is queried.
+    spectrum$intensity_range <- if (!is.null(previous) && isTRUE(previous$cached)) previous$intensity_range else
+      investigate_intensity_range(spectrum$data$intensity)
+    investigate_median(spectrum)
+    if (rebuild || is.null(previous) || !isTRUE(previous$cached)) {
+      investigate_plot_generation(isolate(investigate_plot_generation()) + 1L)
+    } else {
+      display <- investigate_median_view_data(spectrum, view)
+      label <- investigate_summary_label(statistic)
+      # Only the curve/hover text changes. Neither axis nor the SVG widget is rebuilt.
+      plotly::plotlyProxy("investigate_median_plot", session) %>% plotly::plotlyProxyInvoke("restyle",
+        list(x = list(display$data$mz), y = list(display$data$intensity),
+          name = paste(label, "MS1 intensity"),
+          hovertemplate = paste0("m/z: %{x:.7f}<br>", label, " intensity: %{y:.6g}<extra></extra>")), list(0L))
+    }
+    invisible(spectrum)
+  }
+
+  observe_action(list(investigate_cache(), investigate_activation(), input$investigate_median_statistic,
+                      investigate_width(), investigate_position()), {
+    if (!is.null(investigate_cache())) investigate_update_cached()
+  })
+  output$investigate_window_interval <- renderText({
+    if (is.null(investigate_cache())) return("No fine cache available.")
+    windows <- investigate_window()
+    index <- max(1L, min(nrow(windows), investigate_position()))
+    paste0(paste(format(windows[index, ], digits = 10, trim = TRUE), collapse = "–"), " min")
+  })
+
   observe_action(input$investigate_draw_median, {
     with_action_error({
       raw <- investigate_raw()
-      if (is.null(raw)) stop("Load a raw .mz5 file first.")
+      if (is.null(raw)) stop("Load an mz5 through Engine first.")
+      statistic <- investigate_summary_statistic(input$investigate_median_statistic)
+      if (statistic != "median") {
+        investigate_update_cached()
+        return()
+      }
+      if (is.null(raw$read_peaks)) stop("Median requires the original upload loaded through Engine.")
       mz_range <- investigate_range(c(input$investigate_mz_min, input$investigate_mz_max), "Spectrum m/z range")
       time_range <- investigate_range(c(input$investigate_median_time_min, input$investigate_median_time_max), "Spectrum time range")
       width <- if (raw$sampling$shared) NULL else investigate_alignment_value(input$investigate_median_alignment_width)
-      statistic <- investigate_summary_statistic(input$investigate_median_statistic)
       key <- c(raw$name, mz_range, time_range, width, input$investigate_median_step, statistic)
       previous <- investigate_median()
       spectrum <- if (!is.null(previous) && identical(previous$key, key)) previous else {
-        investigate_median(NULL); investigate_median_view(NULL)
-        shiny::withProgress(message = paste(investigate_summary_label(statistic), "spectrum"), value = 0, {
-          investigate_median_spectrum(raw, mz_range, time_range, width, scan_step = input$investigate_median_step, statistic = statistic,
-            progress = function(fraction) shiny::setProgress(value = fraction))
+        investigate_median_view(NULL)
+        shiny::withProgress(message = "Median spectrum", value = 0, {
+          investigate_median_spectrum(raw, mz_range, time_range, width, scan_step = input$investigate_median_step,
+            statistic = "median", progress = function(fraction) shiny::setProgress(value = fraction))
         })
       }
       spectrum$key <- key
       spectrum$intensity_range <- investigate_intensity_range(spectrum$data$intensity)
       investigate_median(spectrum)
+      investigate_plot_generation(isolate(investigate_plot_generation()) + 1L)
     }, "Investigate: spectrum summary")
   })
+
   observe_action(input$investigate_reset_median, {
     req(investigate_median())
     spectrum <- investigate_median()
     investigate_median_view(NULL)
+    if (isTRUE(spectrum$cached)) {
+      investigate_update_cached(list(x = spectrum$mz_range, y = spectrum$intensity_range), rebuild = FALSE)
+      spectrum <- investigate_median()
+    }
     display <- investigate_median_view_data(spectrum)
     proxy <- plotly::plotlyProxy("investigate_median_plot", session)
     proxy %>% plotly::plotlyProxyInvoke("restyle",
@@ -1994,6 +2280,9 @@ server <- function(input, output, session){
     # these to avoid a relayout/render loop and preserve the user's zoom.
     if (!isTRUE(all.equal(next_view, effective, tolerance = 1e-12))) {
       investigate_median_view(next_view)
+      if (isTRUE(spectrum$cached)) {
+        investigate_update_cached(next_view, rebuild = FALSE)
+      }
       display <- investigate_median_display()
       # Replace trace coordinates only. Rebuilding the whole widget here can
       # interrupt a second drag while the first zoom response is arriving.
@@ -2040,12 +2329,12 @@ server <- function(input, output, session){
   }
   output$investigate_status <- renderText({
     raw <- investigate_raw()
-    if (is.null(raw)) return("Load a raw file to measure native MS1 sampling once, then choose a plot.")
+    if (is.null(raw)) return("Upload an mz5 in Engine, or open a saved run.")
     sampling <- raw$sampling
     mass_count <- if (sampling$shared) paste0(length(sampling$mz_axis), " shared native m/z positions") else
       paste0("m/z positions vary: ", paste(sampling$mz_count_range, collapse = "–"),
         " per spectrum; no single shared native m/z axis")
-    paste0("Loaded: ", raw$name, " | ", sampling$time_count, " MS1 time slices (",
+    paste0(if (is.null(raw$read_peaks)) "Saved cache: " else "Engine data: ", raw$name, " | ", sampling$time_count, " MS1 time slices (",
       sampling$time_unique, " distinct times)\n",
       "m/z: ", paste(round(raw$mz_range, 3), collapse = " to "), " | Time: ",
       paste(round(range(raw$times), 3), collapse = " to "), " min\n",
@@ -2082,6 +2371,9 @@ server <- function(input, output, session){
   output$investigate_median_status <- renderText({
     spectrum <- investigate_median()
     if (is.null(spectrum)) return("No spectrum calculated yet.")
+    if (isTRUE(spectrum$cached)) return(paste0(investigate_summary_label(spectrum$statistic),
+      ": ", paste(format(spectrum$time_range, digits = 10, trim = TRUE), collapse = "–"),
+      " min; ", spectrum$scans, " MS1 scans; 0.001 Da cache."))
     raw <- investigate_raw()
     current <- c(raw$name, input$investigate_mz_min, input$investigate_mz_max,
       input$investigate_median_time_min, input$investigate_median_time_max,
@@ -2143,9 +2435,12 @@ server <- function(input, output, session){
       if (display$shown < display$visible) " Overview." else "")
   })
   output$investigate_median_plot <- plotly::renderPlotly({
-    spectrum <- investigate_median()
-    shiny::validate(shiny::need(!is.null(spectrum), "Click Calculate spectrum."))
-    investigate_plot_median(isolate(investigate_median_display()))
+    investigate_plot_generation()
+    isolate({
+      spectrum <- investigate_median()
+      shiny::validate(shiny::need(!is.null(spectrum), "Load data through Engine."))
+      investigate_plot_median(investigate_median_display())
+    })
   })
   #####Matabo3.6 End Investigate raw m/z, time and intensity#####
 
@@ -3690,7 +3985,7 @@ server <- function(input, output, session){
   }
 
   # Run one file through the task functions in the original processing order.
-  process_mz5_file <- function(raw_path, filename, file_name, config, timing) {
+  process_mz5_file <- function(raw_path, filename, file_name, config, timing, shared_data = NULL) {
     mass_df <- config$mass_df
     is_df <- config$is_df
     parameters_df <- config$parameters_df
@@ -3710,7 +4005,12 @@ server <- function(input, output, session){
       file.copy(raw_path, to = temporary_file)
       on.exit(unlink(temporary_file), add = TRUE)
       timing$stage("Read mz5 into memory", filename)
-      run_data <- read_mz5_data(temporary_file, total_steps)
+      # Matabo3.5 Calibration owns a deep copy: its mutable assayData must never
+      # change the original Engine object or Investigate's numeric snapshot.
+      run_data <- if (is.null(shared_data)) read_mz5_data(temporary_file, total_steps) else {
+        incProgress(1/total_steps, detail = "Using Engine data")
+        unserialize(serialize(shared_data, NULL))
+      }
       timing$stage("Mass calibration (if enabled)", filename)
       run_data <- calibrate_masses(run_data, parameters_df, total_steps)
 
@@ -3775,7 +4075,7 @@ server <- function(input, output, session){
   }
 
   # Coordinate the uploaded files and preserve per-file timing/error reports.
-  run_new_analysis <- function(files, mass_df, is_df, parameters_df, user_mti_df) {
+  run_new_analysis <- function(files, mass_df, is_df, parameters_df, user_mti_df, loaded = list()) {
     file_name <- create_results_folder(files$FileName[1])
     start_timer <- function(folder) {
       new_run_timer(file.path(folder, "run_timings.csv"), notify = function(stage, file) {
@@ -3794,7 +4094,8 @@ server <- function(input, output, session){
           timing$stage("Prepare output folders")
           prepare_results_folder(file_name, mass_df, is_df, parameters_df, config$mi_df)
         }
-        process_mz5_file(files$FilePath[d], files$FileName[d], file_name, config, timing)
+        process_mz5_file(files$FilePath[d], files$FileName[d], file_name, config, timing,
+          shared_data = loaded[[files$FilePath[d]]]$data)
       }
       timing$finish()
     }, error = function(e) {
@@ -3820,7 +4121,7 @@ server <- function(input, output, session){
       return(NULL)
     }
 
-    run_new_analysis(files, massData(), refMassListData(), parametersData(), userMTI())
+    run_new_analysis(files, massData(), refMassListData(), parametersData(), userMTI(), loaded = isolate(engine_loaded()))
   })
 
   ####4. Visualization tab####

@@ -1,290 +1,118 @@
-# Investigate raw data
+# Investigate shared Engine data
 
-Branch: `MetaboMeister`, based on `feature/modular-server` at `052bb2b`.
-Replace both `server.R` and `ui.R` with the matching files from this branch.
-All runtime functions remain in `server.R`; no additional package is required
-beyond the existing mzR, Plotly and Shiny dependencies.
+Use matching `server.R` and `ui.R` from branch **MetaboMeister**. Runtime helpers
+remain self-contained in these files and use the existing application packages.
 
-Investigate appears between Engine and Visualization. It reads the original
-MS1 spectra independently of the analysis workflow. No calibration, smoothing,
-peak detection or peak fitting is applied, and no result files are written.
+## Engine owns the upload
 
-## Open raw data
+Upload `.mz5` files in Engine. Each upload is read once into memory. Investigate
+automatically selects that file and populates its ranges, sampling counts,
+controls and status. There is no Investigate upload or raw-file-open button.
+Selecting another already loaded Engine file reuses its memory snapshot.
 
-1. Upload one or more real `.mz5` files in Engine, then select the desired upload
-   in Investigate. Alternatively, choose **Select another .mz5 file** and upload
-   the raw file directly in Investigate without starting a new analysis.
-2. Click **Load raw file**. This reads scan metadata and makes one streamed pass
-   over all valid MS1 spectra to measure native sampling, check whether m/z
-   coordinates are shared, and initialize the observed ranges. The progress bar
-   identifies this pass; it adds reading time on load. These measurements are
-   cached until the file is cleared/replaced. Plots are drawn only on request.
-3. Set the ranges and click **Draw / apply 3D ranges** or
-   **Plot / apply cross-section**.
+Engine retains the original uncalibrated object. Analysis receives a deep copy
+of its mutable assay-data environment, so mass calibration and extraction cannot
+change Investigate's original spectra. Cross-sections, 3D previews and Median
+read the in-memory snapshot, not the original file again.
 
-Opening a saved analysis in Engine does not load its original spectra. The full
-m/z–time–intensity data are not available in the saved extracted traces; supply
-the original `.mz5` in Investigate to explore that analysis's raw measurements.
-Investigate's loaded-file status identifies the raw file being shown.
+**Start run automatically after upload** is enabled by default. Turn it off in
+Engine if only inspection is wanted. The 3D time-start default is **1.2 minutes**,
+also after loading a file; the recorded end populates its upper range. Grouping
+defaults remain 40 mass readings and 20 scans. The 3D preview uses grouped means;
+cross-sections use the original scans. Existing rotation, zoom and resets remain.
 
-## Native sampling information
+## Fine Maximum and Minimum caches
 
-The loaded-file summary reports:
+**Maximum** is the default m/z statistic. Both extrema are calculated together
+from every valid MS1 scan from **1.2 minutes through the actual recorded end**,
+regardless of the 3D grouping or Median controls.
 
-- MS1 scan/time-slice count and number of distinct acquisition times.
-- Minimum positive time difference between adjacent distinct MS1 times, in
-  minutes and seconds. Duplicate timestamps do not give a zero spacing.
-- Minimum positive difference between adjacent distinct m/z positions **within
-  an individual spectrum**, measured across all valid MS1 spectra. Differences
-  between slightly shifted masses in different scans are not used.
-- The number of shared native m/z positions when nonempty spectra have identical
-  coordinates. Empty spectra still count as time slices and contribute zeros.
-- If m/z coordinates vary, the minimum–maximum number of distinct m/z positions
-  per spectrum, including empty spectra. Such data have no single shared native
-  m/z axis, so a universal native m/z-slice count would be misleading.
+All scans and slices use one global grid: equal **0.001 Da** cells anchored at
+integer multiples of 0.001 Da, with intensities plotted at cell centers. This
+grid is used even when scans share identical native mass coordinates. Multiple
+readings in a scan's cell are averaged before aggregation. Only internal empty
+cells between adjacent occupied nonzero cells are linearly interpolated. Measured
+zeros, outer gaps and empty scans retain the original zero semantics.
 
-These are measured **sampling spacings**, not an estimate of the instrument's
-mass resolving power or peak widths. A spacing is reported as unavailable when
-there are not two distinct readings to compare. Invalid/nonfinite measurements
-are excluded. The bounds come from the actual valid MS1 data, including files
-with missing or inconsistent header ranges.
+Time slices are `[1.2, 2)`, `[2, 3)`, `[3, 4)`, and so on. The final slice ends
+at the recorded end and includes that endpoint. A boundary scan belongs to one
+slice only, including duplicated acquisition times. Empty time slices have zero
+scan count and no summaries; they never add false zero observations. A window
+containing no scans displays a gap and reports zero scans.
 
-When coordinates differ between scans, separate **Shared m/z alignment width
-(Da)** controls appear for the 3D preview and the median spectrum. Both default
-to **0.01 Da**, including after loading another file. Entries are rounded to at
-most four decimal places; the smallest supported width is **0.0001 Da**.
-Changing either width does not change the other control or invalidate the
-other plot's cached data.
+Combining slices takes the element-wise **maximum of slice maxima** or
+**minimum of slice minima**, never an average. These summaries are separate from
+Engine's scientific analysis, which retains its existing calculations.
 
-Each scan's readings in one grid cell are averaged first. Empty cells in the
-3D preview contribute zero. For the median, internal empty cells are filled by
-linear interpolation between adjacent occupied cells whose intensities are
-both nonzero, before calculating the median across retained scans. See below
-for the interpolation rules.
+The paired caches are stored alongside dated analysis folders:
 
-A chosen alignment grid differs from measured native spacing. The last cell
-can be narrower at the requested upper bound. Grids begin at the selected 3D
-m/z lower limit; changing that limit can change alignment. Narrow the range or
-increase the width if a request exceeds 2,000,000 alignment positions. Shared
-native coordinates are used directly when they are identical across nonempty
-spectra; both alignment controls are hidden and unused in that case.
+```text
+Results/<mz5 basename>/
+  max_mz_spec_dmz0.001.sqlite
+  min_mz_spec_dmz0.001.sqlite
+  Results <date>/
+```
 
-## Interactive 3D view
+Each database stores indexed `(slice, mass-block)` records with binary double
+intensities in blocks of 4,096 cells. A selected region such as 162–165 m/z reads
+only its intersecting blocks and selected nonempty slices, plus line-continuity
+neighbors. It does not combine the entire mass range while zoomed in.
 
-- Axes: m/z, acquisition time in minutes, and measured intensity.
-- Drag to rotate. The Plotly toolbar provides pan, zoom, camera reset and PNG
-  export; scroll zoom is enabled. **Reset 3D view** restores the camera and the
-  last applied axis ranges without rereading the file.
-- Set independent m/z, time and intensity display ranges. m/z/time range
-  controls show at most three decimal places; initial bounds round outward to
-  retain the original endpoint measurements. Edited bounds round to three
-  decimals when leaving the field. Exact centre m/z and window tolerances retain
-  their precision. Intensity defaults to an automatic range; turn that off to
-  supply explicit limits.
-- Optional log-intensity display makes small signals easier to see alongside
-  large signals. Negative intensities are shown at zero height in log view;
-  linear view retains their values.
-- Set positive whole **m/z grouping** and **time grouping** factors. Factor
-  **1** keeps each position/scan; **10** combines each consecutive group of 10.
-  Time groups follow scan acquisition order rather than equal-duration bins.
-  For varying m/z coordinates, mass grouping follows the aligned positions.
-  The last group uses its actual size if it contains fewer than the factor.
-- Grouping defaults to **40 m/z readings** and **20 time scans**, including
-  after loading another file. Both remain editable. A live label reports the
-  equivalent Da and seconds per full group. Aligned mass cells use
-  `factor × alignment width`; native masses and time scans use
-  `factor × typical (median) adjacent spacing`. These are approximate for
-  irregular sampling; the last group may be smaller. For example, a 1-second
-  scan interval with time factor 20 corresponds to about 20 seconds per group.
-  The plot reports its applied factors.
-  A preview is limited to 1,000,000 cells; increase factors or narrow ranges
-  for larger requests. A single resulting row/column uses 3D lines/markers
-  because a surface requires at least two positions on each axis.
-- The surface uses a light blue–cyan–yellow–orange–red palette with brighter
-  lighting, avoiding the previous dark purple low-intensity background.
-- Each cell shows **mean intensity** across its consecutive mass positions
-  and scans, including zeros for missing positions. If several raw readings
-  share one native/aligned mass position, they are averaged per scan first.
-  Group centres are means of the represented mass coordinates/scan times;
-  groups need not have equal physical width when native spacing is irregular.
-  This is a display summary, not a peak-area measurement.
-- Click the surface to populate **Centre m/z** or **Slice time**, depending on
-  the active slice axis. The orange marker shows the selected m/z or time
-  window. Click **Plot / apply cross-section** to extract it. A click uses a
-  group centre, which can differ from a recorded mass or scan time. Enter an
-  exact value for precise windows, or reduce grouping factors for finer detail.
+Metadata records the original spectra/time fingerprint, filename, common grid,
+slice boundaries/counts, interpolation and alignment rules, schema version,
+completion flag and generation. Both databases must match. Incomplete,
+outdated, structurally damaged or mismatched pairs are rejected. A matching
+Engine upload reuses completed caches without traversing its scans again.
+Different raw data with the same filename invalidates the old pair.
 
-## m/z-window cross-section
+Reopening a saved run in Engine automatically loads its matching completed
+caches without an mz5 read. It validates the stored pair/settings; a subsequent
+raw upload additionally validates its spectra/time fingerprint. Raw-only views
+(3D, cross-sections and Median) still require the original upload through Engine;
+the fine extrema caches do not contain every original spectrum.
 
-The window is a centre m/z plus a **± half-width**, expressed in ppm or Da:
+## Window controls and plotting
 
-`half-width in Da = centre m/z × ppm / 1,000,000`
+Maximum and Minimum use **Window width (min)** and a **Window position** slider.
+Available widths are exact differences between saved slice boundaries. Slider
+positions select intervals of that same width; the displayed interval shows
+the actual endpoints. The last partial slice is available through its matching
+widths and through **Full run**. Full run always means 1.2 minutes to the recorded
+end and disables the position slider. Widths with only one valid position also
+disable it.
 
-For example, 100 m/z ± 10 ppm includes values from 99.999 to 100.001 m/z.
-Both endpoints are included.
+Dragging sends positions live, including before release. Region summaries update
+only the SVG curve and hover label. The plot widget, m/z zoom and intensity-axis
+limits remain unchanged. Zooming into a new region queries its cached mass blocks.
+Reset restores the full mass/intensity view. Broad views retain per-interval
+minima and maxima at their original coordinates, preserving narrow peaks within
+the bounded overview; detailed zoom restores the cached points.
 
-The trace is calculated directly from the original MS1 scans, independently of
-the 3D grid. Mean intensity is the default and follows PeakMeister's existing
-window-aggregation convention. Sum and maximum intensity are also available.
-An empty window contributes zero for that scan. Invalid/nonfinite data points
-are excluded. This feature does not locate or integrate peaks.
+## Median
 
-The trace has its own time and intensity ranges. Drag to zoom, use the toolbar,
-or select **Reset trace view** to restore the last applied ranges. Changing only
-intensity limits reuses the cached data. Changing the window, extraction time
-range or aggregation requires another extraction.
+Median remains available with independent time-start/end, every-Nth-scan and
+alignment-width controls. Click **Calculate Median** after editing them. The
+existing exact sparse/partitioned calculation, interpolation, native-axis behavior
+and scan-stride semantics remain in place. It uses Engine's uncalibrated snapshot.
+The fine 0.001 Da slice workflow does not apply to Median.
 
-## Time-window cross-sections
+## Validation
 
-Choose **Time → mass spectrum**, enter a centre time in minutes and a positive
-± window in seconds. The lower graph then plots intensity against m/z, with
-separate spectrum m/z-range controls and the existing intensity-range/reset
-controls. Only MS1 scans inside the inclusive time window are used.
+- `tests/investigate.R`: existing numerical, display, 3D, cross-section and Median
+  checks plus the new shared/cache tests and actual UI defaults.
+- `tests/investigate-cache.R`: independent extrema oracle, global grid, duplicate
+  boundary times, final/empty slices, region reads, persistence, source/settings
+  validation, incomplete-cache rejection, saved-run reuse and actual GUI handlers
+  retaining both axes during live curve updates.
+- `tests/shared-engine-mz5.R <fixture.mz5>`: real MSnbase data, production analysis
+  reuse without a second read, and calibration isolation from original spectra.
+- `tests/shared-analysis-equivalence.R <pre-change server.R>`: two-file synthetic
+  comparison of CSVs, saved objects, SQLite tables, plots and pipeline stages.
+- `tests/investigate-mz5.R <fixture.mz5>`: genuine mz5 reading and independently
+  checked trace/spectrum extraction. The fixture used is ProteoWizard's
+  `example_data/tiny.pwiz.1.1.mz5`.
 
-Two displays are available:
-
-1. **Combine spectra (mean):** align scans to an explicit m/z grid (default
-   bin width 0.01 Da). Compute each scan's mean intensity within each mass bin,
-   then average those bin intensities across all selected scans. A missing bin
-   in a scan contributes zero, so a scan with more raw points does not receive
-   extra weight. The status reports the number of scans and bin width. The last
-   mass bin can be narrower where it meets the requested m/z upper limit.
-2. **Overlay spectra:** choose the number of spectra, default 5 (4 is also
-   supported). Select up to that many closest scans inside the time window,
-   ordered by absolute distance from its centre; ties use the earlier time.
-   Each curve keeps its original m/z points and has a different colour. Legend
-   entries give actual acquisition times and time distances, nearest first.
-   Click a legend entry to hide/show a curve. Empty spectra in the chosen m/z
-   range are omitted and the status reports the selected and plotted counts.
-
-Combined spectra are averages on their own stated mass grid; they do not use
-the coarse 3D preview. Overlaid spectra are not mass-binned. Both are calculated
-from the original data with no smoothing, calibration or peak fitting. A
-combined spectrum is limited to 1,000,000 mass bins; narrow the m/z range or
-increase its bin width for a larger request.
-
-## Time-summary m/z spectrum
-
-Choose **Median**, **Maximum** or **Minimum** in **Statistic**, then click
-**Calculate spectrum**. Median is the default. Each option summarizes the
-retained scans at each m/z position using the same alignment and interpolation.
-Maximum and Minimum use one streaming pass, with no dense matrix or disk cache.
-A missing observation contributes zero; fully observed negative maxima and
-positive minima retain their actual values. Changing the statistic invalidates
-the calculation cache and updates the plotted axis/hover labels after calculation.
-
-Its own **Time start/end** controls initially match the 3D time range and
-follow changes to it until either median time field is edited. A customized
-median time window stays independent when the 3D window changes. Loading a new
-file initializes both time ranges again. The current 3D m/z limits apply;
-the median has its own alignment-width control, independent of the 3D width.
-
-**Keep every Nth scan** defaults to **10**. Within the inclusive median time
-window, retain the first MS1 scan, then every Nth scan after it: factor 10 uses
-positions 1, 11, 21, … within that window. Factor 1 uses every scan; a window with
-fewer than N scans still retains its first scan. Skipped scans are never read or
-aligned, even in the temporary-disk path, and do not contribute implicit zeros.
-The status reports retained/available scan counts and the applied factor.
-Subsampling reduces work and changes the sample used for the median; brief
-signals can be missed. Use factor 1 when all scans should contribute.
-
-At each shared native m/z position (or aligned position if axes differ), there
-is one intensity per **retained** scan. Multiple readings at the same position
-are averaged within that scan. Only **unoccupied** internal mass cells between
-two adjacent occupied, nonzero cells are linearly interpolated using their
-actual m/z distances. For example, a missing cell halfway between intensities
-10 and 20 becomes 15. Recorded zeros are never replaced and prevent filling
-across them. Gaps outside the first/last anchors, single-anchor spectra and
-entirely empty scans remain zero. There is no additional maximum-gap cutoff.
-The median is then calculated across these aligned/interpolated retained
-spectra. The filled values are estimates; the original raw file is unchanged.
-No 3D grouping is applied. Changing only grouping factors, or changing the 3D time window after
-customizing the median window, reuses the cached median. Changes to median
-bounds, scan factor, statistic, m/z limits or alignment width display a reminder to
-recalculate and invalidate the cache key.
-
-The median is exact for the aligned/interpolated retained scans, including the
-mean of the two middle intensities for an even number of retained scans. Short-lived peaks can have **zero median** when absent
-from most scans; the status explains an all-zero result. This is expected for
-many transient signals and does not mean the original data have disappeared.
-Use the time-window combine/overlay views to inspect signals in shorter windows.
-The graph supports zoom, pan, PNG export and **Reset spectrum view**.
-
-The median display uses a lightweight **SVG 2D trace**, independent of the
-3D surface's WebGL renderer. This avoids relying on WebGL for median interaction
-inside RStudio's embedded viewer. Drag mode defaults to zoom and the toolbar is
-visible. There are no selection/lasso modes on this read-only graph.
-
-A broad view draws at most **4,000 original median points**, retaining the
-minimum and maximum in each horizontal m/z interval at their actual coordinates.
-This preserves narrow positive/negative peaks instead of averaging them or
-keeping a simple stride of display points. The plotted line is an overview;
-it can omit intermediate shape detail. The status reports shown/available
-median positions in the current view. The **full calculated median is unchanged**
-and remains cached in R.
-
-Zooming or panning selects the relevant original cached points again. Once the
-visible window is small enough, every median position in it is shown, plus
-boundary neighbours for line continuity. These display operations do not read
-raw spectra or rerun the median calculation. Zoom/pan messages use a dedicated
-Plotly source, and identical/resize messages are ignored to prevent reset loops.
-Only the trace coordinates are updated during zoom; the widget is not rebuilt,
-so an arriving display update does not recreate its drag area. Hover is handled
-in the browser. **Reset spectrum view** restores the full m/z and
-intensity range and the bounded overview.
-
-The implementation avoids allocating a dense scans-by-m/z matrix. It counts
-positive/negative observations with implicit zeros first, skipping value sorting
-where those counts already prove a zero median. Nonzero values are cached for
-small requests, and only the central ranks are selected rather than fully
-sorting every position. For larger requests it reads the retained scans once
-more and partitions only candidate nonzero values into temporary binary files.
-Partitions are processed individually with a limited number of open files;
-they are deleted on success or error. No new package or compiled extension is
-required. Repeating the same median request reuses the result. Initial reading
-and alignment are still proportional to the selected raw data size; the feature
-does not promise instant processing of large files.
-
-## Resource handling and errors
-
-Spectra are read in batches of eight, rather than loading the full raw run into
-an MSnbase object. Native sampling information, one preview, the current
-cross-section and one full median result are cached per session. Median view
-changes render only the bounded display subset.
-File handles close when the loaded file is replaced, the investigation is
-cleared, or the session ends. Opening a file that cannot be read and invalid
-range requests use the existing guarded error handling, allowing retry.
-Raw loading and calculation actions explicitly call `shiny::withProgress()` and
-`shiny::setProgress()` so other loaded packages cannot mask progress updates.
-
-## Code sections
-
-Existing numbered section comments retain their original numbering and order.
-New server code sits after 3.6 and before 3.7, under **Matabo3.6**, with subsections
-for raw reading, extraction, GUI actions and plot outputs. The sidebar addition
-uses **Matabo2.1** in `ui.R`; the page uses **Matabo5.1** after Engine and before
-Visualization. The original analysis functions are unchanged.
-
-`tests/investigate.R` checks native sampling, fixed/varying mass axes, adjacent
-grouped means, independently calculated exact medians (odd/even, signed, sparse,
-RAM and disk paths), independent four-decimal 3D/median widths, per-scan linear
-gap filling against an independent oracle (recorded zeros, edge gaps and signed
-intensities), independent median windows and scan strides (including
-checks that skipped scans are never read), compact ranges/physical grouping
-widths, single-pass signed/missing-value Maximum and Minimum summaries,
-statistic-aware cache/labels, bounded peak-preserving displays with cached zoom,
-MS1/ppm/Da boundaries, batch/grid limits, plots, caches,
-error recovery, temporary-file/handle cleanup and the actual GUI controls.
-Existing action-guard, startup and scientific equivalence checks also cover
-this branch.
-
-The mzR integration check uses ProteoWizard's genuine HDF5/mz5 reference file,
-`example_data/tiny.pwiz.1.1.mz5`, from commit
-`c9a8cadc630568b519e1fee00ce2aec71c28d695`. The reader and exact aggregates are
-checked independently of the preview. Chromium checks cover actual WebGL
-rotation/reset, linked selection, grouping factors, independent time-range
-medians, ranges, tab switching and raw-file upload.
-A synthetic browser stress check renders 200,000 median positions alongside a
-750,000-cell 3D surface and exercises actual drag rectangles, detailed zoom and
-reset. RStudio's embedded viewer was not available in the test environment;
-large laboratory files were not available for a performance benchmark.
+A Chromium check uploads through Engine and drags the actual slider while zoomed
+to 162–165 m/z and fixed intensity limits. It verifies updates before release,
+unchanged axes and the same SVG widget. Large laboratory files, full user-data
+analysis and RStudio's embedded viewer were not available for validation.
