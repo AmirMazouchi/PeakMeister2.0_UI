@@ -154,6 +154,31 @@ testServer(harness,{
   session$setInputs(analysis_mode='existing',existing_run='Fixture',investigate_median_statistic='max')
   stopifnot(is.null(investigate_raw()$read_peaks),isTRUE(investigate_median()$cached),signals$reads==1L)
   same(investigate_median()$data$intensity,apply(oracle[times>=1.2,,drop=FALSE],2,max))
+  # A new cache must not gate the filename/raw-data handshake. Run its deferred
+  # callback with an intentional failure and verify that loaded data survives.
+  assign('investigate_cache_open',function(...)NULL,envir=environment(engine_load_upload))
+  assign('investigate_cache_build',function(...)stop('cache-build regression fixture'),envir=environment(engine_load_upload))
+  engine_load_upload('one-engine-upload','Fixture.mz5')
+  same(signals$updates$investigate_engine_file$selectize,NULL)
+  stopifnot(grepl('Fixture.mz5',signals$updates$investigate_engine_file$options,fixed=TRUE),
+    !is.null(investigate_raw()),is.null(investigate_cache()),signals$reads==1L)
+  session$flushReact()
+  for (attempt in 1:10) {
+    later::run_now(0.1)
+    session$flushReact()
+    if (length(signals$errors)) break
+  }
+  stopifnot(!is.null(investigate_raw()),signals$reads==1L,
+    identical(tail(signals$errors,1)[[1]],'cache-build regression fixture'))
+  signals$errors <- head(signals$errors,-1L)
+  # Reader errors still publish the uploaded name and an actionable status.
+  investigate_activate(NULL)
+  assign('read_mz5_data',function(...)stop('reader regression fixture'),envir=environment(engine_load_upload))
+  session$setInputs(analysis_mode='new',mz5Files=data.frame(name='Broken.mz5',datapath='broken-upload'))
+  stopifnot(grepl('Broken.mz5',signals$updates$investigate_engine_file$options,fixed=TRUE),
+    grepl('Could not load Broken.mz5',output$investigate_status,fixed=TRUE),
+    identical(tail(signals$errors,1)[[1]],'reader regression fixture'))
+  signals$errors <- head(signals$errors,-1L)
 })
 stopifnot(!length(signals$errors))
 setwd(original_dir)

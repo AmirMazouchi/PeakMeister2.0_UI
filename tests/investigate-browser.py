@@ -3,6 +3,7 @@
 from playwright.sync_api import sync_playwright
 import json
 import argparse
+from pathlib import Path
 parser=argparse.ArgumentParser()
 parser.add_argument("fixture",help="ProteoWizard tiny.pwiz.1.1.mz5")
 parser.add_argument("--url",default="http://127.0.0.1:3840")
@@ -21,6 +22,8 @@ with sync_playwright() as p:
     page.locator('#mz5Files').set_input_files(args.fixture)
     page.locator('a[data-value="investigate"]').click()
     page.wait_for_function('document.querySelector("#investigate_status").textContent.includes("Engine data:")',timeout=120000)
+    selected_name=page.locator('#investigate_engine_file').evaluate('el => el.selectedOptions[0].textContent')
+    assert selected_name==Path(args.fixture).name,selected_name
     page.wait_for_function('document.getElementById("investigate_median_plot")?.data?.length > 0',timeout=120000)
     print('Plot ready',flush=True)
     assert page.locator('#investigate_time_min').input_value()=='1.2'

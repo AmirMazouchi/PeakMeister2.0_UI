@@ -7,7 +7,10 @@ remain self-contained in these files and use the existing application packages.
 
 Upload `.mz5` files in Engine. Each upload is read once into memory. Investigate
 automatically selects that file and populates its ranges, sampling counts,
-controls and status. There is no Investigate upload or raw-file-open button.
+controls and status before fine-cache calculation starts. Cache preparation runs
+after the initial UI update; its failure leaves the Engine filename and spectra
+available. A reader failure displays the filename and an explicit error status.
+There is no Investigate upload or raw-file-open button.
 Selecting another already loaded Engine file reuses its memory snapshot.
 
 Engine retains the original uncalibrated object. Analysis receives a deep copy

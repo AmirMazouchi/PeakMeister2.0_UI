@@ -770,6 +770,7 @@ server <- function(input, output, session){
     current <- uploadedmz5()
     current <- current[current$Source == "upload", , drop = FALSE]
     uploadedmz5(rbind(current, newFiles))
+    engine_publish_files(newFiles$FilePath[1])
     # Matabo3.1 Share one Engine read with analysis and Investigate.
     for (i in seq_len(nrow(newFiles))) engine_load_upload(newFiles$FilePath[i], newFiles$FileName[i])
     if (isTRUE(input$autorun)) request_new_analysis()
@@ -1183,6 +1184,7 @@ server <- function(input, output, session){
   investigate_median_view <- reactiveVal(NULL)
   investigate_median_time_custom <- reactiveVal(FALSE)
   investigate_cache <- reactiveVal(NULL)
+  investigate_loading <- reactiveVal(NULL)
   investigate_plot_generation <- reactiveVal(0L)
   investigate_activation <- reactiveVal(0L)
   investigate_width <- reactiveVal("full")
@@ -2001,6 +2003,7 @@ server <- function(input, output, session){
   ######Matabo3.6.3 File selection, range controls and guarded GUI actions######
   investigate_activate <- function(raw, cache = NULL) {
     investigate_grid(NULL); investigate_trace(NULL); investigate_median(NULL)
+    investigate_loading(NULL)
     investigate_median_view(NULL); investigate_median_time_custom(FALSE)
     investigate_raw(raw); investigate_cache(cache)
     investigate_width("full")
@@ -2034,7 +2037,22 @@ server <- function(input, output, session){
     invisible(raw)
   }
 
+  engine_publish_files <- function(selected = NULL) {
+    files <- uploadedmz5()
+    files <- files[files$Source == "upload" & !is.na(files$FilePath), , drop = FALSE]
+    if (!nrow(files)) return(invisible(NULL))
+    if (is.null(selected) || !selected %in% files$FilePath) selected <- files$FilePath[1]
+    updateSelectInput(session, "investigate_engine_file",
+      choices = stats::setNames(files$FilePath, files$FileName), selected = selected)
+  }
+
   engine_load_upload <- function(path, name) {
+    # Matabo3.6.3 Publish the upload before slow sampling/cache work. A failed
+    # reader must not leave a real Engine upload labelled "Upload in Engine".
+    engine_publish_files(path)
+    investigate_loading(paste0("Loading Engine upload: ", name))
+    ready <- FALSE
+    on.exit(if (!ready) investigate_loading(paste0("Could not load ", name, ". See the error notification.")), add = TRUE)
     entries <- isolate(engine_loaded())
     if (is.null(entries[[path]])) {
       data <- shiny::withProgress(message = paste("Reading Engine upload:", name), value = 0, {
@@ -2045,19 +2063,44 @@ server <- function(input, output, session){
       engine_loaded(entries)
     }
     raw <- entries[[path]]$raw
-    cache <- NULL
+    # Expose spectra, ranges and counts before any fine-cache calculation.
+    investigate_activate(raw)
+    investigate_loading(NULL)
+    ready <- TRUE
     if (max(raw$times) > 1.2) {
-      cache <- with_action_error({
-        shiny::withProgress(message = "Caching Maximum and Minimum spectra", value = 0, {
-          investigate_cache_build(raw, mz5_result_parent(name),
-            progress = function(fraction) shiny::setProgress(value = fraction))
-        })
-      }, "Investigate: cache fine spectra")
+      parent <- mz5_result_parent(name)
+      cache <- investigate_cache_open(parent, raw)
+      if (!is.null(cache)) investigate_attach_cache(cache) else {
+        # Allow the filename/range messages to reach the browser first.
+        session$onFlushed(function() {
+          later::later(function() {
+            if (session$isClosed()) return()
+            shiny::withReactiveDomain(session, isolate({
+              cache <- with_action_error({
+                shiny::withProgress(message = "Caching Maximum and Minimum spectra", value = 0, {
+                  investigate_cache_build(raw, parent,
+                    progress = function(fraction) shiny::setProgress(value = fraction))
+                })
+              }, "Investigate: cache fine spectra")
+              if (!is.null(cache) && identical(investigate_raw()$fingerprint, raw$fingerprint)) {
+                investigate_attach_cache(cache)
+              }
+            }))
+          }, delay = 0.1)
+        }, once = TRUE)
+      }
     }
-    investigate_activate(raw, cache)
-    updateSelectInput(session, "investigate_engine_file",
-      choices = stats::setNames(names(entries), vapply(entries, function(x) x$raw$name, character(1))), selected = path)
     invisible(entries[[path]])
+  }
+
+  investigate_attach_cache <- function(cache) {
+    # Cache completion must not reset ranges/3D/Median edits made during loading.
+    investigate_cache(cache)
+    breaks <- cache$meta$settings$breaks
+    widths <- sort(unique(round(as.vector(outer(breaks, breaks, "-")), 9)))
+    widths <- widths[widths > 0 & widths < diff(range(breaks)) - 1e-8]
+    updateSelectInput(session, "investigate_window_width", choices = c("Full run" = "full",
+      stats::setNames(as.character(widths), paste(format(widths, trim = TRUE), "min"))), selected = "full")
   }
 
   observe_action(input$investigate_engine_file, {
@@ -2329,7 +2372,7 @@ server <- function(input, output, session){
   }
   output$investigate_status <- renderText({
     raw <- investigate_raw()
-    if (is.null(raw)) return("Upload an mz5 in Engine, or open a saved run.")
+    if (is.null(raw)) return(if (!is.null(investigate_loading())) investigate_loading() else "Upload an mz5 in Engine, or open a saved run.")
     sampling <- raw$sampling
     mass_count <- if (sampling$shared) paste0(length(sampling$mz_axis), " shared native m/z positions") else
       paste0("m/z positions vary: ", paste(sampling$mz_count_range, collapse = "–"),
