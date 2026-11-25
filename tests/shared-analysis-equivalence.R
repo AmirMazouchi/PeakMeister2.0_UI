@@ -6,7 +6,8 @@ baseline_path <- normalizePath(args[1])
 source('tests/modular-server.R')
 before <- Filter(function(x)is_assignment(x,'server'),as.list(parse(baseline_path)))[[1]]
 before_statements <- as.list(before[[3]][[3]])[-1]
-for(name in c('calibrate_masses','prepare_extraction_spectra','extract_electropherograms',
+# Calibration output is covered by the known-mass fixture in mass-calibration-report.R.
+for(name in c('prepare_extraction_spectra','extract_electropherograms',
   'build_eie_dataframe','smooth_electropherograms','process_internal_standard_peaks',
   'process_metabolite_peaks','flag_peaks_below_lod','flag_interfered_peaks')) {
   old <- Filter(function(x)is_assignment(x,name),before_statements)[[1]][[3]]

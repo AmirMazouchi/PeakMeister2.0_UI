@@ -139,3 +139,25 @@ upload. It uploads through Engine and drags the actual slider while zoomed
 to 162–165 m/z and fixed intensity limits. It verifies updates before release,
 unchanged axes and the same SVG widget. Large laboratory files, full user-data
 analysis and RStudio's embedded viewer were not available for validation.
+
+## Engine mass calibration workbook
+
+Each new Engine analysis writes `Mass Calibration - <dated analysis folder>.xlsx`
+in `Results/<mz5 basename>/` after the calibration step. The filename includes
+the dated folder name and any rerun suffix, so earlier workbooks are preserved.
+Opening a saved analysis does not regenerate its workbook.
+
+- **Mass List** and **Reference Mass List** include every workbook target. The
+  input m/z is the value used for extraction. The modeled corrected m/z columns
+  show the minimum, mean and maximum of the scan-specific correction evaluated
+  at that input m/z across calibrated scans. These are model estimates.
+- **Calibration References** lists both expected lock masses from the Parameters
+  sheet and their measured m/z before and after calibration in scan processing
+  order. The after values come from refitting the same peak flanks on the
+  corrected m/z coordinates. A missing lock pair skips that scan. A lock mass
+  measured on a skipped scan can still have a before value.
+- **Summary** identifies the analysis and records whether calibration was applied,
+  disabled, or enabled with no usable scan pairs. Unavailable measurements and
+  unapplied corrections appear as blank cells.
+
+Run the workbook check with `Rscript --vanilla tests/mass-calibration-report.R`.

@@ -27,6 +27,7 @@ tasks$calibrate_masses <- function(run_data,...) {
   run_data@assayData[[name]]@mz <- run_data@assayData[[name]]@mz + 100
   run_data
 }
+tasks$write_mass_calibration_report <- function(...) invisible(NULL)
 tasks$prepare_extraction_spectra <- function(run_data,...) {
   name <- ls(run_data@assayData)[1]
   stopifnot(all.equal(run_data@assayData[[name]]@mz,run@assayData[[name]]@mz+100)==TRUE)

@@ -338,7 +338,9 @@ ui <- dashboardPage(
                    conditionalPanel("input.analysis_mode === 'new'",
                      tags$h4(style = "text-decoration: underline;", "File Uploads for Initializing Data Preprocessing"),
                      fileInput("mz5Files", "Upload .mz5 Files", accept = c(".mz5"), multiple = TRUE),
-                     checkboxInput("autorun", "Start run automatically after upload", value = TRUE)
+                     checkboxInput("autorun", "Start run automatically after upload", value = TRUE),
+                     # Matabo5. Engine mass calibration report location.
+                     helpText("New analyses save an Excel mass calibration report alongside the dated analysis folder.")
                    ),
                    conditionalPanel("input.analysis_mode === 'existing'",
                      tags$h4("Open existing analysis"),

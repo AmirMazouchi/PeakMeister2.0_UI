@@ -1034,7 +1034,7 @@ server <- function(input, output, session){
 
   #####3.6 Perform Mass Calibration#####
   # Apply optional lock-mass calibration; return the run object.
-  calibrate_masses <- function(run_data, parameters_df, total_steps) {
+  calibrate_masses <- function(run_data, parameters_df, total_steps, record_scan = NULL) {
     calibration_response <- parameters_df$apply.mass.calibration
 
     #Confirm response is "Yes" or "No". Otherwise, produce an error.
@@ -1066,6 +1066,29 @@ server <- function(input, output, session){
 
         minimum_counts <- parameters_df$ref.mass.minimum.counts[1]
 
+        fit_lock_mass <- function(spectrum, max_intensity_index) {
+          #Create a data frame with all four points
+          line_points <- data.frame("mz" = c(spectrum$mz[(max_intensity_index - 2):(max_intensity_index - 1)],
+                                             spectrum$mz[(max_intensity_index + 1):(max_intensity_index + 2)]),
+                                    "intensity" = c(spectrum$intensity[(max_intensity_index - 2):(max_intensity_index - 1)],
+                                                    spectrum$intensity[(max_intensity_index + 1):(max_intensity_index + 2)]))
+
+          #Create a model for all four points
+          model_left <- lm(formula = intensity ~ mz, data = line_points[c(1,2),])
+          model_right <- lm(formula = intensity ~ mz, data = line_points[c(3,4),])
+
+          #Get the coefficients for both models
+          coefficients_left <- c(model_left$coefficients["mz"], model_left$coefficients["(Intercept)"])
+          coefficients_right <- c(model_right$coefficients["mz"], model_right$coefficients["(Intercept)"])
+
+          #Calculate the slope and intercept
+          slope <- coefficients_left[1] - coefficients_right[1]
+          intercept <- coefficients_right[2] - coefficients_left[2]
+
+          #Solve for the experimental_mz
+          solve(slope, intercept)
+        }
+
         #Define a function to calculate 1. experimental m/z of lock masses, 2. the corresponding mass error, and 3. the index of the lock mass
         #The lock mass value is currently the most intense point in the mass window plus an adjustment to better predict the lock mass value.
 
@@ -1084,26 +1107,7 @@ server <- function(input, output, session){
           if(length(max_intensity_index) == 1){
             if(spectrum$intensity[max_intensity_index] > minimum_counts){
 
-              #Create a data frame with all four points
-              line_points <- data.frame("mz" = c(spectrum$mz[(max_intensity_index - 2):(max_intensity_index - 1)],
-                                                 spectrum$mz[(max_intensity_index + 1):(max_intensity_index + 2)]),
-                                        "intensity" = c(spectrum$intensity[(max_intensity_index - 2):(max_intensity_index - 1)],
-                                                        spectrum$intensity[(max_intensity_index + 1):(max_intensity_index + 2)]))
-
-              #Create a model for all four points
-              model_left <- lm(formula = intensity ~ mz, data = line_points[c(1,2),])
-              model_right <- lm(formula = intensity ~ mz, data = line_points[c(3,4),])
-
-              #Get the coefficients for both models
-              coefficients_left <- c(model_left$coefficients["mz"], model_left$coefficients["(Intercept)"])
-              coefficients_right <- c(model_right$coefficients["mz"], model_right$coefficients["(Intercept)"])
-
-              #Calculate the slope and intercept
-              slope <- coefficients_left[1] - coefficients_right[1]
-              intercept <- coefficients_right[2] - coefficients_left[2]
-
-              #Solve for the experimental_mz
-              experimental_mz <- solve(slope, intercept)
+              experimental_mz <- fit_lock_mass(spectrum, max_intensity_index)
 
               experimental_mass_diff <- lock_mass - experimental_mz
 
@@ -1141,6 +1145,9 @@ server <- function(input, output, session){
                                                mass_window = mass_window)
 
           if (is.null(cal_para_1) | is.null(cal_para_2)){
+            if (!is.null(record_scan)) record_scan(c(
+              scan = s, calibrated = 0, before_one = if (is.null(cal_para_1)) NA_real_ else cal_para_1[1],
+              before_two = if (is.null(cal_para_2)) NA_real_ else cal_para_2[1]))
             next
           }
 
@@ -1161,6 +1168,21 @@ server <- function(input, output, session){
 
           run_data@assayData[[spectrum_name]]@mz <- run_data@assayData[[spectrum_name]]@mz + correction_vector
 
+          if (!is.null(record_scan)) {
+            corrected <- spectrum
+            corrected$mz <- run_data@assayData[[spectrum_name]]@mz
+            # Refit the same peak flanks in the corrected spectrum.
+            refit <- function(index) tryCatch(fit_lock_mass(corrected, index),
+              error = function(e) NA_real_)
+            record_scan(c(scan = s, calibrated = 1,
+              before_one = cal_para_1[1], before_two = cal_para_2[1],
+              after_one = refit(cal_para_1[3]), after_two = refit(cal_para_2[3]),
+              lower_mz = spectrum$mz[cal_para_1[3]], upper_mz = spectrum$mz[cal_para_2[3]],
+              lower_offset = cal_para_1[2], upper_offset = cal_para_2[2],
+              slope = model[["coefficients"]][["x"]],
+              intercept = model[["coefficients"]][["(Intercept)"]]))
+          }
+
         }
 
         run_data
@@ -1172,6 +1194,81 @@ server <- function(input, output, session){
     print("Mass Calibration Complete")
 
     run_data
+  }
+
+  #####Matabo3.6 Excel mass calibration report#####
+  write_mass_calibration_report <- function(filename, analysis_folder, masses, references,
+                                            parameters, scans) {
+    columns <- c("scan", "calibrated", "before_one", "before_two", "after_one", "after_two",
+                 "lower_mz", "upper_mz", "lower_offset", "upper_offset", "slope", "intercept")
+    values <- t(vapply(scans, function(scan) {
+      result <- unname(scan[match(columns, names(scan))])
+      result[!is.finite(result)] <- NA_real_
+      result
+    }, numeric(length(columns))))
+    colnames(values) <- columns
+    models <- values[values[, "calibrated"] == 1, , drop = FALSE]
+    enabled <- identical(parameters$apply.mass.calibration[1], "Yes")
+    status <- if (!enabled) "Disabled" else if (!nrow(models)) "No scans calibrated" else "Applied"
+    target_sheet <- function(targets) {
+      stats <- vapply(targets$mz, function(input_mz) {
+        if (!nrow(models) || !is.finite(input_mz)) return(rep(NA_real_, 3L))
+        offsets <- ifelse(input_mz >= models[, "upper_mz"], models[, "upper_offset"],
+          ifelse(input_mz <= models[, "lower_mz"], models[, "lower_offset"],
+            models[, "slope"] * input_mz + models[, "intercept"]))
+        corrected <- input_mz + offsets
+        c(min(corrected), mean(corrected), max(corrected))
+      }, numeric(3))
+      data.frame("Metabolite" = as.character(targets$name), "Input target m/z" = as.numeric(targets$mz),
+        "Modeled corrected m/z (min)" = stats[1, ],
+        "Modeled corrected m/z (mean)" = stats[2, ],
+        "Modeled corrected m/z (max)" = stats[3, ], check.names = FALSE)
+    }
+    lock_sheet <- function(rows) {
+      observed <- values[rows, , drop = FALSE]
+      data.frame(
+        "Scan (calibration order)" = observed[, "scan"],
+        "Scan status" = ifelse(is.na(observed[, "calibrated"]), status,
+          ifelse(observed[, "calibrated"] == 1, "Calibrated", "Skipped: lock pair unavailable")),
+        "Reference 1 expected m/z" = rep(as.numeric(parameters$ref.mass.one)[1], length(rows)),
+        "Reference 1 measured before m/z" = observed[, "before_one"],
+        "Reference 1 measured after m/z" = observed[, "after_one"],
+        "Reference 2 expected m/z" = rep(as.numeric(parameters$ref.mass.two)[1], length(rows)),
+        "Reference 2 measured before m/z" = observed[, "before_two"],
+        "Reference 2 measured after m/z" = observed[, "after_two"], check.names = FALSE)
+    }
+    workbook <- list(
+      Summary = data.frame(
+        Item = c("Input file", "Analysis", "Calibration status", "Scans evaluated",
+                 "Scans calibrated", "Scans skipped", "Target values", "Reference values"),
+        Value = c(filename, basename(analysis_folder), status,
+          if (enabled) nrow(values) else NA, if (enabled) nrow(models) else NA,
+          if (enabled) nrow(values) - nrow(models) else NA,
+          paste("Min, mean and max of the correction model evaluated at the input target m/z",
+                "across calibrated scans only. These are modeled values; extraction targets",
+                "stay at the workbook input m/z."),
+          paste("Expected m/z comes from Parameters. Measurements before and after are fits",
+                "of the same peak flanks on the original and corrected spectra. Blank cells",
+                "indicate unavailable measurements or a correction that was not applied."))),
+      "Mass List" = target_sheet(masses),
+      "Reference Mass List" = target_sheet(references))
+    rows <- if (nrow(values)) seq_len(nrow(values)) else NA_integer_
+    # Excel allows 1,048,576 rows per sheet, including the header.
+    chunks <- split(rows, (seq_along(rows) - 1L) %/% 1048575L)
+    for (i in seq_along(chunks)) {
+      sheet <- if (i == 1L) "Calibration References" else paste("Calibration References", i)
+      workbook[[sheet]] <- lock_sheet(chunks[[i]])
+    }
+
+    path <- file.path(dirname(analysis_folder),
+      paste0("Mass Calibration - ", basename(analysis_folder), ".xlsx"))
+    temporary <- tempfile("mass-calibration-", tmpdir = dirname(path), fileext = ".xlsx")
+    on.exit(unlink(temporary), add = TRUE)
+    writexl::write_xlsx(workbook, temporary)
+    if (file.exists(path) || !file.rename(temporary, path)) {
+      stop("Could not save the mass calibration report: ", path)
+    }
+    invisible(path)
   }
 
   #####Matabo3.6 Investigate raw m/z, time and intensity#####
@@ -4162,7 +4259,13 @@ server <- function(input, output, session){
         unserialize(serialize(shared_data, NULL))
       }
       timing$stage("Mass calibration (if enabled)", filename)
-      run_data <- calibrate_masses(run_data, parameters_df, total_steps)
+      calibration_scans <- list()
+      run_data <- calibrate_masses(run_data, parameters_df, total_steps,
+        record_scan = function(scan) calibration_scans[[length(calibration_scans) + 1L]] <<- scan)
+      timing$stage("Write mass calibration workbook", filename)
+      write_mass_calibration_report(filename, file_name, mass_df, is_df,
+                                    parameters_df, calibration_scans)
+      rm(calibration_scans)
 
       timing$stage("Prepare extraction windows and spectra", filename)
       extraction <- prepare_extraction_spectra(run_data, is_df, mass_df, total_steps)
