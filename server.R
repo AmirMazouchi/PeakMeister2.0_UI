@@ -2519,9 +2519,27 @@ server <- function(input, output, session){
   observe_action(input$investigate_extrema_request, {
     raw <- investigate_raw()
     if (is.null(raw)) stop("Load an mz5 through Engine or choose a saved spectrum range.")
+    source_path <- NULL
+    if (is.null(raw$read_peaks)) {
+      # Opening saved spectra can leave only metadata active while Engine
+      # still owns the original spectra for this file.
+      entries <- engine_loaded()
+      candidates <- entries[vapply(entries, function(entry) {
+        identical(entry$raw$name, raw$name) && !is.null(entry$raw$read_peaks)
+      }, logical(1))]
+      exact <- vapply(candidates, function(entry) identical(entry$raw$fingerprint, raw$fingerprint), logical(1))
+      if (any(exact)) candidates <- candidates[exact]
+      if (any(exact) || length(candidates) == 1L) {
+        source_path <- names(candidates)[1]
+        raw <- candidates[[1]]$raw
+      } else if (length(candidates) > 1L) {
+        stop("Select the intended Engine upload before calculating this time range.")
+      }
+    }
     limits <- investigate_range(unlist(input$investigate_extrema_request), "Calculation time range")
     cache <- investigate_cache()
     if (!is.null(cache) && identical(limits, range(cache$meta$settings$breaks)) &&
+        identical(cache$meta$settings$fingerprint, raw$fingerprint) &&
         cache$meta$settings$version == 3L) {
       next_cache <- cache
     } else {
@@ -2545,6 +2563,10 @@ server <- function(input, output, session){
     if (is.null(cache) || !identical(cache$meta$generation, next_cache$meta$generation)) {
       investigate_median_view(NULL)
       investigate_median(NULL)
+    }
+    if (!is.null(source_path)) {
+      investigate_raw(raw)
+      engine_publish_files(source_path)
     }
     investigate_attach_cache(next_cache)
     investigate_reset_window_position()

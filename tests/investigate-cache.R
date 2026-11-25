@@ -205,6 +205,20 @@ testServer(harness,{
   same(investigate_cache()$meta$generation,restricted$meta$generation)
   same(investigate_median()$data$intensity,apply(oracle[selected,,drop=FALSE],2,min))
   stopifnot(is.null(investigate_raw()$read_peaks), signals$reads==1L)
+  # The cache-only view can recover the existing Engine reader without another file read.
+  session$setInputs(investigate_extrema_request=c(1.2,2.9))
+  same(investigate_median()$time_range,c(1.2,2.9))
+  same(investigate_median()$scans,sum(times>=1.2 & times<=2.9))
+  stopifnot(!is.null(investigate_raw()$read_peaks),signals$reads==1L)
+  # Older saved metadata can have a different fingerprint. A unique same-name
+  # Engine upload supplies the new calculation and its fingerprint.
+  saved_raw <- investigate_cache()$meta$raw
+  saved_raw$fingerprint <- 'older-cache-fingerprint'
+  investigate_raw(saved_raw)
+  session$setInputs(investigate_extrema_request=c(1.21,2.9))
+  same(investigate_cache()$meta$settings$fingerprint,raw$fingerprint)
+  same(investigate_median()$time_range,c(1.21,2.9))
+  stopifnot(!is.null(investigate_raw()$read_peaks),signals$reads==1L)
   # A new cache must not gate the filename/raw-data handshake. Run its deferred
   # callback with an intentional failure and verify that loaded data survives.
   assign('investigate_cache_open',function(...)NULL,envir=environment(engine_load_upload))
