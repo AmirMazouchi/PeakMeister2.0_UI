@@ -86,6 +86,7 @@ server <- function(input, output, session){
       analysis_mode = "Change analysis mode", mz5Files = "Upload mz5 files",
       existing_run = "Open existing analysis", clearFiles = "Clear Files", initialize = "Initialize Run",
       investigate_load_saved_spectra = "Load / plot saved spectra",
+      investigate_extrema_request = "Apply spectrum time limits",
       results_folder = "Select saved analysis", confirm_migration = "Build saved-results database",
       file_selector = "Select visualization file", draw_mode = "Change plot interaction mode",
       plot_table_rows_selected = "Select plot", delete_peak = "Delete Selected Peaks",
@@ -1276,7 +1277,6 @@ server <- function(input, output, session){
   investigate_plot_generation <- reactiveVal(0L)
   investigate_activation <- reactiveVal(0L)
   investigate_width <- reactiveVal("full")
-  investigate_extrema_bounds <- reactiveVal(NULL)
 
   ######Matabo3.6.1 Raw-file metadata, validation and bounded scan reading######
   investigate_range <- function(values, label, nonnegative = TRUE) {
@@ -1415,31 +1415,43 @@ server <- function(input, output, session){
     raw
   }
 
-  investigate_cache_settings <- function(raw, version = 2L) {
+  investigate_cache_settings <- function(raw, version = 3L, limits = NULL) {
     end <- max(raw$times)
     # A single grid anchored at zero, including complete equal-width edge cells.
     first <- floor(raw$mz_range[1] * 1000)
     last <- max(first + 1, ceiling(raw$mz_range[2] * 1000))
     if (last - first > 2e6) stop("The fine spectrum grid exceeds 2,000,000 bins.")
     breaks <- if (end > 1.2) sort(unique(c(1.2, seq.int(2, max(2, ceiling(end)))[seq.int(2, max(2, ceiling(end))) < end], end))) else numeric()
-    if (version == 2L) {
+    if (version >= 2L) {
       start <- min(raw$times)
       if (start == end) start <- max(0, start - 1/6)
       if (start == end) end <- end + 1/6
-      grid <- seq.int(ceiling(start * 6), floor(end * 6))/6
+      if (!is.null(limits)) {
+        start <- limits[1]
+        end <- limits[2]
+      }
+      if (version == 2L) {
+        grid <- seq.int(ceiling(start * 6), floor(end * 6))/6
+      } else {
+        first_step <- max(0, floor((min(raw$times) - start) * 6))
+        last_step <- floor((min(end, max(raw$times) + 1/6) - start) * 6)
+        grid <- if (first_step <= last_step) start + seq.int(first_step, last_step)/6 else numeric()
+      }
       breaks <- sort(unique(c(start, grid[grid > start & grid < end], end)))
     }
-    list(version = version, fingerprint = raw$fingerprint, name = raw$name,
+    settings <- list(version = version, fingerprint = raw$fingerprint, name = raw$name,
       dmz = 0.001, first = first, bins = as.integer(last - first), block = 4096L,
       breaks = breaks, times = raw$times, interpolation = "internal-nonzero-neighbours-v1",
       alignment = "per-scan-bin-mean;zero-outer-gaps;half-open-time-final-inclusive")
+    if (version == 3L) settings["limits"] <- list(limits)
+    settings
   }
 
   investigate_cache_paths <- function(parent) {
     file.path(parent, c("max_mz_spec_dmz0.001.sqlite", "min_mz_spec_dmz0.001.sqlite"))
   }
 
-  investigate_cache_open <- function(parent, raw = NULL, strict = FALSE) {
+  investigate_cache_open <- function(parent, raw = NULL, strict = FALSE, limits = NULL) {
     paths <- investigate_cache_paths(parent)
     if (!all(file.exists(paths))) {
       if (strict) stop("Both saved Maximum and Minimum files are required in ", parent)
@@ -1452,20 +1464,27 @@ server <- function(input, output, session){
         row <- DBI::dbGetQuery(con, "SELECT payload FROM metadata WHERE id=1")
         if (nrow(row) != 1L) stop("Missing cache metadata.")
         meta <- unserialize(row$payload[[1]])
-        if (!isTRUE(meta$complete) || !meta$settings$version %in% c(1L, 2L) ||
+        if (!isTRUE(meta$complete) || !meta$settings$version %in% c(1L, 2L, 3L) ||
             !identical(meta$settings$dmz, 0.001) ||
             !identical(meta$settings$interpolation, "internal-nonzero-neighbours-v1") ||
             !identical(meta$settings$alignment, "per-scan-bin-mean;zero-outer-gaps;half-open-time-final-inclusive") ||
             !identical(meta$settings$block, 4096L) ||
-            !identical(meta$settings, investigate_cache_settings(meta$raw, meta$settings$version))) stop("Outdated cache settings.")
-        expected <- sum(meta$counts > 0L) * ceiling(meta$settings$bins/meta$settings$block)
+            !identical(meta$settings, investigate_cache_settings(meta$raw, meta$settings$version, meta$settings$limits))) stop("Outdated cache settings.")
+        stored_slices <- sum(meta$counts > 0L) + as.integer(meta$settings$version == 3L && any(meta$counts > 0L))
+        if (meta$settings$version == 3L) {
+          stored_slices <- stored_slices + sum(table((which(meta$counts > 0L) - 1L) %/% 6L) > 1L)
+        }
+        expected <- stored_slices * ceiling(meta$settings$bins/meta$settings$block)
         if (DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM blocks")$n != expected ||
-            DBI::dbGetQuery(con, "PRAGMA quick_check")[[1]][1] != "ok") stop("Incomplete cache.")
+            (strict && meta$settings$version < 3L && DBI::dbGetQuery(con, "PRAGMA quick_check")[[1]][1] != "ok")) stop("Incomplete cache.")
         meta
       })
       if (!identical(metadata[[1]], metadata[[2]])) stop("The saved Maximum and Minimum belong to different cache generations.")
       meta <- metadata[[1]]
-      if (!is.null(raw) && !identical(meta$settings, investigate_cache_settings(raw))) stop("The saved spectra do not match the loaded Engine data/settings.")
+      if (!is.null(raw) && !identical(meta$settings, investigate_cache_settings(raw, limits = limits))) {
+        if (strict) stop("The saved spectra do not match the loaded Engine data/settings.")
+        return(NULL)
+      }
       list(paths = paths, meta = meta)
     }, error = function(e) {
       if (strict) stop(e)
@@ -1474,10 +1493,10 @@ server <- function(input, output, session){
     })
   }
 
-  investigate_cache_build <- function(raw, parent, progress = function(fraction) NULL) {
-    existing <- investigate_cache_open(parent, raw)
+  investigate_cache_build <- function(raw, parent, progress = function(fraction) NULL, limits = NULL) {
+    existing <- investigate_cache_open(parent, raw, limits = limits)
     if (!is.null(existing)) return(existing)
-    settings <- investigate_cache_settings(raw)
+    settings <- investigate_cache_settings(raw, limits = limits)
     if (length(settings$breaks) < 2L) stop("No recorded run interval.")
     dir.create(parent, recursive = TRUE, showWarnings = FALSE)
     paths <- investigate_cache_paths(parent)
@@ -1499,10 +1518,26 @@ server <- function(input, output, session){
     eligible <- which(raw$times >= settings$breaks[1] & raw$times <= tail(settings$breaks, 1))
     counts <- tabulate(membership[eligible], nbins = length(settings$breaks) - 1L)
     grouped <- split(eligible, membership[eligible])
+    write_extrema <- function(slice, maximum, minimum) {
+      for (start in seq.int(1L, settings$bins, by = settings$block)) {
+        rows <- seq.int(start, min(settings$bins, start + settings$block - 1L))
+        block <- (start - 1L) %/% settings$block
+        for (i in 1:2) DBI::dbExecute(connections[[i]],
+          "INSERT INTO blocks VALUES (?, ?, ?)", params = list(slice, block,
+            list(writeBin(if (i == 1L) maximum[rows] else minimum[rows],
+              raw(), size = 8L, endian = "little"))))
+      }
+    }
+    full_minimum <- rep(Inf, settings$bins)
+    full_maximum <- rep(-Inf, settings$bins)
+    minute_minimum <- minute_maximum <- NULL
+    occupied <- which(counts > 0L)
+    group_sizes <- table((occupied - 1L) %/% 6L)
     completed <- 0L
-    for (slice_name in names(grouped)) {
-      slice <- as.integer(slice_name)
-      selected <- grouped[[slice_name]]
+    for (k in seq_along(occupied)) {
+      slice <- occupied[k]
+      group <- (slice - 1L) %/% 6L
+      selected <- grouped[[as.character(slice)]]
       # An empty slice is absent, never a zero observation.
       minimum <- rep(Inf, settings$bins); maximum <- rep(-Inf, settings$bins)
       for (index in selected) {
@@ -1515,15 +1550,19 @@ server <- function(input, output, session){
         completed <- completed + 1L
         progress(completed/length(eligible))
       }
-      for (start in seq.int(1L, settings$bins, by = settings$block)) {
-        rows <- seq.int(start, min(settings$bins, start + settings$block - 1L))
-        block <- (start - 1L) %/% settings$block
-        for (i in 1:2) DBI::dbExecute(connections[[i]],
-          "INSERT INTO blocks VALUES (?, ?, ?)", params = list(slice, block,
-            list(memCompress(writeBin(if (i == 1L) maximum[rows] else minimum[rows],
-              raw(), size = 8L, endian = "little"), "gzip"))))
+      write_extrema(slice, maximum, minimum)
+      full_minimum <- pmin(full_minimum, minimum)
+      full_maximum <- pmax(full_maximum, maximum)
+      if (group_sizes[[as.character(group)]] > 1L) {
+        minute_minimum <- if (is.null(minute_minimum)) minimum else pmin(minute_minimum, minimum)
+        minute_maximum <- if (is.null(minute_maximum)) maximum else pmax(minute_maximum, maximum)
+        if (k == length(occupied) || (occupied[k + 1L] - 1L) %/% 6L != group) {
+          write_extrema(-1L - group, minute_maximum, minute_minimum)
+          minute_minimum <- minute_maximum <- NULL
+        }
       }
     }
+    if (length(eligible)) write_extrema(0L, full_maximum, full_minimum)
     # Both files carry identical source/settings/generation metadata, written last.
     saved_raw <- raw[c("name", "times", "scans", "time_range", "mz_range", "sampling", "alignment_width", "range_source", "fingerprint")]
     meta <- list(settings = settings, counts = counts, raw = saved_raw,
@@ -1556,6 +1595,7 @@ server <- function(input, output, session){
     if (width >= diff(limits) - 1e-9) return(matrix(limits, nrow = 1L))
     breaks <- cache$meta$settings$breaks
     last_start <- limits[2] - width
+    raw_available <- raw_available && cache$meta$settings$version < 3L
     starts <- if (raw_available) sort(unique(c(limits[1], breaks, last_start))) else breaks
     starts <- starts[starts >= limits[1] - 1e-9 & starts <= last_start + 1e-9]
     ends <- pmin(starts + width, limits[2])
@@ -1589,6 +1629,19 @@ server <- function(input, output, session){
       !membership %in% slices)
     if (length(partial) && (is.null(raw$read_peaks) || !identical(raw$fingerprint, settings$fingerprint))) {
       stop("Use saved time boundaries or load the original mz5 through Engine.", call. = FALSE)
+    }
+    scan_count <- sum(cache$meta$counts[slices]) + length(partial)
+    if (settings$version == 3L && length(slices)) {
+      if (all(abs(time_range - range(settings$breaks)) < 1e-9)) {
+        slices <- 0L
+      } else {
+        active_groups <- (slices - 1L) %/% 6L
+        all_groups <- (which(cache$meta$counts > 0L) - 1L) %/% 6L
+        group_sizes <- table(all_groups)
+        eligible_sizes <- table(active_groups)
+        complete <- names(eligible_sizes)[eligible_sizes == group_sizes[names(eligible_sizes)] & eligible_sizes > 1L]
+        slices <- c(slices[!active_groups %in% as.integer(complete)], -1L - as.integer(complete))
+      }
     }
     con <- DBI::dbConnect(RSQLite::SQLite(), cache$paths[if (statistic == "max") 1L else 2L], flags = RSQLite::SQLITE_RO)
     on.exit(DBI::dbDisconnect(con))
@@ -1635,7 +1688,6 @@ server <- function(input, output, session){
         values <- reduce(values, scan_values)
       }
     }
-    scan_count <- sum(cache$meta$counts[slices]) + length(partial)
     if (!scan_count) values[] <- NA_real_ # Empty window: a gap, never a false zero.
     progress(1)
     list(data = data.frame(mz = centers, intensity = values),
@@ -2177,7 +2229,6 @@ server <- function(input, output, session){
     investigate_median_view(NULL); investigate_median_time_custom(FALSE)
     investigate_raw(raw); investigate_cache(cache)
     investigate_width("full")
-    investigate_extrema_bounds(NULL)
     investigate_activation(isolate(investigate_activation()) + 1L)
     if (is.null(raw)) return(invisible(NULL))
     mz_bounds <- investigate_display_range(raw$mz_range)
@@ -2185,6 +2236,7 @@ server <- function(input, output, session){
     defaults <- list(investigate_mz_min = mz_bounds[1], investigate_mz_max = mz_bounds[2],
       investigate_time_min = 1.2, investigate_time_max = time_bounds[2],
       investigate_median_time_min = time_bounds[1], investigate_median_time_max = time_bounds[2],
+      investigate_extrema_start = min(raw$times), investigate_extrema_end = max(raw$times),
       investigate_slice_time_min = time_bounds[1], investigate_slice_time_max = time_bounds[2],
       investigate_time_center = raw$times[ceiling(length(raw$times)/2)],
       investigate_spectrum_mz_min = mz_bounds[1], investigate_spectrum_mz_max = mz_bounds[2],
@@ -2262,11 +2314,16 @@ server <- function(input, output, session){
     parent <- mz5_result_parent(name)
     cache <- investigate_cache_open(parent, raw)
     if (!is.null(cache)) investigate_attach_cache(cache) else {
+      settings <- investigate_cache_settings(raw)
+      occupied <- length(unique(findInterval(raw$times, settings$breaks, rightmost.closed = TRUE)))
+      # Let users choose a smaller calculation interval before a large initial write.
+      if (as.double(occupied) * settings$bins * 16 > 128 * 1024^2) return(invisible(entries[[path]]))
       # Allow the filename/range messages to reach the browser first.
       session$onFlushed(function() {
         later::later(function() {
           if (session$isClosed()) return()
           shiny::withReactiveDomain(session, isolate({
+            if (!is.null(investigate_cache()) || !identical(investigate_raw()$fingerprint, raw$fingerprint)) return()
             cache <- with_action_error({
               shiny::withProgress(message = "Caching Maximum and Minimum spectra", value = 0, {
                 investigate_cache_build(raw, parent,
@@ -2287,10 +2344,8 @@ server <- function(input, output, session){
     # Cache completion must not reset ranges/3D/Median edits made during loading.
     investigate_cache(cache)
     limits <- range(cache$meta$settings$breaks)
-    if (is.null(isolate(investigate_extrema_bounds()))) {
-      updateNumericInput(session, "investigate_extrema_start", value = limits[1])
-      updateNumericInput(session, "investigate_extrema_end", value = limits[2])
-    }
+    updateNumericInput(session, "investigate_extrema_start", value = limits[1])
+    updateNumericInput(session, "investigate_extrema_end", value = limits[2])
   }
 
   observe_action(input$investigate_engine_file, {
@@ -2303,11 +2358,20 @@ server <- function(input, output, session){
   })
 
   ######Matabo3.6.3a Recover and plot completed saved spectra######
+  investigate_extrema_folder <- function(limits) {
+    endpoints <- vapply(limits, format, character(1), digits = 15, trim = TRUE, scientific = FALSE)
+    paste("Extrema", paste(endpoints, collapse = " to "), "min")
+  }
+
   investigate_saved_cache_runs <- function() {
-    if (!dir.exists("./Results")) return(character())
     folders <- list.dirs("./Results", recursive = FALSE, full.names = TRUE)
-    folders <- folders[vapply(folders, function(folder) all(file.exists(investigate_cache_paths(folder))), logical(1))]
-    sort(basename(folders))
+    paths <- unlist(lapply(folders, function(folder) {
+      ranges <- list.dirs(folder, recursive = FALSE, full.names = TRUE)
+      c(folder, ranges[startsWith(basename(ranges), "Extrema ")])
+    }), use.names = FALSE)
+    if (!length(paths)) return(character())
+    paths <- paths[vapply(paths, function(path) all(file.exists(investigate_cache_paths(path))), logical(1))]
+    sort(sub("^\\./Results/", "", paths))
   }
   investigate_saved_caches <- reactivePoll(5000, session,
     checkFunc = investigate_saved_cache_runs, valueFunc = investigate_saved_cache_runs)
@@ -2327,16 +2391,21 @@ server <- function(input, output, session){
       stop("Select a run with both saved Maximum and Minimum files.")
     }
     raw <- investigate_raw()
-    matching <- !is.null(raw) && identical(sub("\\.mz5$", "", raw$name, ignore.case = TRUE), run)
     cache <- shiny::withProgress(message = "Loading saved spectra", value = 0, {
-      investigate_cache_open(file.path(".", "Results", run), if (matching) raw else NULL, strict = TRUE)
+      investigate_cache_open(file.path(".", "Results", run), strict = TRUE)
     })
+    matching <- !is.null(raw) && identical(raw$fingerprint, cache$meta$raw$fingerprint)
     if (!matching) {
       investigate_activate(cache$meta$raw, cache)
       key <- paste0("cache:", run)
       updateSelectInput(session, "investigate_engine_file",
         choices = stats::setNames(key, cache$meta$raw$name), selected = key)
-    } else investigate_attach_cache(cache)
+    } else {
+      investigate_width("full")
+      updateSelectInput(session, "investigate_window_width", selected = "full")
+      investigate_attach_cache(cache)
+      investigate_reset_window_position()
+    }
     investigate_update_cached(rebuild = TRUE)
   })
 
@@ -2437,8 +2506,7 @@ server <- function(input, output, session){
   investigate_window <- reactive({
     cache <- investigate_cache()
     req(cache)
-    limits <- investigate_extrema_bounds()
-    if (is.null(limits)) limits <- range(cache$meta$settings$breaks)
+    limits <- range(cache$meta$settings$breaks)
     investigate_window_choices(cache, investigate_width(), limits,
       raw_available = !is.null(investigate_raw()$read_peaks))
   })
@@ -2448,30 +2516,43 @@ server <- function(input, output, session){
     updateSliderInput(session, "investigate_window_position", min = 1, max = max(2, nrow(windows)), value = 1, step = 1)
     if (nrow(windows) == 1L) shinyjs::disable("investigate_window_position") else shinyjs::enable("investigate_window_position")
   }
-  observe_action(input$investigate_extrema_apply, {
+  observe_action(input$investigate_extrema_request, {
+    raw <- investigate_raw()
+    if (is.null(raw)) stop("Load an mz5 through Engine or choose a saved spectrum range.")
+    limits <- investigate_range(unlist(input$investigate_extrema_request), "Calculation time range")
     cache <- investigate_cache()
-    req(cache)
-    limits <- investigate_range(c(input$investigate_extrema_start, input$investigate_extrema_end), "Calculation time range")
-    breaks <- cache$meta$settings$breaks
-    if (limits[1] < min(breaks) - 1e-9 || limits[2] > max(breaks) + 1e-9) {
-      stop("Choose calculation limits within the available time range.")
-    }
-    if (is.null(investigate_raw()$read_peaks) &&
-        !all(vapply(limits, function(value) any(abs(breaks - value) < 1e-9), logical(1)))) {
-      stop("Use saved time boundaries or load the original mz5 through Engine.")
-    }
-    tryCatch(investigate_window_choices(cache, investigate_width(), limits,
-      raw_available = !is.null(investigate_raw()$read_peaks)), error = function(e) {
-        stop("Choose Full before applying these limits, or load the original mz5 through Engine.")
+    if (!is.null(cache) && identical(limits, range(cache$meta$settings$breaks)) &&
+        cache$meta$settings$version == 3L) {
+      next_cache <- cache
+    } else {
+      parent <- mz5_result_parent(raw$name)
+      default_limits <- range(investigate_cache_settings(raw)$breaks)
+      requested <- if (all(abs(limits - default_limits) < 1e-9)) NULL else limits
+      if (!is.null(requested)) parent <- file.path(parent, investigate_extrema_folder(requested))
+      next_cache <- if (is.null(raw$read_peaks)) {
+        saved <- investigate_cache_open(parent)
+        if (is.null(saved) || !identical(saved$meta$raw$fingerprint, raw$fingerprint)) {
+          stop("Load the original mz5 through Engine to calculate this time range.")
+        }
+        saved
+      } else shiny::withProgress(message = "Preparing Maximum and Minimum for selected time range", value = 0, {
+        investigate_cache_build(raw, parent, limits = requested,
+          progress = function(fraction) shiny::setProgress(value = fraction))
       })
-    investigate_extrema_bounds(limits)
+    }
+    investigate_width("full")
+    updateSelectInput(session, "investigate_window_width", selected = "full")
+    if (is.null(cache) || !identical(cache$meta$generation, next_cache$meta$generation)) {
+      investigate_median_view(NULL)
+      investigate_median(NULL)
+    }
+    investigate_attach_cache(next_cache)
     investigate_reset_window_position()
   })
   observe_action(input$investigate_window_width, {
     cache <- investigate_cache()
     req(cache)
-    limits <- investigate_extrema_bounds()
-    if (is.null(limits)) limits <- range(cache$meta$settings$breaks)
+    limits <- range(cache$meta$settings$breaks)
     tryCatch(investigate_window_choices(cache, input$investigate_window_width, limits,
       raw_available = !is.null(investigate_raw()$read_peaks)), error = function(e) {
         updateSelectInput(session, "investigate_window_width", selected = investigate_width())
@@ -2510,7 +2591,8 @@ server <- function(input, output, session){
     }) else investigate_cache_spectrum(cache, statistic, interval, if (!is.null(view)) view$x else NULL,
       raw = investigate_raw())
     # Keep the established full-run scale even when only a visible region is queried.
-    spectrum$intensity_range <- if (!is.null(previous) && isTRUE(previous$cached)) previous$intensity_range else
+    spectrum$intensity_range <- if (!is.null(previous) && isTRUE(previous$cached) &&
+        identical(previous$query_key[[1]], cache$meta$generation)) previous$intensity_range else
       investigate_intensity_range(spectrum$data$intensity)
     spectrum$query_key <- query_key
     investigate_median(spectrum)
@@ -2529,11 +2611,11 @@ server <- function(input, output, session){
   }
 
   observe_action(list(investigate_cache(), investigate_activation(), input$investigate_median_statistic,
-                      investigate_width(), investigate_position(), investigate_extrema_bounds()), {
+                      investigate_width(), investigate_position()), {
     if (!is.null(investigate_cache())) investigate_update_cached()
   })
   output$investigate_window_interval <- renderText({
-    if (is.null(investigate_cache())) return("No fine cache available.")
+    if (is.null(investigate_cache())) return("Choose a saved spectrum or apply calculation time limits to the loaded mz5.")
     windows <- investigate_window()
     index <- max(1L, min(nrow(windows), investigate_position()))
     paste0(paste(format(windows[index, ], digits = 10, trim = TRUE), collapse = "–"), " min")

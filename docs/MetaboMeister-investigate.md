@@ -42,9 +42,9 @@ readings in a scan's cell are averaged before aggregation. Only internal empty
 cells between adjacent occupied nonzero cells are linearly interpolated. Measured
 zeros, outer gaps and empty scans retain the original zero semantics.
 
-New caches use compressed blocks and 10-second time slices, with partial slices
-at the recorded start and end. Intervals include the start and exclude the end,
-except at the recorded end, which is included. A boundary scan belongs to one
+New caches use 10-second time slices within the selected range, with a partial
+final slice if needed. Full-range and minute summaries speed up plotting. Intervals include the start and exclude the end,
+except at the end of the saved calculation range, which is included. A boundary scan belongs to one
 slice only, including duplicated acquisition times. Empty time slices have zero
 scan count and no summaries; they never add false zero observations. A window
 containing no scans displays a gap and reports zero scans.
@@ -97,11 +97,14 @@ entire interval. The other widths are 20 sec, 30 sec, 1 min, 2 min, 3 min,
 selected interval. If the selected interval is shorter than the width, the
 plot uses the entire interval. The display shows the actual endpoints.
 
-With the original mz5 loaded through Engine, the app reads any scans needed
-from partially covered cache slices to honor the entered endpoints. With only
-saved spectra loaded, choose saved time boundaries. Older caches remain
-readable with their original boundaries. Reopen the original mz5 through
-Engine to generate the finer cache and use the short widths.
+Applying limits calculates both extrema from scans within those endpoints,
+including the end scan. The plot switches to **Full** for the new range.
+The paired files are saved in `Results/<mz5 basename>/Extrema <start> to <end> min/`.
+Applying the same limits reuses the matching pair. Open it later under
+**Saved spectra / time ranges**, even without the original mz5. A new range
+requires the original mz5 through Engine. Large uncached runs wait for you
+to apply a time range before building extrema. Older saved pairs remain
+readable at their original boundaries.
 
 Dragging sends positions live, including before release. Region summaries update
 only the SVG curve and hover label. The plot widget, m/z zoom and intensity-axis

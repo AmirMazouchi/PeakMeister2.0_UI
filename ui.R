@@ -386,6 +386,13 @@ ui <- dashboardPage(
               Shiny.setInputValue('investigate_median_time_edited', Date.now(), {priority: 'event'});
             }
           });
+          document.addEventListener('click', function (event) {
+            if (!event.target.closest('#investigate_extrema_apply')) return;
+            var start = document.getElementById('investigate_extrema_start');
+            var end = document.getElementById('investigate_extrema_end');
+            Shiny.setInputValue('investigate_extrema_request',
+              [start.valueAsNumber, end.valueAsNumber], {priority: 'event'});
+          });
           document.addEventListener('blur', function (event) {
             var field = event.target;
             if ((ids.indexOf(field.id) < 0 && widths.indexOf(field.id) < 0) || field.value === '') return;
@@ -495,7 +502,7 @@ ui <- dashboardPage(
             selectInput("investigate_median_statistic", "Statistic",
               choices = c("Median" = "median", "Maximum" = "max", "Minimum" = "min"), selected = "max"),
             conditionalPanel("input.investigate_median_statistic !== 'median'",
-              selectInput("investigate_cache_run", "Saved spectra", choices = c("Select a run" = "")),
+              selectInput("investigate_cache_run", "Saved spectra / time ranges", choices = c("Select a run" = "")),
               actionButton("investigate_load_saved_spectra", "Load / plot saved spectra"),
               fluidRow(
                 column(6, numericInput("investigate_extrema_start", "Calculation start (min)", 0, min = 0, step = 0.001)),

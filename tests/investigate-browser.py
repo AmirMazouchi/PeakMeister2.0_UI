@@ -97,4 +97,14 @@ with sync_playwright() as p:
     saved.locator('#investigate_median_statistic').evaluate("el => el.selectize.setValue('min')")
     saved.wait_for_function('document.getElementById("investigate_median_plot").data[0].name.includes("Minimum")',timeout=120000)
     print('PASS: fresh-session saved Maximum/Minimum plotting without mz5 upload',flush=True)
+    range_key = saved.locator('#investigate_cache_run').evaluate(
+        "(el, run) => Object.keys(el.selectize.options).find(key => key.startsWith(run + '/Extrema '))", run)
+    assert range_key, 'No saved range appeared in the picker'
+    saved.locator('#investigate_cache_run').evaluate('(el,key) => el.selectize.setValue(key)', range_key)
+    saved.locator('#investigate_load_saved_spectra').click()
+    saved.wait_for_function("""limits => document.getElementById('investigate_window_interval').textContent
+                            .split('–').map(parseFloat).every((value, i) => Math.abs(value - limits[i]) < 1e-8)""",
+                            arg=limits)
+    assert saved.evaluate('Shiny.shinyapp.$inputValues.mz5Files == null')
+    print('PASS: the named calculation range reopens in a fresh session',flush=True)
     browser.close()

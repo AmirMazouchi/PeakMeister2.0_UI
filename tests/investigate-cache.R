@@ -158,12 +158,23 @@ testServer(harness,{
   }
   same(output$investigate_median_plot,before_plot)
   same(investigate_median()$time_range,c(0,1))
-  session$setInputs(investigate_extrema_start=1.19,investigate_extrema_end=4.41,
-    investigate_window_width='full')
-  session$setInputs(investigate_extrema_apply=1)
-  same(investigate_median()$time_range,c(1.19,4.41))
-  same(investigate_median()$scans,sum(times>=1.19 & times<4.41))
-  same(investigate_median_view(),expected_view)
+  session$setInputs(investigate_window_width='1')
+  session$setInputs(investigate_extrema_request=c(1.19,4.4))
+  same(investigate_width(),'full')
+  same(investigate_median()$time_range,c(1.19,4.4))
+  selected <- times>=1.19 & times<=4.4
+  same(investigate_median()$scans,sum(selected))
+  same(investigate_median()$data$intensity,apply(oracle[selected,,drop=FALSE],2,max))
+  restricted <- investigate_cache()
+  stopifnot(basename(dirname(restricted$paths[1]))=='Extrema 1.19 to 4.4 min',
+    all(file.exists(restricted$paths)), !identical(restricted$paths, cache$paths))
+  no_read <- raw
+  no_read$read_peaks <- function(...) stop('Existing range caches must not reread spectra')
+  reused <- tasks$investigate_cache_build(no_read,dirname(restricted$paths[1]),limits=c(1.19,4.4))
+  same(reused$meta$generation,restricted$meta$generation)
+  minute <- tasks$investigate_cache_spectrum(reused,'max',c(1.19,2.19))
+  same(minute$data$intensity,apply(oracle[times>=1.19 & times<2.19,,drop=FALSE],2,max))
+  same(minute$blocks_read,ceiling(reused$meta$settings$bins/reused$meta$settings$block))
   stopifnot(signals$reads==1L)
   # The cache is already persisted: a second use of the same Engine upload
   # reuses both its raw object and completed summaries.
@@ -189,6 +200,11 @@ testServer(harness,{
   session$setInputs(investigate_median_statistic='min',investigate_load_saved_spectra=2)
   same(investigate_median()$data$intensity,apply(oracle,2,min))
   stopifnot(signals$reads==1L)
+  session$setInputs(investigate_cache_run='Fixture/Extrema 1.19 to 4.4 min',
+    investigate_load_saved_spectra=3)
+  same(investigate_cache()$meta$generation,restricted$meta$generation)
+  same(investigate_median()$data$intensity,apply(oracle[selected,,drop=FALSE],2,min))
+  stopifnot(is.null(investigate_raw()$read_peaks), signals$reads==1L)
   # A new cache must not gate the filename/raw-data handshake. Run its deferred
   # callback with an intentional failure and verify that loaded data survives.
   assign('investigate_cache_open',function(...)NULL,envir=environment(engine_load_upload))
@@ -211,9 +227,9 @@ testServer(harness,{
   assign('read_mz5_data',function(...)stop('reader regression fixture'),envir=environment(engine_load_upload))
   session$setInputs(analysis_mode='new',mz5Files=data.frame(name='Broken.mz5',datapath='broken-upload'))
   stopifnot(grepl('Broken.mz5',signals$updates$investigate_engine_file$options,fixed=TRUE))
-  for (attempt in 1:20) {
+  for (attempt in 1:100) {
     later::run_now(0.1);session$flushReact()
-    if (length(signals$errors)) break
+    if ('reader regression fixture' %in% unlist(signals$errors)) break
   }
   stopifnot(grepl('Broken.mz5',signals$updates$investigate_engine_file$options,fixed=TRUE),
     grepl('Could not load Broken.mz5',output$investigate_status,fixed=TRUE),
