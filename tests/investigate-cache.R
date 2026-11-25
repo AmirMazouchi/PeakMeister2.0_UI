@@ -23,9 +23,8 @@ raw <- tasks$investigate_memory_raw(scans,times,'Fixture.mz5')
 cache <- tasks$investigate_cache_build(raw,file.path(workspace,'Results','Fixture'))
 stopifnot(!is.null(cache),all(file.exists(cache$paths)),
   identical(basename(cache$paths),c('max_mz_spec_dmz0.001.sqlite','min_mz_spec_dmz0.001.sqlite')))
-same(cache$meta$settings$breaks,c(1.2,2,3,4,5,5.3))
-same(cache$meta$counts,c(2L,3L,0L,2L,2L))
-stopifnot(sum(cache$meta$counts)==sum(times>=1.2))
+same(cache$meta$settings$breaks,c((0:31)/6,5.3))
+stopifnot(sum(cache$meta$counts)==length(times))
 # Oracle bins readings globally, then fills only empty cells between measured
 # nonzero neighbours. Zeros measured in a cell block interpolation across it.
 settings <- cache$meta$settings
@@ -43,7 +42,7 @@ oracle <- t(vapply(scans,function(scan){
   }
   values
 },numeric(settings$bins)))
-for (statistic in c('max','min')) for (interval in list(c(1.2,5.3),c(1.2,2),c(2,3),c(3,5),c(5,5.3))) {
+for (statistic in c('max','min')) for (interval in list(c(0,5.3),c(1,2),c(2,3),c(3,5),c(5,5.3))) {
   selected <- times>=interval[1] & (times<interval[2] | (interval[2]==max(times) & times==max(times)))
   result <- tasks$investigate_cache_spectrum(cache,statistic,interval)
   same(result$data$intensity,apply(oracle[selected,,drop=FALSE],2,get(statistic)))
@@ -51,9 +50,20 @@ for (statistic in c('max','min')) for (interval in list(c(1.2,5.3),c(1.2,2),c(2,
 }
 empty <- tasks$investigate_cache_spectrum(cache,'min',c(3,4))
 stopifnot(empty$scans==0L,all(is.na(empty$data$intensity)))
-same(tasks$investigate_window_choices(cache,'1'),rbind(c(2,3),c(3,4),c(4,5)))
-same(tasks$investigate_window_choices(cache,'full'),matrix(c(1.2,5.3),nrow=1))
-same(tasks$investigate_window_choices(cache,'0.3'),matrix(c(5,5.3),nrow=1))
+same(tasks$investigate_window_choices(cache,'full'),matrix(c(0,5.3),nrow=1))
+for (width in c(20/60, 30/60, 1)) {
+  windows <- tasks$investigate_window_choices(cache,width,c(1,5))
+  stopifnot(all(abs(windows[,2]-windows[,1]-width)<1e-9),
+            all(windows[,1]>=1),all(windows[,2]<=5))
+}
+interval <- c(1.19,4.41)
+for (statistic in c('max','min')) {
+  result <- tasks$investigate_cache_spectrum(cache,statistic,interval,raw=raw)
+  selected <- times>=interval[1] & times<interval[2]
+  same(result$data$intensity,apply(oracle[selected,,drop=FALSE],2,get(statistic)))
+  same(result$scans,sum(selected))
+}
+stopifnot(inherits(try(tasks$investigate_cache_spectrum(cache,'max',c(1.19,1.21)),silent=TRUE),'try-error'))
 same(diff(centers),rep(0.001,length(centers)-1L))
 # Shared native axes must STILL use the fine grid, not native point spacing.
 stopifnot(raw$sampling$shared == FALSE,settings$dmz==0.001)
@@ -69,8 +79,8 @@ changed <- raw;changed$fingerprint <- 'different-content-same-name'
 stopifnot(is.null(tasks$investigate_cache_open(dirname(cache$paths[1]),changed)))
 saved <- tasks$investigate_cache_open(dirname(cache$paths[1]))
 stopifnot(!is.null(saved),is.null(saved$meta$raw$read_peaks),is.null(saved$meta$raw$handle))
-same(tasks$investigate_cache_spectrum(saved,'min',c(1.2,5.3))$data$intensity,
-  apply(oracle[times>=1.2,,drop=FALSE],2,min))
+same(tasks$investigate_cache_spectrum(saved,'min',c(0,5.3))$data$intensity,
+  apply(oracle,2,min))
 # Generation mismatch and interrupted/incomplete output must never be reused.
 con <- dbConnect(SQLite(),cache$paths[2]);meta <- cache$meta;meta$complete <- FALSE
 dbExecute(con,'UPDATE metadata SET payload=? WHERE id=1',params=list(list(serialize(meta,NULL))))
@@ -81,8 +91,8 @@ stopifnot(!is.null(cache))
 # A narrow viewport fetches fewer mass blocks than the full grid.
 wide <- raw;wide$mz_range <- c(50,1000);wide$fingerprint <- paste0(raw$fingerprint,'-wide')
 wide_cache <- tasks$investigate_cache_build(wide,file.path(workspace,'wide'))
-full <- tasks$investigate_cache_spectrum(wide_cache,'max',c(1.2,5.3))
-narrow <- tasks$investigate_cache_spectrum(wide_cache,'max',c(1.2,5.3),c(162,165))
+full <- tasks$investigate_cache_spectrum(wide_cache,'max',c(0,5.3))
+narrow <- tasks$investigate_cache_spectrum(wide_cache,'max',c(0,5.3),c(162,165))
 stopifnot(narrow$blocks_read < full$blocks_read,nrow(narrow$data)<4000L)
 same(narrow$data$intensity,full$data$intensity[match(narrow$data$mz,full$data$mz)])
 cat('PASS: shared 0.001 grid; paired extrema; all scans; exact boundary ownership; partial/empty slices; zeros/internal interpolation; indexed region queries; source/settings validation; completed-cache reopen and interrupted-cache rejection.\n')
@@ -147,7 +157,13 @@ testServer(harness,{
     same(investigate_plot_generation(),generation)
   }
   same(output$investigate_median_plot,before_plot)
-  same(investigate_median()$time_range,c(2,3))
+  same(investigate_median()$time_range,c(0,1))
+  session$setInputs(investigate_extrema_start=1.19,investigate_extrema_end=4.41,
+    investigate_window_width='full')
+  session$setInputs(investigate_extrema_apply=1)
+  same(investigate_median()$time_range,c(1.19,4.41))
+  same(investigate_median()$scans,sum(times>=1.19 & times<4.41))
+  same(investigate_median_view(),expected_view)
   stopifnot(signals$reads==1L)
   # The cache is already persisted: a second use of the same Engine upload
   # reuses both its raw object and completed summaries.
@@ -162,16 +178,16 @@ testServer(harness,{
   stopifnot(!isTRUE(investigate_median()$cached),signals$reads==1L)
   session$setInputs(analysis_mode='existing',existing_run='Fixture',investigate_median_statistic='max')
   stopifnot(is.null(investigate_raw()$read_peaks),isTRUE(investigate_median()$cached),signals$reads==1L)
-  same(investigate_median()$data$intensity,apply(oracle[times>=1.2,,drop=FALSE],2,max))
+  same(investigate_median()$data$intensity,apply(oracle,2,max))
   # Reproduce files-on-disk/empty-GUI state and recover without an mz5 read.
   investigate_activate(NULL)
   session$setInputs(investigate_cache_run='Fixture',investigate_median_statistic='max',
     investigate_load_saved_spectra=1)
   stopifnot(isTRUE(investigate_median()$cached),signals$reads==1L,
     is.null(investigate_raw()$read_peaks))
-  same(investigate_median()$data$intensity,apply(oracle[times>=1.2,,drop=FALSE],2,max))
+  same(investigate_median()$data$intensity,apply(oracle,2,max))
   session$setInputs(investigate_median_statistic='min',investigate_load_saved_spectra=2)
-  same(investigate_median()$data$intensity,apply(oracle[times>=1.2,,drop=FALSE],2,min))
+  same(investigate_median()$data$intensity,apply(oracle,2,min))
   stopifnot(signals$reads==1L)
   # A new cache must not gate the filename/raw-data handshake. Run its deferred
   # callback with an intentional failure and verify that loaded data survives.

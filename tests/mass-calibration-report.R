@@ -78,13 +78,14 @@ verify_report <- function() {
   stopifnot(identical(refs$Metabolite, references$name))
   same(as.numeric(refs[1, 2:5]), c(10, 10 - 0.05, 10 - mean(c(0.02, 0.05)), 10 - 0.02))
   locks <- read(first, "Calibration References")
+  stopifnot(identical(names(locks), c("Scan (calibration order)", "Scan status",
+    "Reference 1 expected m/z", "Reference 1 measured before m/z",
+    "Reference 2 expected m/z", "Reference 2 measured before m/z")))
   same(locks[[1]], c(1, 2, 3))
   same(locks[[3]], rep(3, 3))
   same(locks[[4]], c(3.02, 3.025, 3.02))
-  same(locks[[5]], c(3, 3, NA_real_))
-  same(locks[[6]], rep(8, 3))
-  same(locks[[7]], c(8.02, 8.05, NA_real_))
-  same(locks[[8]], c(8, 8, NA_real_))
+  same(locks[[5]], rep(8, 3))
+  same(locks[[6]], c(8.02, 8.05, NA_real_))
   stopifnot(grepl("^Skipped", locks[[2]][3]))
 
   config$parameters_df$apply.mass.calibration <- "No"
@@ -93,8 +94,8 @@ verify_report <- function() {
   stopifnot(read(second, "Summary")$Value[3] == "Disabled",
     all(is.na(read(second, "Mass List")[3:5])))
   disabled <- read(second, "Calibration References")
-  stopifnot(disabled[[2]] == "Disabled", disabled[[3]] == 3, disabled[[6]] == 8,
-    all(is.na(disabled[c(4, 5, 7, 8)])))
+  stopifnot(disabled[[2]] == "Disabled", disabled[[3]] == 3, disabled[[5]] == 8,
+    all(is.na(disabled[c(4, 6)])))
 }
 verify_report()
 cat("PASS: variable scan corrections, skipped and disabled calibration, workbook contents and rerun-safe placement.\n")

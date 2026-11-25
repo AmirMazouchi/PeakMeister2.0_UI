@@ -32,8 +32,8 @@ cross-sections use the original scans. Existing rotation, zoom and resets remain
 ## Fine Maximum and Minimum caches
 
 **Maximum** is the default m/z statistic. Both extrema are calculated together
-from every valid MS1 scan from **1.2 minutes through the actual recorded end**,
-regardless of the 3D grouping or Median controls.
+from all valid MS1 scans within the selected calculation limits. The defaults
+cover the recorded run, independently of the 3D grouping and Median controls.
 
 All scans and slices use one global grid: equal **0.001 Da** cells anchored at
 integer multiples of 0.001 Da, with intensities plotted at cell centers. This
@@ -42,8 +42,9 @@ readings in a scan's cell are averaged before aggregation. Only internal empty
 cells between adjacent occupied nonzero cells are linearly interpolated. Measured
 zeros, outer gaps and empty scans retain the original zero semantics.
 
-Time slices are `[1.2, 2)`, `[2, 3)`, `[3, 4)`, and so on. The final slice ends
-at the recorded end and includes that endpoint. A boundary scan belongs to one
+New caches use compressed blocks and 10-second time slices, with partial slices
+at the recorded start and end. Intervals include the start and exclude the end,
+except at the recorded end, which is included. A boundary scan belongs to one
 slice only, including duplicated acquisition times. Empty time slices have zero
 scan count and no summaries; they never add false zero observations. A window
 containing no scans displays a gap and reports zero scans.
@@ -89,13 +90,18 @@ the fine extrema caches do not contain every original spectrum.
 
 ## Window controls and plotting
 
-Maximum and Minimum use **Window width (min)** and a **Window position** slider.
-Available widths are exact differences between saved slice boundaries. Slider
-positions select intervals of that same width; the displayed interval shows
-the actual endpoints. The last partial slice is available through its matching
-widths and through **Full run**. Full run always means 1.2 minutes to the recorded
-end and disables the position slider. Widths with only one valid position also
-disable it.
+For Maximum and Minimum, enter **Calculation start (min)** and
+**Calculation end (min)** and select **Apply time limits**. **Full** uses this
+entire interval. The other widths are 20 sec, 30 sec, 1 min, 2 min, 3 min,
+4 min, 5 min and 10 min. The position slider moves the window within the
+selected interval. If the selected interval is shorter than the width, the
+plot uses the entire interval. The display shows the actual endpoints.
+
+With the original mz5 loaded through Engine, the app reads any scans needed
+from partially covered cache slices to honor the entered endpoints. With only
+saved spectra loaded, choose saved time boundaries. Older caches remain
+readable with their original boundaries. Reopen the original mz5 through
+Engine to generate the finer cache and use the short widths.
 
 Dragging sends positions live, including before release. Region summaries update
 only the SVG curve and hover label. The plot widget, m/z zoom and intensity-axis
@@ -152,10 +158,9 @@ Opening a saved analysis does not regenerate its workbook.
   show the minimum, mean and maximum of the scan-specific correction evaluated
   at that input m/z across calibrated scans. These are model estimates.
 - **Calibration References** lists both expected lock masses from the Parameters
-  sheet and their measured m/z before and after calibration in scan processing
-  order. The after values come from refitting the same peak flanks on the
-  corrected m/z coordinates. A missing lock pair skips that scan. A lock mass
-  measured on a skipped scan can still have a before value.
+  sheet and their measured m/z before calibration in scan processing order.
+  A missing lock pair skips that scan. A lock mass measured on a skipped scan
+  can still have a before value.
 - **Summary** identifies the analysis and records whether calibration was applied,
   disabled, or enabled with no usable scan pairs. Unavailable measurements and
   unapplied corrections appear as blank cells.

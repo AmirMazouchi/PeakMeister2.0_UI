@@ -32,6 +32,24 @@ with sync_playwright() as p:
     print('Plot ready',flush=True)
     assert page.locator('#investigate_time_min').input_value()=='1.2'
     assert page.locator('#investigate_median_statistic').input_value()=='max'
+    widths = page.locator('#investigate_window_width').evaluate("el => Object.values(el.selectize.options).sort((a, b) => a.$order - b.$order).map(option => option.label)")
+    assert widths == ['20 sec', '30 sec', '1 min', '2 min', '3 min', '4 min', '5 min', '10 min', 'Full'], widths
+    start = page.locator('#investigate_extrema_start')
+    end = page.locator('#investigate_extrema_end')
+    original_limits = (start.input_value(), end.input_value())
+    limits = [round(float(original_limits[0]) + 0.02, 3), round(float(original_limits[1]) - 0.02, 3)]
+    original_interval = page.locator('#investigate_window_interval').inner_text()
+    start.fill(str(limits[0]))
+    end.fill(str(limits[1]))
+    page.locator('#investigate_extrema_apply').click()
+    page.wait_for_function("""limits => document.getElementById('investigate_window_interval').textContent
+                           .split('–').map(parseFloat).every((value, i) => Math.abs(value - limits[i]) < 1e-8)""",
+                           arg=limits)
+    start.fill(original_limits[0])
+    end.fill(original_limits[1])
+    page.locator('#investigate_extrema_apply').click()
+    page.wait_for_function("label => document.getElementById('investigate_window_interval').textContent === label",
+                           arg=original_interval)
     assert page.locator('#investigate_raw_file').count()==0
     assert page.evaluate('$("#investigate_window_position").data("ionRangeSlider").metaboLive === true')
     page.evaluate('''() => { var g=document.getElementById('investigate_median_plot');
